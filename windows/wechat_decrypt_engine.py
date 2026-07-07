@@ -56,6 +56,8 @@ READABLE = {0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80}
 
 _HEX_RE = re.compile(b"x'([0-9a-fA-F]{64,192})'")
 _ZSTD = zstd.ZstdDecompressor() if zstd is not None else None
+_IMAGE_KEY32_RE = re.compile(rb'(?<![a-zA-Z0-9])[a-zA-Z0-9]{32}(?![a-zA-Z0-9])')
+_IMAGE_KEY16_RE = re.compile(rb'(?<![a-zA-Z0-9])[a-zA-Z0-9]{16}(?![a-zA-Z0-9])')
 
 
 class MBI(ctypes.Structure):
@@ -256,13 +258,18 @@ def export_chatlog_json(
     output_path: str,
     max_messages: int = 5000,
     source_data_dir: str = "",
+    preferred_pid: int = 0,
     log_fn=None,
     event_fn=None,
 ) -> list[dict]:
     contact_records = load_contact_records(decrypted_dir, log_fn=log_fn, event_fn=event_fn)
     contact_map = contact_records
     resource_md5_maps = load_resource_md5_map(decrypted_dir)
-    image_aes_key, image_xor_key = load_image_crypto_config()
+    image_aes_key, image_xor_key = load_image_crypto_config(
+        source_data_dir,
+        preferred_pid=preferred_pid,
+        log_fn=log_fn,
+    )
     messages = []
 
     message_dir = os.path.join(decrypted_dir, "message")
@@ -753,14 +760,179 @@ def decrypt_database(db_path: str, out_path: str, enc_key: bytes):
     return True
 
 
-def load_image_crypto_config():
+def iter_image_sample_files(source_data_dir: str):
+    if not source_data_dir or not os.path.isdir(source_data_dir):
+        return []
+
+    patterns = [
+        os.path.join(source_data_dir, "msg", "attach", "**", "Img", "*_t.dat"),
+        os.path.join(source_data_dir, "MsgAttach", "**", "Image", "*_t.dat"),
+        os.path.join(source_data_dir, "FileStorage", "MsgAttach", "**", "Image", "*_t.dat"),
+    ]
+
+    files = []
+    seen = set()
+    for pattern in patterns:
+        for path in glob.glob(pattern, recursive=True):
+            if path in seen or not os.path.isfile(path):
+                continue
+            seen.add(path)
+            files.append(path)
+
+    files.sort(key=lambda path: os.path.getmtime(path), reverse=True)
+    return files
+
+
+def detect_v2_image_samples(source_data_dir: str):
+    samples = []
+    for path in iter_image_sample_files(source_data_dir):
+        try:
+            with open(path, "rb") as handle:
+                header = handle.read(31)
+            if len(header) >= 31 and header[:6] in (V2_MAGIC_FULL, V1_MAGIC_FULL):
+                samples.append((path, header))
+        except OSError:
+            continue
+    return samples
+
+
+def derive_image_xor_key(v2_samples: list[tuple[str, bytes]]):
+    tail_counts = {}
+    for path, _ in v2_samples[:32]:
+        try:
+            with open(path, "rb") as handle:
+                handle.seek(-2, os.SEEK_END)
+                tail = handle.read(2)
+            if len(tail) != 2:
+                continue
+            tail_counts[tail] = tail_counts.get(tail, 0) + 1
+        except OSError:
+            continue
+
+    if not tail_counts:
+        return 0x88
+
+    x, y = max(tail_counts, key=tail_counts.get)
+    guessed = x ^ 0xFF
+    if (y ^ 0xD9) == guessed:
+        return guessed
+    return guessed
+
+
+def try_image_aes_key(key_bytes: bytes, ciphertext: bytes):
+    try:
+        cipher = AES.new(key_bytes, AES.MODE_ECB)
+        decrypted = cipher.decrypt(ciphertext)
+    except Exception:
+        return ""
+
+    fmt = detect_image_format(decrypted[:16])
+    return fmt if fmt != "bin" else ""
+
+
+def scan_memory_for_image_aes_key(ciphertext: bytes, preferred_pid: int = 0, log_fn=None):
+    pids = get_wechat_pids(preferred_pid)
+
+    for pid, mem_kb, process_name in pids:
+        handle = kernel32.OpenProcess(0x0010 | 0x0400, False, pid)
+        if not handle:
+            continue
+
+        try:
+            regions = enum_regions(handle)
+            total_bytes = sum(size for _, size in regions)
+            scanned_bytes = 0
+
+            for reg_idx, (base, size) in enumerate(regions):
+                data = read_mem(handle, base, size)
+                scanned_bytes += size
+                if not data:
+                    continue
+
+                for match in _IMAGE_KEY32_RE.finditer(data):
+                    candidate = match.group()
+                    fmt = try_image_aes_key(candidate[:16], ciphertext)
+                    if fmt:
+                        key = candidate[:16].decode("ascii", errors="ignore")
+                        if log_fn:
+                            log_fn(
+                                f"[wechat-decrypt] 命中图片 AES key pid={pid} ({process_name}) "
+                                f"fmt={fmt} len=16"
+                            )
+                        return key
+
+                    fmt = try_image_aes_key(candidate, ciphertext)
+                    if fmt:
+                        key = candidate.decode("ascii", errors="ignore")
+                        if log_fn:
+                            log_fn(
+                                f"[wechat-decrypt] 命中图片 AES key pid={pid} ({process_name}) "
+                                f"fmt={fmt} len=32"
+                            )
+                        return key
+
+                for match in _IMAGE_KEY16_RE.finditer(data):
+                    candidate = match.group()
+                    fmt = try_image_aes_key(candidate, ciphertext)
+                    if fmt:
+                        key = candidate.decode("ascii", errors="ignore")
+                        if log_fn:
+                            log_fn(
+                                f"[wechat-decrypt] 命中图片 AES key pid={pid} ({process_name}) "
+                                f"fmt={fmt} len=16"
+                            )
+                        return key
+
+                if log_fn and (reg_idx + 1) % 200 == 0 and total_bytes > 0:
+                    progress = scanned_bytes / total_bytes * 100
+                    log_fn(
+                        f"[wechat-decrypt] 扫描图片 key PID={pid} 进度 {progress:.1f}%"
+                    )
+        finally:
+            kernel32.CloseHandle(handle)
+
+    return ""
+
+
+def discover_image_crypto(source_data_dir: str, preferred_pid: int = 0, log_fn=None):
+    v2_samples = detect_v2_image_samples(source_data_dir)
+    if not v2_samples:
+        return "", 0x88
+
+    xor_key = derive_image_xor_key(v2_samples)
+    ciphertext = v2_samples[0][1][15:31]
+    aes_key = scan_memory_for_image_aes_key(ciphertext, preferred_pid=preferred_pid, log_fn=log_fn)
+
+    if log_fn:
+        if aes_key:
+            log_fn(f"[wechat-decrypt] 图片密钥已就绪，xor=0x{xor_key:02x}")
+        else:
+            log_fn("[wechat-decrypt] 未找到图片 AES key，V2 图片将无法解密")
+
+    return aes_key, xor_key
+
+
+def load_image_crypto_config(source_data_dir: str = "", preferred_pid: int = 0, log_fn=None):
     aes_key = (os.environ.get("WECHAT_IMAGE_AES_KEY") or "").strip()
     xor_raw = (os.environ.get("WECHAT_IMAGE_XOR_KEY") or "0x88").strip()
     try:
         xor_key = int(xor_raw, 0)
     except ValueError:
         xor_key = 0x88
-    return aes_key, xor_key
+
+    if aes_key:
+        return aes_key, xor_key
+
+    if source_data_dir:
+        discovered_key, discovered_xor = discover_image_crypto(
+            source_data_dir,
+            preferred_pid=preferred_pid,
+            log_fn=log_fn,
+        )
+        if discovered_key:
+            return discovered_key, discovered_xor
+
+    return "", xor_key
 
 
 def extract_md5_from_packed_info(blob):
@@ -1090,8 +1262,9 @@ def decode_image_dat_file(dat_path: str, image_aes_key: str = "", image_xor_key:
     if len(data) > MAX_IMAGE_BYTES:
         return None
 
+    head6 = data[:6]
     decoded = decrypt_v2_dat(data, image_aes_key=image_aes_key, image_xor_key=image_xor_key)
-    if decoded is None:
+    if decoded is None and head6 not in (V2_MAGIC_FULL, V1_MAGIC_FULL):
         decoded = decrypt_legacy_dat(data)
     if decoded is None:
         return None
@@ -1132,6 +1305,19 @@ def resolve_db_path(decrypted_dir: str, candidates: list[str], log_fn=None) -> s
             if log_fn:
                 log_fn(f"[wechat-decrypt] 使用回退路径命中数据库: {resolved}")
             return resolved
+
+    if any("favorite" in os.path.basename(path).lower() for path in candidates):
+        for root, _, files in os.walk(decrypted_dir):
+            for file_name in files:
+                lower_name = file_name.lower()
+                if not lower_name.endswith(".db"):
+                    continue
+                if "favorite" not in lower_name and "fav" not in lower_name:
+                    continue
+                resolved = os.path.join(root, file_name)
+                if log_fn:
+                    log_fn(f"[wechat-decrypt] 使用模糊回退路径命中收藏数据库: {resolved}")
+                return resolved
 
     return ""
 
@@ -1184,8 +1370,12 @@ def head_image_db_candidates(decrypted_dir: str):
 def favorite_db_candidates(decrypted_dir: str):
     return [
         os.path.join(decrypted_dir, "favorite", "favorite.db"),
+        os.path.join(decrypted_dir, "favorite", "favorites.db"),
         os.path.join(decrypted_dir, "Favorite", "favorite.db"),
+        os.path.join(decrypted_dir, "Favorite", "favorites.db"),
+        os.path.join(decrypted_dir, "favorites", "favorite.db"),
         os.path.join(decrypted_dir, "favorites", "favorites.db"),
+        os.path.join(decrypted_dir, "Favorites", "favorite.db"),
         os.path.join(decrypted_dir, "Favorites", "favorites.db"),
         os.path.join(decrypted_dir, "favorite.db"),
         os.path.join(decrypted_dir, "favorites.db"),
@@ -1399,7 +1589,9 @@ def load_favorite_records(decrypted_dir: str, log_fn=None, event_fn=None, max_it
                         break
                 if len(favorites) >= max_items:
                     break
-    except Exception:
+    except Exception as exc:
+        if log_fn:
+            log_fn(f"[wechat-decrypt] 读取收藏数据库失败: {db_path} ({exc})")
         return favorites
 
     if log_fn:
