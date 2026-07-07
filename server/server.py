@@ -1987,8 +1987,16 @@ def describe_event(event_name, payload):
             f"（PID {payload.get('pid', '-')})。"
         )
     if event_name == "client_wechat_restart_started":
+        trigger_error = normalize_reason_text(payload.get("trigger_error", ""))
+        if trigger_error:
+            return (
+                f"当前这轮快速采集没有顺利完成，准备自动重启微信后重试；"
+                f"旧 PID {payload.get('previous_pid', '-')}"
+                f"；快速尝试窗口 {payload.get('quick_try_seconds', '-')} 秒；"
+                f"触发原因：{trigger_error}"
+            )
         return (
-            f"当前微信进程取密钥不稳定，准备自动重启微信；"
+            f"当前这轮快速采集没有顺利完成，准备自动重启微信后重试；"
             f"旧 PID {payload.get('previous_pid', '-')}"
             f"；快速尝试窗口 {payload.get('quick_try_seconds', '-')} 秒。"
         )
@@ -2014,6 +2022,12 @@ def describe_event(event_name, payload):
             f"硬超时 {payload.get('hard_timeout_seconds', '-')} 秒。"
         )
     if event_name == "client_decrypt_progress":
+        if payload.get("stage") == "timeout_extended_after_key_ready":
+            return (
+                f"已确认拿到数据库密钥，继续沿用当前微信进程完成导出；"
+                f"本轮超时窗口已从 {payload.get('original_hard_timeout_seconds', '-')}"
+                f" 秒延长到 {payload.get('hard_timeout_seconds', '-')} 秒。"
+            )
         return (
             f"解密仍在进行中，已运行 {payload.get('elapsed_seconds', 0)} 秒，"
             f"软超时 {payload.get('soft_timeout_seconds', '-')} 秒，"

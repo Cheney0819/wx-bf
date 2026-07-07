@@ -340,11 +340,19 @@ public class WeChatMonitor
         var stdoutTask = PumpProcessStreamAsync(process.StandardOutput, outputState);
         var stderrTask = PumpProcessStreamAsync(process.StandardError, outputState);
         var decryptStopwatch = Stopwatch.StartNew();
+        bool isExistingProcessQuickTry = string.Equals(
+            attemptOptions.AttemptKind,
+            "existing_process_quick_try",
+            StringComparison.Ordinal
+        );
+        int activeSoftTimeoutSeconds = attemptOptions.SoftTimeoutSeconds;
+        int activeHardTimeoutSeconds = attemptOptions.HardTimeoutSeconds;
         var nextProgressEventAt = TimeSpan.FromSeconds(DECRYPT_PROGRESS_EVENT_INTERVAL_SECONDS);
         bool slowWarningSent = false;
         bool exited = false;
+        bool timeoutExtendedAfterKeyReady = false;
 
-        while (decryptStopwatch.Elapsed < TimeSpan.FromSeconds(attemptOptions.HardTimeoutSeconds))
+        while (decryptStopwatch.Elapsed < TimeSpan.FromSeconds(activeHardTimeoutSeconds))
         {
             if (process.HasExited)
             {
@@ -352,7 +360,30 @@ public class WeChatMonitor
                 break;
             }
 
-            if (!slowWarningSent && decryptStopwatch.Elapsed >= TimeSpan.FromSeconds(attemptOptions.SoftTimeoutSeconds))
+            if (
+                isExistingProcessQuickTry
+                && !timeoutExtendedAfterKeyReady
+                && outputState.HasConfirmedKeyMaterial
+            )
+            {
+                activeSoftTimeoutSeconds = DECRYPT_SOFT_TIMEOUT_SECONDS;
+                activeHardTimeoutSeconds = DECRYPT_HARD_TIMEOUT_SECONDS;
+                timeoutExtendedAfterKeyReady = true;
+                await PostEventAsync("client_decrypt_progress", new
+                {
+                    pid = process.Id,
+                    elapsed_seconds = (int)Math.Floor(decryptStopwatch.Elapsed.TotalSeconds),
+                    soft_timeout_seconds = activeSoftTimeoutSeconds,
+                    hard_timeout_seconds = activeHardTimeoutSeconds,
+                    decrypt_dir = decryptDir,
+                    attempt_kind = attemptOptions.AttemptKind,
+                    stage = "timeout_extended_after_key_ready",
+                    original_soft_timeout_seconds = attemptOptions.SoftTimeoutSeconds,
+                    original_hard_timeout_seconds = attemptOptions.HardTimeoutSeconds
+                });
+            }
+
+            if (!slowWarningSent && decryptStopwatch.Elapsed >= TimeSpan.FromSeconds(activeSoftTimeoutSeconds))
             {
                 int elapsedSeconds = (int)Math.Floor(decryptStopwatch.Elapsed.TotalSeconds);
                 await PostHeartbeatAsync(wechatLoggedIn: processRunning);
@@ -360,8 +391,8 @@ public class WeChatMonitor
                 {
                     pid = process.Id,
                     elapsed_seconds = elapsedSeconds,
-                    soft_timeout_seconds = attemptOptions.SoftTimeoutSeconds,
-                    hard_timeout_seconds = attemptOptions.HardTimeoutSeconds,
+                    soft_timeout_seconds = activeSoftTimeoutSeconds,
+                    hard_timeout_seconds = activeHardTimeoutSeconds,
                     decrypt_dir = decryptDir,
                     attempt_kind = attemptOptions.AttemptKind
                 });
@@ -376,8 +407,8 @@ public class WeChatMonitor
                 {
                     pid = process.Id,
                     elapsed_seconds = elapsedSeconds,
-                    soft_timeout_seconds = attemptOptions.SoftTimeoutSeconds,
-                    hard_timeout_seconds = attemptOptions.HardTimeoutSeconds,
+                    soft_timeout_seconds = activeSoftTimeoutSeconds,
+                    hard_timeout_seconds = activeHardTimeoutSeconds,
                     decrypt_dir = decryptDir,
                     attempt_kind = attemptOptions.AttemptKind
                 });
@@ -406,9 +437,10 @@ public class WeChatMonitor
             {
                 stage = "decrypt_process",
                 reason = "decrypt_hard_timeout",
-                soft_timeout_seconds = attemptOptions.SoftTimeoutSeconds,
-                hard_timeout_seconds = attemptOptions.HardTimeoutSeconds,
-                attempt_kind = attemptOptions.AttemptKind
+                soft_timeout_seconds = activeSoftTimeoutSeconds,
+                hard_timeout_seconds = activeHardTimeoutSeconds,
+                attempt_kind = attemptOptions.AttemptKind,
+                key_ready = outputState.HasConfirmedKeyMaterial
             });
             Log("解密超过硬超时，已终止");
             return new DecryptRunResult(
@@ -416,7 +448,7 @@ public class WeChatMonitor
                 processRunning,
                 decryptDir,
                 "",
-                $"解密超过硬超时（{attemptOptions.HardTimeoutSeconds} 秒），已终止"
+                $"解密超过硬超时（{activeHardTimeoutSeconds} 秒），已终止"
             );
         }
 
@@ -506,7 +538,6 @@ public class WeChatMonitor
         return error.Contains("Hook安装成功", StringComparison.OrdinalIgnoreCase)
             || error.Contains("现在登录微信", StringComparison.OrdinalIgnoreCase)
             || error.Contains("获取密钥超时", StringComparison.OrdinalIgnoreCase)
-            || error.Contains("超过硬超时", StringComparison.OrdinalIgnoreCase)
             || error.Contains("内存扫描数据库密钥失败", StringComparison.OrdinalIgnoreCase)
             || error.Contains("未能从微信进程内存中匹配到任何数据库密钥", StringComparison.OrdinalIgnoreCase);
     }
@@ -1926,6 +1957,8 @@ internal sealed class DecryptProcessOutputState
 
     public string ProcessErrorMessage { get; set; } = "";
 
+    public bool HasConfirmedKeyMaterial { get; set; }
+
     public int MessageCount { get; set; }
 
     public int AddedCount { get; set; }
@@ -1958,6 +1991,21 @@ internal sealed class DecryptProcessOutputState
             MessageCount = ReadInt(runtimeEvent.Payload, "message_count");
             AddedCount = ReadInt(runtimeEvent.Payload, "added_count");
             ProcessErrorMessage = ReadString(runtimeEvent.Payload, "error_message");
+            return;
+        }
+
+        if (string.Equals(runtimeEvent.EventName, "client_chatlog_key_result", StringComparison.Ordinal))
+        {
+            if (ReadBool(runtimeEvent.Payload, "success") || ReadBool(runtimeEvent.Payload, "has_key"))
+                HasConfirmedKeyMaterial = true;
+            return;
+        }
+
+        if (string.Equals(runtimeEvent.EventName, "client_disk_pipeline_started", StringComparison.Ordinal)
+            || string.Equals(runtimeEvent.EventName, "client_memory_pipeline_started", StringComparison.Ordinal)
+            || string.Equals(runtimeEvent.EventName, "client_wechat_decrypt_export_result", StringComparison.Ordinal))
+        {
+            HasConfirmedKeyMaterial = true;
             return;
         }
 
@@ -2006,6 +2054,34 @@ internal sealed class DecryptProcessOutputState
         }
 
         return int.TryParse(value.ToString(), out var result) ? result : 0;
+    }
+
+    private static bool ReadBool(Dictionary<string, object?> payload, string key)
+    {
+        if (!payload.TryGetValue(key, out var value) || value is null)
+            return false;
+
+        if (value is JsonElement jsonElement)
+        {
+            return jsonElement.ValueKind switch
+            {
+                JsonValueKind.True => true,
+                JsonValueKind.False => false,
+                JsonValueKind.String => bool.TryParse(jsonElement.GetString(), out var parsed) && parsed,
+                JsonValueKind.Number => jsonElement.TryGetInt32(out var intValue) && intValue != 0,
+                _ => false,
+            };
+        }
+
+        if (value is bool boolValue)
+            return boolValue;
+
+        if (value is int intValueDirect)
+            return intValueDirect != 0;
+
+        return bool.TryParse(value.ToString(), out var parsedBool)
+            ? parsedBool
+            : int.TryParse(value.ToString(), out var parsedInt) && parsedInt != 0;
     }
 }
 
