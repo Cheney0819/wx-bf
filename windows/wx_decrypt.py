@@ -1243,6 +1243,7 @@ def export_v4_messages(
         str(export_path),
         max_messages=MAX_MESSAGES,
         source_data_dir=selected_data_dir,
+        preferred_pid=pid,
         log_fn=log_debug,
         event_fn=emit_runtime_event,
     )
