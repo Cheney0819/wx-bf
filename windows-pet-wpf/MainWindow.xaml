@@ -1,0 +1,70 @@
+<Window
+    x:Class="DesktopPet.Wpf.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="Desktop Pet"
+    Width="320"
+    Height="340"
+    WindowStyle="None"
+    ResizeMode="NoResize"
+    AllowsTransparency="True"
+    Background="Transparent"
+    ShowInTaskbar="False"
+    Topmost="True">
+    <Grid>
+        <Canvas>
+            <Border
+                x:Name="SpeechBubble"
+                Canvas.Left="58"
+                Canvas.Top="8"
+                MinWidth="160"
+                MaxWidth="210"
+                Padding="14,10"
+                CornerRadius="18"
+                Background="#FFF0F6">
+                <TextBlock
+                    x:Name="SpeechText"
+                    Text="妈妈，我来陪你啦。"
+                    Foreground="#8D2D59"
+                    FontSize="14"
+                    TextAlignment="Center"
+                    TextWrapping="Wrap" />
+            </Border>
+
+            <Border
+                x:Name="EmotionBadge"
+                Canvas.Left="244"
+                Canvas.Top="64"
+                MinWidth="34"
+                Height="30"
+                Padding="8,0"
+                CornerRadius="15"
+                Background="#FFFFFFFF">
+                <TextBlock
+                    x:Name="EmotionText"
+                    VerticalAlignment="Center"
+                    HorizontalAlignment="Center"
+                    FontSize="16"
+                    FontWeight="Bold"
+                    Foreground="#FF5E98"
+                    Text="♡" />
+            </Border>
+
+            <Polygon
+                Canvas.Left="150"
+                Canvas.Top="72"
+                Points="0,0 16,0 8,10"
+                Fill="#FFF0F6" />
+
+            <Image
+                x:Name="PetImage"
+                Canvas.Left="52"
+                Canvas.Top="88"
+                Width="220"
+                Height="220"
+                Stretch="Uniform"
+                SnapsToDevicePixels="True"
+                RenderOptions.BitmapScalingMode="NearestNeighbor" />
+        </Canvas>
+    </Grid>
+</Window>

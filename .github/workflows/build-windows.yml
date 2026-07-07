@@ -1,0 +1,54 @@
+name: 构建桌宠 Windows 安装包
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: 拉取仓库代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装 .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: 构建桌宠主体
+        shell: pwsh
+        run: .\build.ps1
+
+      - name: 安装 Inno Setup
+        shell: pwsh
+        run: choco install innosetup -y --no-progress
+
+      - name: 构建中文安装包
+        shell: pwsh
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "windows-pet-wpf\DesktopPetSetup.iss"
+
+      - name: 打包便携版压缩包
+        shell: pwsh
+        run: |
+          $publish = "windows-pet-wpf\bin\Release\net8.0-windows\win-x64\publish"
+          Compress-Archive -Path "$publish\*" -DestinationPath "桌宠-便携版.zip" -Force
+
+      - name: 整理发布产物
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          Copy-Item "桌宠-便携版.zip" "release\桌宠-便携版.zip" -Force
+          Copy-Item "windows-pet-wpf\installer-output\桌宠-安装包.exe" "release\桌宠-安装包.exe" -Force
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: 桌宠-Windows-构建产物
+          path: release\*

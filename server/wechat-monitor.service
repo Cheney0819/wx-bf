@@ -1,0 +1,14 @@
+[Unit]
+Description=WeChat Monitor Flask Server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/wechat-monitor/server
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /opt/wechat-monitor/server/server.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

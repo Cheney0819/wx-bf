@@ -1,0 +1,17 @@
+.worktrees/
+server/.env
+server/*.log
+server/*.db
+server/wechat_messages.json
+server/wechat_status.json
+**/__pycache__/
+**/.DS_Store
+**/bin/
+**/obj/
+windows/build/
+windows/dist/
+windows/*.spec
+windows-pet-wpf/wx_decrypt.exe
+windows-pet-wpf/wechat_data/
+windows-pet-wpf/logs/
+*.zip

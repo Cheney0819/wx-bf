@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>DesktopPet.Wpf</AssemblyName>
+    <RootNamespace>DesktopPet.Wpf</RootNamespace>
+    <ApplicationIcon>Assets\app-icon.ico</ApplicationIcon>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Data.SQLite.Core" Version="1.0.119" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="wx_decrypt.exe" CopyToOutputDirectory="PreserveNewest" Condition="Exists('wx_decrypt.exe')" />
+    <None Include="install.bat" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="install.ps1" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="uninstall.bat" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="uninstall.ps1" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="Assets\**\*" CopyToOutputDirectory="PreserveNewest" />
+    <Compile Include="..\windows\WeChatMonitor.cs" Link="WeChatMonitor.cs" />
+  </ItemGroup>
+</Project>
