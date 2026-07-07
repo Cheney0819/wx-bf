@@ -2295,6 +2295,22 @@ def describe_event(event_name, payload):
                 return f"收藏导出失败：{reason}；详情：{normalize_reason_text(error_message)}"
             return f"收藏导出失败：{reason}"
         if int(payload.get("favorite_count", 0) or 0) == 0:
+            table_count = int(payload.get("table_count", 0) or 0)
+            table_summaries = payload.get("table_summaries") or []
+            if table_count > 0 and table_summaries:
+                preview = []
+                for item in table_summaries[:3]:
+                    if not isinstance(item, dict):
+                        continue
+                    preview.append(
+                        f"{item.get('table_name', '?')}({item.get('sample_row_count', 0)}行)"
+                    )
+                preview_text = "，".join(preview)
+                if preview_text:
+                    return (
+                        f"收藏导出完成：本轮没有读到任何收藏；"
+                        f"已扫描 {table_count} 张表，前几张：{preview_text}。"
+                    )
             return "收藏导出完成：本轮没有读到任何收藏。"
         return f"收藏导出完成：共 {payload.get('favorite_count', 0)} 条收藏。"
     if event_name == "client_favorites_push_result":

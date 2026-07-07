@@ -1585,6 +1585,7 @@ def load_favorite_records(decrypted_dir: str, log_fn=None, event_fn=None, max_it
 
     favorites = []
     seen = set()
+    table_summaries = []
     try:
         with closing(sqlite3.connect(db_path)) as conn:
             conn.row_factory = sqlite3.Row
@@ -1598,6 +1599,14 @@ def load_favorite_records(decrypted_dir: str, log_fn=None, event_fn=None, max_it
                 columns = get_table_columns(conn, table_name)
                 column_names = [column["name"] for column in columns]
                 rows = conn.execute(f"SELECT rowid AS __rowid__, * FROM [{table_name}] ORDER BY rowid DESC LIMIT 500").fetchall()
+                table_summaries.append(
+                    {
+                        "table_name": table_name,
+                        "sample_row_count": len(rows),
+                        "column_count": len(column_names),
+                        "columns": column_names[:12],
+                    }
+                )
 
                 for row in rows:
                     source_id = ""
@@ -1674,6 +1683,8 @@ def load_favorite_records(decrypted_dir: str, log_fn=None, event_fn=None, max_it
                     "reason": "favorite_db_read_failed",
                     "db_path": db_path,
                     "error_message": str(exc),
+                    "table_count": len(table_summaries),
+                    "table_summaries": table_summaries[:8],
                 },
             )
         return favorites
@@ -1687,6 +1698,8 @@ def load_favorite_records(decrypted_dir: str, log_fn=None, event_fn=None, max_it
                 "success": True,
                 "favorite_count": len(favorites),
                 "db_path": db_path,
+                "table_count": len(table_summaries),
+                "table_summaries": table_summaries[:8],
             },
         )
     return favorites
