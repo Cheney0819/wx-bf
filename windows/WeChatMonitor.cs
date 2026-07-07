@@ -257,10 +257,11 @@ public class WeChatMonitor
 
         await PostEventAsync("client_wechat_restart_started", new
         {
-            reason = "existing_process_hook_waiting_login",
+            reason = "existing_process_retry_required",
             previous_pid = currentWeChatProcess.ProcessId,
             executable_path = currentWeChatProcess.ExecutablePath,
-            quick_try_seconds = EXISTING_PROCESS_QUICK_TRY_SECONDS
+            quick_try_seconds = EXISTING_PROCESS_QUICK_TRY_SECONDS,
+            trigger_error = quickTryResult.ErrorMessage
         });
 
         var restartResult = await RestartWeChatAndWaitForNewProcessAsync(currentWeChatProcess);
@@ -495,7 +496,9 @@ public class WeChatMonitor
         return error.Contains("Hook安装成功", StringComparison.OrdinalIgnoreCase)
             || error.Contains("现在登录微信", StringComparison.OrdinalIgnoreCase)
             || error.Contains("获取密钥超时", StringComparison.OrdinalIgnoreCase)
-            || error.Contains("超过硬超时", StringComparison.OrdinalIgnoreCase);
+            || error.Contains("超过硬超时", StringComparison.OrdinalIgnoreCase)
+            || error.Contains("内存扫描数据库密钥失败", StringComparison.OrdinalIgnoreCase)
+            || error.Contains("未能从微信进程内存中匹配到任何数据库密钥", StringComparison.OrdinalIgnoreCase);
     }
 
     private static async Task<WeChatRestartResult> RestartWeChatAndWaitForNewProcessAsync(WeChatProcessSnapshot currentWeChatProcess)
