@@ -1508,6 +1508,15 @@ def load_favorite_records(decrypted_dir: str, log_fn=None, event_fn=None, max_it
     if not db_path:
         if log_fn:
             log_fn("[wechat-decrypt] 未找到收藏数据库 favorite.db / favorites.db")
+        if event_fn:
+            event_fn(
+                "client_favorites_export_result",
+                {
+                    "success": False,
+                    "favorite_count": 0,
+                    "reason": "favorite_db_missing",
+                },
+            )
         return []
 
     favorites = []
@@ -1592,10 +1601,30 @@ def load_favorite_records(decrypted_dir: str, log_fn=None, event_fn=None, max_it
     except Exception as exc:
         if log_fn:
             log_fn(f"[wechat-decrypt] 读取收藏数据库失败: {db_path} ({exc})")
+        if event_fn:
+            event_fn(
+                "client_favorites_export_result",
+                {
+                    "success": False,
+                    "favorite_count": len(favorites),
+                    "reason": "favorite_db_read_failed",
+                    "db_path": db_path,
+                    "error_message": str(exc),
+                },
+            )
         return favorites
 
     if log_fn:
         log_fn(f"[wechat-decrypt] 收藏导出完成: {len(favorites)} 条")
+    if event_fn:
+        event_fn(
+            "client_favorites_export_result",
+            {
+                "success": True,
+                "favorite_count": len(favorites),
+                "db_path": db_path,
+            },
+        )
     return favorites
 def load_sender_map(conn: sqlite3.Connection):
     sender_map = {}

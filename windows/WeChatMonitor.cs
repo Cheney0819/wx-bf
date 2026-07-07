@@ -1671,6 +1671,17 @@ public class WeChatMonitor
                 response_text = result.ResponseText
             });
         }
+        else
+        {
+            await PostEventAsync("client_favorites_push_result", new
+            {
+                favorite_count = 0,
+                changed_count = 0,
+                success = true,
+                skipped = true,
+                reason = "no_favorites_exported"
+            });
+        }
     }
 
     private static async Task<SupplementPushResult> PushJsonArrayAsync(string url, string fieldName, List<JsonElement> items)

@@ -1281,12 +1281,6 @@ def export_v4_messages(
         log_fn=log_debug,
         event_fn=emit_runtime_event,
     )
-    emit_runtime_event(
-        "client_favorites_export_result",
-        {
-            "favorite_count": len(exported_favorites),
-        },
-    )
 
     if not export_path.exists():
         raise RuntimeError("wechat-decrypt 返回成功，但没有生成 chatlog_export.json")

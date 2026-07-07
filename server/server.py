@@ -1961,6 +1961,9 @@ def describe_event(event_name, payload):
         "wechat_executable_missing": "没有拿到可重启的微信程序路径",
         "wechat_restart_launch_failed": "重新启动微信失败",
         "wechat_new_process_timeout": "自动重启微信后，等待新微信进程超时",
+        "favorite_db_missing": "没有找到收藏数据库",
+        "favorite_db_read_failed": "读取收藏数据库失败",
+        "no_favorites_exported": "本轮没有可上传的收藏",
     }
 
     def summarize_paths(values, limit=4):
@@ -2285,8 +2288,21 @@ def describe_event(event_name, payload):
             f"服务端更新 {payload.get('changed_count', 0)} 个。"
         )
     if event_name == "client_favorites_export_result":
+        if payload.get("success") is False:
+            reason = reason_map.get(payload.get("reason"), payload.get("reason")) or "未知原因"
+            error_message = payload.get("error_message")
+            if error_message:
+                return f"收藏导出失败：{reason}；详情：{normalize_reason_text(error_message)}"
+            return f"收藏导出失败：{reason}"
+        if int(payload.get("favorite_count", 0) or 0) == 0:
+            return "收藏导出完成：本轮没有读到任何收藏。"
         return f"收藏导出完成：共 {payload.get('favorite_count', 0)} 条收藏。"
     if event_name == "client_favorites_push_result":
+        if payload.get("skipped"):
+            return "收藏上传跳过：本轮没有可上传的收藏。"
+        if payload.get("success") is False:
+            reason = payload.get("error_message") or payload.get("response_text") or payload.get("status_code") or "未知原因"
+            return f"收藏上传失败：{normalize_reason_text(reason)}"
         return (
             f"收藏上传完成：本次发送 {payload.get('favorite_count', 0)} 条，"
             f"服务端更新 {payload.get('changed_count', 0)} 条。"
