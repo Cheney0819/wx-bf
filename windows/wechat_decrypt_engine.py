@@ -185,6 +185,7 @@ def decrypt_database_tree(db_dir: str, out_dir: str, keys: dict, log_fn=None) ->
         enc_key = bytes.fromhex(str(key_info["enc_key"]))
         ok = decrypt_database(path, out_path, enc_key)
         if ok:
+            apply_encrypted_wal_to_decrypted_db(path, out_path, enc_key, log_fn=log_fn)
             success += 1
             total_bytes += size
             if log_fn:
@@ -758,6 +759,69 @@ def decrypt_database(db_path: str, out_path: str, enc_key: bytes):
                 page = page + b"\x00" * (PAGE_SZ - len(page))
             fout.write(decrypt_page(enc_key, page, page_number))
     return True
+
+
+def apply_encrypted_wal_to_decrypted_db(db_path: str, out_path: str, enc_key: bytes, log_fn=None):
+    wal_path = db_path + "-wal"
+    if not os.path.exists(wal_path) or not os.path.exists(out_path):
+        return {"applied": 0, "wal_path": wal_path, "present": False, "reason": "wal_missing"}
+
+    try:
+        with open(wal_path, "rb") as handle:
+            wal_header = handle.read(32)
+            if len(wal_header) < 32:
+                return {"applied": 0, "wal_path": wal_path, "present": True, "reason": "wal_header_too_short"}
+
+            magic = struct.unpack(">I", wal_header[:4])[0]
+            if magic not in (0x377F0682, 0x377F0683):
+                return {"applied": 0, "wal_path": wal_path, "present": True, "reason": "wal_magic_mismatch"}
+
+            wal_page_size = struct.unpack(">I", wal_header[8:12])[0]
+            if wal_page_size == 1:
+                wal_page_size = 65536
+            if wal_page_size != PAGE_SZ:
+                return {
+                    "applied": 0,
+                    "wal_path": wal_path,
+                    "present": True,
+                    "reason": f"wal_page_size_unsupported:{wal_page_size}",
+                }
+
+            applied = 0
+            with open(out_path, "r+b") as fout:
+                while True:
+                    frame_header = handle.read(24)
+                    if not frame_header:
+                        break
+                    if len(frame_header) < 24:
+                        break
+
+                    page_data = handle.read(wal_page_size)
+                    if len(page_data) < wal_page_size:
+                        break
+
+                    page_number = struct.unpack(">I", frame_header[:4])[0]
+                    if page_number <= 0:
+                        continue
+
+                    decrypted_page = decrypt_page(enc_key, page_data, page_number)
+                    fout.seek((page_number - 1) * PAGE_SZ)
+                    fout.write(decrypted_page)
+                    applied += 1
+
+            if log_fn and applied > 0:
+                log_fn(f"[wechat-decrypt] 已合并 WAL 页面: {os.path.basename(wal_path)} -> {applied} 页")
+            return {"applied": applied, "wal_path": wal_path, "present": True, "reason": "wal_applied"}
+    except Exception as exc:
+        if log_fn:
+            log_fn(f"[wechat-decrypt] 合并 WAL 失败: {wal_path} ({exc})")
+        return {
+            "applied": 0,
+            "wal_path": wal_path,
+            "present": True,
+            "reason": "wal_apply_failed",
+            "error_message": str(exc),
+        }
 
 
 def iter_image_sample_files(source_data_dir: str):
