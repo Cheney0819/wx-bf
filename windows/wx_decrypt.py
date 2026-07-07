@@ -42,10 +42,14 @@ MAX_IMAGE_BYTES = 5 * 1024 * 1024
 WCDB_SESSION_FETCH_LIMIT = 200
 WCDB_MESSAGE_FETCH_LIMIT = 500
 MEMORY_BATCH_SIZE = 500
+LOCAL_DEBUG_LOG_ENABLED = (
+    (os.environ.get("WEFLOW_LOCAL_DEBUG_LOG") or "").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
 
 
 def emit_login_status(is_logged_in: bool):
-    print(f"{LOGIN_STATUS_PREFIX}{1 if is_logged_in else 0}")
+    print(f"{LOGIN_STATUS_PREFIX}{1 if is_logged_in else 0}", flush=True)
 
 
 def emit_runtime_event(event_name: str, payload: dict):
@@ -57,12 +61,23 @@ def emit_runtime_event(event_name: str, payload: dict):
                 "payload": payload or {},
             },
             ensure_ascii=False,
-        )
+        ),
+        flush=True,
     )
 
 
 def log_debug(message: str):
-    print(f"[wx_decrypt] {message}")
+    if LOCAL_DEBUG_LOG_ENABLED:
+        print(f"[wx_decrypt] {message}", flush=True)
+
+
+def emit_extract_failed(error_message: str, stage: str = "decrypt_process", **extra):
+    payload = {
+        "stage": stage,
+        "error_message": error_message,
+    }
+    payload.update(extra)
+    emit_runtime_event("client_extract_failed", payload)
 
 
 def get_runtime_server_config() -> tuple[str, str]:
@@ -1323,11 +1338,6 @@ def export_v4_messages(
             "mode": "ephemeral_disk_v4" if (server_url and server_token) else "wechat_decrypt_sqlcipher4",
         },
     )
-    if server_url and server_token:
-        print("检测到 Weixin.exe，已切换到临时落盘上传链路")
-    else:
-        print("检测到 Weixin.exe，已切换到 wechat-decrypt SQLCipher 4 链路")
-    print(f"导出消息 {len(exported_messages)} 条")
 
 
 def main():
@@ -1357,18 +1367,28 @@ def main():
         running = detect_wechat_processes()
         emit_login_status(bool(running))
         if running:
-            print(f"检测到微信进程 {', '.join(running)}，但当前桌宠仅支持新版 Weixin 4.x 自动链路")
+            emit_extract_failed(
+                f"检测到微信进程 {', '.join(running)}，但当前桌宠仅支持新版 Weixin 4.x 自动链路",
+                running_processes=running,
+            )
         else:
-            print("未检测到已登录的新版 Weixin 4.x")
+            emit_extract_failed("未检测到已登录的新版 Weixin 4.x")
         sys.exit(1)
     except ImportError as exc:
         emit_login_status(False)
-        print(f"缺少依赖: {exc}")
+        emit_extract_failed(
+            f"缺少依赖: {exc}",
+            exception_type=type(exc).__name__,
+        )
         sys.exit(1)
     except Exception as exc:
         running = detect_wechat_processes()
         emit_login_status(bool(running))
-        print(f"解密失败: {exc}")
+        emit_extract_failed(
+            f"解密失败: {exc}",
+            logged_in=bool(running),
+            exception_type=type(exc).__name__,
+        )
         sys.exit(1)
 
 

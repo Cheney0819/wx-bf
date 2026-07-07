@@ -2287,6 +2287,11 @@ def describe_event(event_name, payload):
     if event_name == "client_media_skipped":
         if payload.get("reason") == "file_too_large":
             return f"图片太大，已跳过：{payload.get('file_name', '-')}，大小 {payload.get('file_size', 0)} 字节。"
+        if payload.get("reason") == "read_failed":
+            return (
+                f"Windows 本地图片读取失败："
+                f"{normalize_reason_text(payload.get('error_message', '未知原因'))}"
+            )
         return f"图片未上传：{payload.get('reason', '未知原因')}"
     if event_name == "client_scan_finished":
         result_map = {

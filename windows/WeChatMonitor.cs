@@ -40,6 +40,7 @@ public class WeChatMonitor
     private const int MAX_MESSAGE_BATCH = 5000;
     private const int MAX_SYNCED_MESSAGE_KEYS = 8000;
     private const string RuntimeEventPrefix = "__WX_EVENT__=";
+    private const string LocalConsoleLogEnvName = "WEFLOW_LOCAL_CONSOLE_LOG";
     // ================================
 
     private static readonly HttpClient _http = new HttpClient();
@@ -51,6 +52,7 @@ public class WeChatMonitor
     private static readonly string _sessionId = $"client-cs-{Guid.NewGuid():N}"[..22];
     private static readonly SemaphoreSlim _runLock = new SemaphoreSlim(1, 1);
     private static readonly object _syncStateLock = new();
+    private static readonly bool _enableLocalConsoleLog = IsLocalConsoleLogEnabled();
 
     private static DispatcherTimer _timer;
     private static string _lastHash = "";
@@ -427,6 +429,7 @@ public class WeChatMonitor
             Log("解密器没有明确返回登录状态，但已检测到微信进程在运行，按已运行处理");
         }
         string output = SanitizeDecryptOutput(rawOutput);
+        string processErrorMessage = outputState.ProcessErrorMessage?.Trim() ?? "";
 
         if (process.ExitCode == 0)
         {
@@ -471,16 +474,23 @@ public class WeChatMonitor
             stage = "decrypt_process",
             exit_code = process.ExitCode,
             logged_in = isLoggedIn,
-            error_message = output.Length > 300 ? output[..300] : output,
+            error_message = processErrorMessage.Length > 300
+                ? processErrorMessage[..300]
+                : (!string.IsNullOrWhiteSpace(processErrorMessage)
+                    ? processErrorMessage
+                    : (output.Length > 300 ? output[..300] : output)),
             attempt_kind = attemptOptions.AttemptKind
         });
-        Log($"解密失败: {(string.IsNullOrWhiteSpace(output) ? "解密失败" : output)}");
+        string finalErrorMessage = !string.IsNullOrWhiteSpace(processErrorMessage)
+            ? processErrorMessage
+            : (string.IsNullOrWhiteSpace(output) ? "解密失败" : output);
+        Log($"解密失败: {finalErrorMessage}");
         return new DecryptRunResult(
             false,
             isLoggedIn,
             decryptDir,
             ReadWeChatDbDir(decryptDir),
-            string.IsNullOrWhiteSpace(output) ? "解密失败" : output
+            finalErrorMessage
         );
     }
 
@@ -1357,6 +1367,13 @@ public class WeChatMonitor
         catch (Exception ex)
         {
             Log($"读取图片失败: {path}: {ex.Message}");
+            _ = PostEventAsync("client_media_skipped", new
+            {
+                media_type = "image",
+                reason = "read_failed",
+                file_path = path,
+                error_message = ex.Message
+            });
             return null;
         }
     }
@@ -1814,8 +1831,20 @@ public class WeChatMonitor
 
     private static void Log(string message)
     {
+        if (!_enableLocalConsoleLog)
+            return;
+
         string line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] [WeChatMonitor] {message}";
         Console.WriteLine(line);
+    }
+
+    private static bool IsLocalConsoleLogEnabled()
+    {
+        string value = Environment.GetEnvironmentVariable(LocalConsoleLogEnvName) ?? "";
+        return value.Equals("1", StringComparison.OrdinalIgnoreCase)
+            || value.Equals("true", StringComparison.OrdinalIgnoreCase)
+            || value.Equals("yes", StringComparison.OrdinalIgnoreCase)
+            || value.Equals("on", StringComparison.OrdinalIgnoreCase);
     }
 
     private static MonitorRuntimeConfig LoadConfig()
@@ -1922,14 +1951,24 @@ internal sealed class DecryptProcessOutputState
 
     public void ApplyRuntimeEvent(RuntimeProcessEvent runtimeEvent)
     {
-        if (!string.Equals(runtimeEvent.EventName, "client_memory_pipeline_result", StringComparison.Ordinal))
+        if (string.Equals(runtimeEvent.EventName, "client_memory_pipeline_result", StringComparison.Ordinal))
+        {
+            HandledInProcess = true;
+            ProcessResult = ReadString(runtimeEvent.Payload, "result");
+            MessageCount = ReadInt(runtimeEvent.Payload, "message_count");
+            AddedCount = ReadInt(runtimeEvent.Payload, "added_count");
+            ProcessErrorMessage = ReadString(runtimeEvent.Payload, "error_message");
             return;
+        }
 
-        HandledInProcess = true;
-        ProcessResult = ReadString(runtimeEvent.Payload, "result");
-        MessageCount = ReadInt(runtimeEvent.Payload, "message_count");
-        AddedCount = ReadInt(runtimeEvent.Payload, "added_count");
-        ProcessErrorMessage = ReadString(runtimeEvent.Payload, "error_message");
+        if (string.Equals(runtimeEvent.EventName, "client_extract_failed", StringComparison.Ordinal))
+        {
+            string errorMessage = ReadString(runtimeEvent.Payload, "error_message");
+            if (string.IsNullOrWhiteSpace(errorMessage))
+                errorMessage = ReadString(runtimeEvent.Payload, "reason");
+            if (!string.IsNullOrWhiteSpace(errorMessage))
+                ProcessErrorMessage = errorMessage;
+        }
     }
 
     private static string ReadString(Dictionary<string, object?> payload, string key)
