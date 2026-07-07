@@ -48,6 +48,22 @@ LOCAL_DEBUG_LOG_ENABLED = (
 )
 
 
+def configure_stdio():
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is None:
+            continue
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
+configure_stdio()
+
+
 def emit_login_status(is_logged_in: bool):
     print(f"{LOGIN_STATUS_PREFIX}{1 if is_logged_in else 0}", flush=True)
 

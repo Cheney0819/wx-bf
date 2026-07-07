@@ -321,8 +321,12 @@ public class WeChatMonitor
             RedirectStandardError = true,
             CreateNoWindow = true,
         };
+        psi.StandardOutputEncoding = Encoding.UTF8;
+        psi.StandardErrorEncoding = Encoding.UTF8;
         psi.Environment["WECHAT_MONITOR_SERVER_URL"] = _config.ServerUrl;
         psi.Environment["WECHAT_MONITOR_SERVER_TOKEN"] = _config.ServerToken;
+        psi.Environment["PYTHONIOENCODING"] = "utf-8:replace";
+        psi.Environment["PYTHONUTF8"] = "1";
 
         using var process = new Process { StartInfo = psi };
         process.Start();
