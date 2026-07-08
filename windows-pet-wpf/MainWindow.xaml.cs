@@ -5,6 +5,7 @@ using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
+using DesktopPet.Wpf.Services;
 using Forms = System.Windows.Forms;
 
 namespace DesktopPet.Wpf;
@@ -17,10 +18,18 @@ public partial class MainWindow : Window
     private readonly DispatcherTimer _energyTimer = new() { Interval = TimeSpan.FromSeconds(4) };
     private readonly List<BitmapSource> _frames = [];
     private readonly Forms.NotifyIcon _notifyIcon = new();
+    private readonly SpeechSessionController _speechSessionController = new();
+    private readonly AudioCaptureService _audioCaptureService = new();
+    private readonly AudioPlaybackService _audioPlaybackService = new();
     private System.Windows.Point _dragStart;
     private bool _isDraggingWindow;
     private bool _dragVisualShown;
     private bool _suppressClickRelease;
+    private string? _speechOverrideText;
+    private string? _emotionOverrideText;
+    private DateTime _speechOverrideUntil;
+    private ChatInputWindow? _chatInputWindow;
+    private CancellationTokenSource? _activeChatCts;
 
     public MainWindow()
     {
@@ -62,6 +71,17 @@ public partial class MainWindow : Window
 
     protected override void OnClosed(EventArgs e)
     {
+        _activeChatCts?.Cancel();
+        _activeChatCts?.Dispose();
+        _audioCaptureService.Dispose();
+        _audioPlaybackService.Dispose();
+        if (_chatInputWindow is not null)
+        {
+            _chatInputWindow.Submitted -= ChatInputWindowOnSubmitted;
+            _chatInputWindow.RecordingToggled -= ChatInputWindowOnRecordingToggled;
+            _chatInputWindow.Close();
+            _chatInputWindow = null;
+        }
         _notifyIcon.Visible = false;
         _notifyIcon.Dispose();
         base.OnClosed(e);
@@ -74,6 +94,7 @@ public partial class MainWindow : Window
         _notifyIcon.Visible = true;
 
         var menu = new Forms.ContextMenuStrip();
+        menu.Items.Add("跟我聊天", null, (_, _) => OpenChatInputWindow());
         menu.Items.Add("陪我一下", null, (_, _) => ApplyVisual(_engine.Interact("happy")));
         menu.Items.Add("安静陪伴", null, (_, _) => ApplyVisual(_engine.Interact("idle")));
         menu.Items.Add("先去睡觉", null, (_, _) => ApplyVisual(_engine.Interact("sleep")));
@@ -230,6 +251,8 @@ public partial class MainWindow : Window
         EmotionText.Foreground = emotionBrush;
         PropBadge.Background = propBackgroundBrush;
         PropText.Foreground = propForegroundBrush;
+
+        ApplySpeechOverrideIfNeeded();
     }
 
     private void OnMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
@@ -317,6 +340,224 @@ public partial class MainWindow : Window
             _ => "listen",
         };
         ApplyVisual(_engine.Interact(action));
+    }
+
+    private void OpenChatInputWindow()
+    {
+        if (_chatInputWindow is not null)
+        {
+            _chatInputWindow.Show();
+            _chatInputWindow.Activate();
+            return;
+        }
+
+        _chatInputWindow = new ChatInputWindow();
+        _chatInputWindow.Submitted += ChatInputWindowOnSubmitted;
+        _chatInputWindow.RecordingToggled += ChatInputWindowOnRecordingToggled;
+        _chatInputWindow.Closed += (_, _) =>
+        {
+            if (_chatInputWindow is not null)
+            {
+                _chatInputWindow.Submitted -= ChatInputWindowOnSubmitted;
+                _chatInputWindow.RecordingToggled -= ChatInputWindowOnRecordingToggled;
+            }
+            _chatInputWindow = null;
+        };
+        _chatInputWindow.Show();
+        _chatInputWindow.Activate();
+    }
+
+    private async void ChatInputWindowOnSubmitted(object? sender, string text)
+    {
+        if (_activeChatCts is not null)
+            return;
+
+        _activeChatCts = new CancellationTokenSource();
+        _chatInputWindow?.SetBusyState(true, "我正在认真想回复哦");
+
+        SetSpeechOverride("我在认真听妈妈说话哦", TimeSpan.FromSeconds(8), "◔");
+        ApplyVisual(_engine.Interact("listen"));
+
+        try
+        {
+            await Task.Delay(250, _activeChatCts.Token);
+            SetSpeechOverride("让我想一下呀", TimeSpan.FromSeconds(12), "…");
+            ApplyVisual(_engine.Interact("blink"));
+
+            var result = await _speechSessionController.SendTextAsync(text, _activeChatCts.Token);
+            SetSpeechOverride(result.ReplyText, TimeSpan.FromSeconds(result.Success ? 20 : 14));
+            ApplyVisual(_engine.Interact(result.SuggestedAction));
+            _ = PlayReplyAudioIfNeededAsync(result.AudioFilePath);
+        }
+        catch (OperationCanceledException)
+        {
+            SetSpeechOverride("这次先停住啦，妈妈等会儿再叫我就好。", TimeSpan.FromSeconds(10), "!");
+            ApplyVisual(_engine.Interact("surprised"));
+        }
+        finally
+        {
+            _activeChatCts?.Dispose();
+            _activeChatCts = null;
+            _chatInputWindow?.SetBusyState(false, "按 Enter 发送，Shift+Enter 换行");
+        }
+    }
+
+    private async void ChatInputWindowOnRecordingToggled(object? sender, bool shouldStartRecording)
+    {
+        if (shouldStartRecording)
+        {
+            BeginVoiceCapture();
+            return;
+        }
+
+        await EndVoiceCaptureAndReplyAsync();
+    }
+
+    private async void MicButton_OnClick(object sender, RoutedEventArgs e)
+    {
+        e.Handled = true;
+
+        if (_audioCaptureService.IsRecording)
+        {
+            await EndVoiceCaptureAndReplyAsync();
+            return;
+        }
+
+        BeginVoiceCapture();
+    }
+
+    private async Task PlayReplyAudioIfNeededAsync(string audioFilePath)
+    {
+        if (string.IsNullOrWhiteSpace(audioFilePath))
+            return;
+
+        try
+        {
+            await _audioPlaybackService.PlayAndDeleteAsync(audioFilePath);
+        }
+        catch
+        {
+        }
+    }
+
+    private void BeginVoiceCapture()
+    {
+        if (_activeChatCts is not null || _audioCaptureService.IsRecording)
+            return;
+
+        try
+        {
+            int maxRecordSeconds = Models.MiMoSettings.Load(PetAiPaths.GetConfigPath()).MaxRecordSeconds;
+            _audioCaptureService.StartRecording(maxRecordSeconds);
+            _chatInputWindow?.SetRecordingState(true, "正在听妈妈说话，再点一次结束");
+            SetMicButtonVisual(isRecording: true, toolTip: "再点一次结束录音");
+            SetSpeechOverride("我在认真听妈妈说话哦", TimeSpan.FromSeconds(maxRecordSeconds + 2), "◔");
+            ApplyVisual(_engine.Interact("listen"));
+        }
+        catch (Exception ex)
+        {
+            _chatInputWindow?.SetBusyState(false, $"录音没能开始：{ex.Message}");
+            SetMicButtonVisual(isRecording: false, toolTip: "点我开始说话");
+            SetSpeechOverride("我刚刚没能顺利开始听呢，妈妈再试一次好不好。", TimeSpan.FromSeconds(12), "!");
+            ApplyVisual(_engine.Interact("surprised"));
+        }
+    }
+
+    private async Task EndVoiceCaptureAndReplyAsync()
+    {
+        if (_activeChatCts is not null)
+            return;
+
+        string audioFilePath;
+        try
+        {
+            _chatInputWindow?.SetBusyState(true, "我先把刚刚的话听成文字哦");
+            SetMicButtonVisual(isRecording: false, toolTip: "我正在听清刚刚那句话");
+            SetSpeechOverride("让我认真听清楚呀", TimeSpan.FromSeconds(12), "…");
+            ApplyVisual(_engine.Interact("blink"));
+            audioFilePath = await _audioCaptureService.StopRecordingAsync();
+        }
+        catch (Exception ex)
+        {
+            _chatInputWindow?.SetRecordingState(false, "点一下开始录音，再点一下结束");
+            _chatInputWindow?.SetBusyState(false, ex.Message);
+            SetMicButtonVisual(isRecording: false, toolTip: "点我开始说话");
+            SetSpeechOverride(ex.Message, TimeSpan.FromSeconds(10), "!");
+            ApplyVisual(_engine.Interact("surprised"));
+            return;
+        }
+
+        _activeChatCts = new CancellationTokenSource();
+
+        try
+        {
+            var result = await _speechSessionController.SendAudioAsync(audioFilePath, _activeChatCts.Token);
+            if (!string.IsNullOrWhiteSpace(result.UserText))
+            {
+                _chatInputWindow?.SetRecognizedText(result.UserText);
+                _chatInputWindow?.SetBusyState(false, $"听到：{result.UserText}");
+            }
+            else
+            {
+                _chatInputWindow?.SetBusyState(false, "这次没有听清，妈妈可以再试一次");
+            }
+
+            SetSpeechOverride(result.ReplyText, TimeSpan.FromSeconds(result.Success ? 20 : 14));
+            ApplyVisual(_engine.Interact(result.SuggestedAction));
+            _ = PlayReplyAudioIfNeededAsync(result.AudioFilePath);
+        }
+        catch (OperationCanceledException)
+        {
+            _chatInputWindow?.SetBusyState(false, "这次先停住啦，妈妈等会儿再叫我就好");
+            SetSpeechOverride("这次先停住啦，妈妈等会儿再叫我就好。", TimeSpan.FromSeconds(10), "!");
+            ApplyVisual(_engine.Interact("surprised"));
+        }
+        finally
+        {
+            _activeChatCts?.Dispose();
+            _activeChatCts = null;
+            _chatInputWindow?.SetRecordingState(false, "点一下开始录音，再点一下结束");
+            SetMicButtonVisual(isRecording: false, toolTip: "点我开始说话");
+        }
+    }
+
+    private void SetMicButtonVisual(bool isRecording, string toolTip)
+    {
+        MicButton.Background = isRecording
+            ? new SolidColorBrush((Color)ColorConverter.ConvertFromString("#FFE9859D"))
+            : new SolidColorBrush((Color)ColorConverter.ConvertFromString("#FFF6FB"));
+        MicButton.BorderBrush = isRecording
+            ? new SolidColorBrush((Color)ColorConverter.ConvertFromString("#FFCE5A7B"))
+            : new SolidColorBrush((Color)ColorConverter.ConvertFromString("#FFDCA2BC"));
+        MicButton.Foreground = isRecording
+            ? Brushes.White
+            : new SolidColorBrush((Color)ColorConverter.ConvertFromString("#FFC55287"));
+        MicButtonText.Text = isRecording ? "停" : "麦";
+        MicButton.ToolTip = toolTip;
+    }
+
+    private void SetSpeechOverride(string text, TimeSpan duration, string? emotionText = null)
+    {
+        _speechOverrideText = text;
+        _emotionOverrideText = emotionText;
+        _speechOverrideUntil = DateTime.Now.Add(duration);
+    }
+
+    private void ApplySpeechOverrideIfNeeded()
+    {
+        if (string.IsNullOrWhiteSpace(_speechOverrideText))
+            return;
+
+        if (DateTime.Now > _speechOverrideUntil)
+        {
+            _speechOverrideText = null;
+            _emotionOverrideText = null;
+            return;
+        }
+
+        SpeechText.Text = _speechOverrideText;
+        if (!string.IsNullOrWhiteSpace(_emotionOverrideText))
+            EmotionText.Text = _emotionOverrideText;
     }
 
     private sealed record ComponentInfo(List<(int X, int Y)> Points, int MinY, int MaxY)

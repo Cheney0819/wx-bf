@@ -1,0 +1,81 @@
+<Window
+    x:Class="DesktopPet.Wpf.ChatInputWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="和桌宠聊天"
+    Width="360"
+    Height="248"
+    WindowStartupLocation="CenterScreen"
+    ResizeMode="NoResize"
+    Background="#FFFDFB">
+    <Grid Margin="18">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="12" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="12" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="12" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <TextBlock
+            Text="可以打字，也可以先用语音跟我说话"
+            FontSize="18"
+            FontWeight="Bold"
+            Foreground="#7A3554" />
+
+        <DockPanel Grid.Row="2" LastChildFill="False">
+            <Button
+                x:Name="RecordButton"
+                DockPanel.Dock="Left"
+                Width="96"
+                Padding="0,6"
+                Click="RecordButton_OnClick"
+                Content="语音说话" />
+            <TextBlock
+                x:Name="VoiceStateTextBlock"
+                Margin="12,0,0,0"
+                VerticalAlignment="Center"
+                Foreground="#9C647C"
+                Text="点一下开始录音，再点一下结束" />
+        </DockPanel>
+
+        <TextBox
+            x:Name="PromptTextBox"
+            Grid.Row="4"
+            Padding="10"
+            AcceptsReturn="True"
+            TextWrapping="Wrap"
+            VerticalScrollBarVisibility="Auto"
+            FontSize="14"
+            Background="#FFFFF7FA"
+            BorderBrush="#FFD9A3BC"
+            BorderThickness="1.2"
+            KeyDown="PromptTextBox_OnKeyDown" />
+
+        <DockPanel Grid.Row="6" LastChildFill="False">
+            <TextBlock
+                x:Name="HintTextBlock"
+                DockPanel.Dock="Left"
+                VerticalAlignment="Center"
+                Foreground="#9C647C"
+                Text="按 Enter 发送，Shift+Enter 换行" />
+            <Button
+                x:Name="CancelButton"
+                DockPanel.Dock="Right"
+                Width="74"
+                Margin="8,0,0,0"
+                Padding="0,6"
+                Click="CancelButton_OnClick"
+                Content="取消" />
+            <Button
+                x:Name="SendButton"
+                DockPanel.Dock="Right"
+                Width="88"
+                Padding="0,6"
+                Click="SendButton_OnClick"
+                Content="发送给桌宠" />
+        </DockPanel>
+    </Grid>
+</Window>

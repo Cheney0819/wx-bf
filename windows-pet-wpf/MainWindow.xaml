@@ -75,6 +75,39 @@
                     Text="结" />
             </Border>
 
+            <Button
+                x:Name="MicButton"
+                Canvas.Left="150"
+                Canvas.Top="176"
+                Width="28"
+                Height="28"
+                Padding="0"
+                Click="MicButton_OnClick"
+                Background="#FFF6FB"
+                BorderBrush="#FFDCA2BC"
+                BorderThickness="1.2"
+                Foreground="#C55287"
+                ToolTip="点我开始说话">
+                <Button.Template>
+                    <ControlTemplate TargetType="Button">
+                        <Border
+                            Background="{TemplateBinding Background}"
+                            BorderBrush="{TemplateBinding BorderBrush}"
+                            BorderThickness="{TemplateBinding BorderThickness}"
+                            CornerRadius="14">
+                            <ContentPresenter
+                                HorizontalAlignment="Center"
+                                VerticalAlignment="Center" />
+                        </Border>
+                    </ControlTemplate>
+                </Button.Template>
+                <TextBlock
+                    x:Name="MicButtonText"
+                    FontSize="13"
+                    FontWeight="Bold"
+                    Text="麦" />
+            </Button>
+
             <Image
                 x:Name="PetImage"
                 Canvas.Left="40"

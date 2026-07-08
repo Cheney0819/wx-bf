@@ -312,6 +312,10 @@ public sealed class PetEngine
             case "idle":
                 WakeUp();
                 break;
+            case "cozy":
+                MarkInteraction(8);
+                SetCozy();
+                break;
             default:
                 MarkInteraction(10);
                 SetIdle();
