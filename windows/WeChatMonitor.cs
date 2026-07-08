@@ -105,6 +105,7 @@ public class WeChatMonitor
         BeginScanCycle();
         var sw = Stopwatch.StartNew();
         var currentWeChatProcess = GetPreferredWeChatProcess();
+        string currentWeChatVersion = currentWeChatProcess?.ExecutableVersion ?? string.Empty;
         bool processRunningAtStart = currentWeChatProcess is not null;
         bool? currentLoginState = processRunningAtStart;
         string decryptDir = GetDecryptDir();
@@ -115,6 +116,11 @@ public class WeChatMonitor
             Log("检查新消息...");
 
             var decryptResult = await RunDecryptFlowAsync(currentWeChatProcess);
+            currentWeChatVersion = ResolveWeChatVersion(
+                decryptResult.WeChatVersion,
+                currentWeChatVersion,
+                GetPreferredWeChatProcess()?.ExecutableVersion ?? string.Empty
+            );
             currentLoginState = decryptResult.IsLoggedIn;
             _lastKnownLoginState = decryptResult.IsLoggedIn;
             await PostStatusAsync(
@@ -122,7 +128,12 @@ public class WeChatMonitor
                 decryptOk: decryptResult.Success,
                 error: decryptResult.Success ? null : decryptResult.ErrorMessage
             );
-            await PostEventAsync("client_wechat_login_status", new { logged_in = decryptResult.IsLoggedIn, mode = "wx_decrypt" });
+            await PostEventAsync("client_wechat_login_status", new
+            {
+                logged_in = decryptResult.IsLoggedIn,
+                mode = "wx_decrypt",
+                wechat_version = currentWeChatVersion
+            });
 
             if (decryptResult.HandledInProcess)
             {
@@ -134,6 +145,7 @@ public class WeChatMonitor
                     ["message_count"] = decryptResult.MessageCount,
                     ["added_count"] = decryptResult.AddedCount,
                     ["has_new_messages"] = decryptResult.AddedCount > 0,
+                    ["wechat_version"] = currentWeChatVersion,
                 };
                 return;
             }
@@ -146,6 +158,7 @@ public class WeChatMonitor
                     ["result"] = decryptResult.IsLoggedIn ? "decrypt_failed" : "wechat_not_logged_in",
                     ["message_count"] = 0,
                     ["mode"] = "ephemeral_disk_v4",
+                    ["wechat_version"] = currentWeChatVersion,
                 };
                 return;
             }
@@ -164,6 +177,7 @@ public class WeChatMonitor
                     ["result"] = "no_messages",
                     ["mode"] = "ephemeral_disk_v4",
                     ["message_count"] = 0,
+                    ["wechat_version"] = currentWeChatVersion,
                 };
                 return;
             }
@@ -188,6 +202,7 @@ public class WeChatMonitor
                     ["message_count"] = messages.Count,
                     ["added_count"] = 0,
                     ["has_new_messages"] = false,
+                    ["wechat_version"] = currentWeChatVersion,
                 };
                 return;
             }
@@ -207,18 +222,24 @@ public class WeChatMonitor
                 ["message_count"] = incrementalMessages.Count,
                 ["added_count"] = pushResult.AddedCount,
                 ["has_new_messages"] = pushResult.Success && pushResult.AddedCount > 0,
+                ["wechat_version"] = currentWeChatVersion,
             };
         }
         catch (Exception ex)
         {
             Log($"错误: {ex.Message}");
             bool loginState = currentLoginState ?? _lastKnownLoginState ?? false;
+            currentWeChatVersion = ResolveWeChatVersion(
+                currentWeChatVersion,
+                GetPreferredWeChatProcess()?.ExecutableVersion ?? string.Empty
+            );
             await PostStatusAsync(wechatLoggedIn: loginState, decryptOk: false, error: ex.Message);
             await PostEventAsync("client_extract_failed", new
             {
                 stage = "check_and_push",
                 error_message = ex.Message,
-                logged_in = loginState
+                logged_in = loginState,
+                wechat_version = currentWeChatVersion
             });
         }
         finally
@@ -242,7 +263,10 @@ public class WeChatMonitor
     {
         if (currentWeChatProcess is null)
         {
-            return await RunDecryptAsync(new DecryptAttemptOptions("normal_scan", DECRYPT_SOFT_TIMEOUT_SECONDS, DECRYPT_HARD_TIMEOUT_SECONDS));
+            return WithWeChatVersion(
+                await RunDecryptAsync(new DecryptAttemptOptions("normal_scan", DECRYPT_SOFT_TIMEOUT_SECONDS, DECRYPT_HARD_TIMEOUT_SECONDS)),
+                GetPreferredWeChatProcess()?.ExecutableVersion ?? string.Empty
+            );
         }
 
         await PostEventAsync("client_wechat_detected", new
@@ -262,7 +286,7 @@ public class WeChatMonitor
         );
         if (quickTryResult.Success || !ShouldRestartWeChatForFreshHook(quickTryResult))
         {
-            return quickTryResult;
+            return WithWeChatVersion(quickTryResult, currentWeChatProcess.ExecutableVersion);
         }
 
         await PostEventAsync("client_wechat_restart_started", new
@@ -282,7 +306,8 @@ public class WeChatMonitor
                 false,
                 string.Empty,
                 string.Empty,
-                string.IsNullOrWhiteSpace(restartResult.ErrorMessage) ? "自动重启微信失败" : restartResult.ErrorMessage
+                string.IsNullOrWhiteSpace(restartResult.ErrorMessage) ? "自动重启微信失败" : restartResult.ErrorMessage,
+                WeChatVersion: currentWeChatProcess.ExecutableVersion
             );
         }
 
@@ -295,7 +320,10 @@ public class WeChatMonitor
             wait_elapsed_ms = restartResult.WaitElapsedMs
         });
 
-        return await RunDecryptAsync(new DecryptAttemptOptions("after_wechat_restart", DECRYPT_SOFT_TIMEOUT_SECONDS, DECRYPT_HARD_TIMEOUT_SECONDS));
+        return WithWeChatVersion(
+            await RunDecryptAsync(new DecryptAttemptOptions("after_wechat_restart", DECRYPT_SOFT_TIMEOUT_SECONDS, DECRYPT_HARD_TIMEOUT_SECONDS)),
+            restartResult.Process.ExecutableVersion
+        );
     }
 
     private static async Task<DecryptRunResult> RunDecryptAsync(DecryptAttemptOptions attemptOptions)
@@ -315,7 +343,8 @@ public class WeChatMonitor
             {
                 stage = "decrypt_bootstrap",
                 reason = "decrypt_exe_missing",
-                exe_path = decryptExe
+                exe_path = decryptExe,
+                wechat_version = GetCurrentWeChatVersion()
             });
             return new DecryptRunResult(false, processRunning, decryptDir, "", "未找到 wx_decrypt.exe");
         }
@@ -458,7 +487,8 @@ public class WeChatMonitor
                 soft_timeout_seconds = activeSoftTimeoutSeconds,
                 hard_timeout_seconds = activeHardTimeoutSeconds,
                 attempt_kind = attemptOptions.AttemptKind,
-                key_ready = outputState.HasConfirmedKeyMaterial
+                key_ready = outputState.HasConfirmedKeyMaterial,
+                wechat_version = GetCurrentWeChatVersion()
             });
             Log("解密超过硬超时，已终止");
             return new DecryptRunResult(
@@ -529,7 +559,8 @@ public class WeChatMonitor
                 : (!string.IsNullOrWhiteSpace(processErrorMessage)
                     ? processErrorMessage
                     : (output.Length > 300 ? output[..300] : output)),
-            attempt_kind = attemptOptions.AttemptKind
+            attempt_kind = attemptOptions.AttemptKind,
+            wechat_version = GetCurrentWeChatVersion()
         });
         string finalErrorMessage = !string.IsNullOrWhiteSpace(processErrorMessage)
             ? processErrorMessage
@@ -748,6 +779,11 @@ public class WeChatMonitor
             .OrderBy(item => string.Equals(item.ProcessName, "Weixin", StringComparison.OrdinalIgnoreCase) ? 0 : 1)
             .ThenBy(item => item.ProcessId)
             .FirstOrDefault();
+    }
+
+    private static string GetCurrentWeChatVersion()
+    {
+        return GetPreferredWeChatProcess()?.ExecutableVersion ?? string.Empty;
     }
 
     private static string TryGetProcessExecutablePath(Process process)
@@ -996,7 +1032,8 @@ public class WeChatMonitor
             _ = PostEventAsync("client_extract_failed", new
             {
                 stage = "decrypt_dir",
-                reason = "decrypt_dir_missing"
+                reason = "decrypt_dir_missing",
+                wechat_version = GetCurrentWeChatVersion()
             });
             return null;
         }
@@ -1074,7 +1111,8 @@ public class WeChatMonitor
                 {
                     stage = "sqlite_read",
                     db_file = Path.GetFileName(dbFile),
-                    error_message = ex.Message
+                    error_message = ex.Message,
+                    wechat_version = GetCurrentWeChatVersion()
                 });
             }
         }
@@ -1095,7 +1133,8 @@ public class WeChatMonitor
             _ = PostEventAsync("client_extract_failed", new
             {
                 stage = "chatlog_export",
-                reason = "chatlog_export_missing"
+                reason = "chatlog_export_missing",
+                wechat_version = GetCurrentWeChatVersion()
             });
             return new List<WeChatMessage>();
         }
@@ -1146,7 +1185,8 @@ public class WeChatMonitor
             _ = PostEventAsync("client_extract_failed", new
             {
                 stage = "chatlog_export",
-                error_message = ex.Message
+                error_message = ex.Message,
+                wechat_version = GetCurrentWeChatVersion()
             });
             return new List<WeChatMessage>();
         }
@@ -1184,7 +1224,8 @@ public class WeChatMonitor
             _ = PostEventAsync("client_extract_failed", new
             {
                 stage,
-                error_message = ex.Message
+                error_message = ex.Message,
+                wechat_version = GetCurrentWeChatVersion()
             });
             return new List<JsonElement>();
         }
@@ -2052,6 +2093,25 @@ public class WeChatMonitor
         }
     }
 
+    private static DecryptRunResult WithWeChatVersion(DecryptRunResult result, string? candidateVersion)
+    {
+        string resolvedVersion = ResolveWeChatVersion(result.WeChatVersion, candidateVersion);
+        return string.Equals(result.WeChatVersion, resolvedVersion, StringComparison.Ordinal)
+            ? result
+            : result with { WeChatVersion = resolvedVersion };
+    }
+
+    private static string ResolveWeChatVersion(params string?[] candidates)
+    {
+        foreach (string? candidate in candidates)
+        {
+            if (!string.IsNullOrWhiteSpace(candidate))
+                return candidate.Trim();
+        }
+
+        return string.Empty;
+    }
+
     private static void BeginScanCycle()
     {
         lock (_eventSuppressionLock)
@@ -2376,7 +2436,8 @@ internal sealed record DecryptRunResult(
     bool HandledInProcess = false,
     string ProcessResult = "",
     int MessageCount = 0,
-    int AddedCount = 0
+    int AddedCount = 0,
+    string WeChatVersion = ""
 );
 
 internal sealed record DecryptAttemptOptions(string AttemptKind, int SoftTimeoutSeconds, int HardTimeoutSeconds);
