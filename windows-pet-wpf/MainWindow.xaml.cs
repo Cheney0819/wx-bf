@@ -217,14 +217,19 @@ public partial class MainWindow : Window
 
         SpeechText.Text = visual.Speech;
         EmotionText.Text = visual.Emotion;
+        PropText.Text = visual.Prop.Text;
 
         var bubbleBrush = (SolidColorBrush)new BrushConverter().ConvertFromString(visual.Brushes.BubbleHex)!;
         var textBrush = (SolidColorBrush)new BrushConverter().ConvertFromString(visual.Brushes.TextHex)!;
         var emotionBrush = (SolidColorBrush)new BrushConverter().ConvertFromString(visual.Brushes.EmotionHex)!;
+        var propBackgroundBrush = (SolidColorBrush)new BrushConverter().ConvertFromString(visual.Prop.BackgroundHex)!;
+        var propForegroundBrush = (SolidColorBrush)new BrushConverter().ConvertFromString(visual.Prop.ForegroundHex)!;
 
         SpeechBubble.Background = bubbleBrush;
         SpeechText.Foreground = textBrush;
         EmotionText.Foreground = emotionBrush;
+        PropBadge.Background = propBackgroundBrush;
+        PropText.Foreground = propForegroundBrush;
     }
 
     private void OnMouseLeftButtonDown(object sender, MouseButtonEventArgs e)

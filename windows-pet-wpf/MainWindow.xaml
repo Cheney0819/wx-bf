@@ -56,6 +56,25 @@
                 Points="0,0 10,0 5,7"
                 Fill="#FFF0F6" />
 
+            <Border
+                x:Name="PropBadge"
+                Canvas.Left="142"
+                Canvas.Top="74"
+                MinWidth="24"
+                Height="22"
+                Padding="5,0"
+                CornerRadius="11"
+                Background="#FFF6FB">
+                <TextBlock
+                    x:Name="PropText"
+                    VerticalAlignment="Center"
+                    HorizontalAlignment="Center"
+                    FontSize="11"
+                    FontWeight="Bold"
+                    Foreground="#D85A95"
+                    Text="结" />
+            </Border>
+
             <Image
                 x:Name="PetImage"
                 Canvas.Left="40"

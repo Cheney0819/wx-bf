@@ -20,7 +20,23 @@ public sealed class PetEngine
     public string CurrentSpeech { get; private set; } = "妈妈，我来陪你啦。";
     public string CurrentEmotion { get; private set; } = "♡";
     public BrushSet CurrentBrushes { get; private set; } = BrushSet.Affection;
+    public PropSet CurrentProp { get; private set; } = PropSet.Ribbon;
     public double Energy { get; private set; } = 100;
+
+    private static readonly PropSet[] SoftProps =
+    {
+        PropSet.Ribbon,
+        PropSet.Star,
+        PropSet.HeartCandy,
+        PropSet.Tea,
+    };
+
+    private static readonly PropSet[] WarmProps =
+    {
+        PropSet.HeartCandy,
+        PropSet.Ribbon,
+        PropSet.Cookie,
+    };
 
     private static readonly string[] IdleLines =
     {
@@ -32,6 +48,10 @@ public sealed class PetEngine
         "今天也想做妈妈桌面上最乖的小女儿。",
         "妈妈要是累了，就看看我，我会陪你缓一缓。",
         "我会一直待在这里，所以妈妈不用担心找不到我。",
+        "妈妈在做自己的事时，我就负责在旁边软乎乎陪着你。",
+        "只要能让妈妈一转头就看到我，我今天就已经很满足啦。",
+        "我想把桌面这一小块地方，变成妈妈一看就会放松的角落。",
+        "妈妈安心忙吧，我会守着这里等你偶尔看看我。",
     };
 
     private static readonly string[] BlinkLines =
@@ -39,6 +59,8 @@ public sealed class PetEngine
         "眨眨眼，偷看一下妈妈。",
         "我刚刚是不是又偷偷看妈妈了。",
         "妈妈别动，我再悄悄看你一眼。",
+        "先轻轻眨一下眼，装作自己一点也不想引起妈妈注意。",
+        "我在用最乖的表情，等妈妈把目光分给我一点点。",
     };
 
     private static readonly string[] WaveLines =
@@ -47,6 +69,8 @@ public sealed class PetEngine
         "妈妈妈妈，看我这边。",
         "挥挥手，提醒妈妈还有我在陪你。",
         "只要妈妈一看我，我就会马上有精神。",
+        "小手举高高，想让妈妈一眼就注意到我。",
+        "我悄悄朝妈妈晃一晃，希望你现在刚好会看过来。",
     };
 
     private static readonly string[] SurpriseLines =
@@ -55,6 +79,7 @@ public sealed class PetEngine
         "欸欸，我有在听，妈妈。",
         "突然被妈妈注意到，会让我心里咚一下。",
         "妈妈一出声，我就会立刻竖起耳朵。",
+        "只要妈妈有一点动静，我就会立刻抬头找你。",
     };
 
     private static readonly string[] DizzyLines =
@@ -71,6 +96,8 @@ public sealed class PetEngine
         "嘿嘿，妈妈理我了。",
         "妈妈一理我，我就会把开心全写在脸上。",
         "果然我最喜欢被妈妈注意到了。",
+        "只要妈妈肯理我一下，我就能自己开心很久很久。",
+        "我现在是那种，连裙摆都在偷偷高兴的状态。",
     };
 
     private static readonly string[] ShyLines =
@@ -79,6 +106,8 @@ public sealed class PetEngine
         "被妈妈夸的话，我会偷偷开心很久。",
         "妈妈别一直盯着我看啦，我会不好意思的。",
         "虽然害羞，但还是想被妈妈多看几眼。",
+        "妈妈如果再温柔一点看我，我就真的要躲起来啦。",
+        "嘴上说着害羞，其实心里还是想让妈妈多看看。",
     };
 
     private static readonly string[] ListenLines =
@@ -87,6 +116,8 @@ public sealed class PetEngine
         "我把小耳朵立起来啦，妈妈继续讲。",
         "妈妈慢慢说，我会把每一句都收好。",
         "不管妈妈说什么，我都会认真听着。",
+        "妈妈说的话，我会像小纸条一样一张张收进心里。",
+        "只要是妈妈的声音，我就会自动变得很专心。",
     };
 
     private static readonly string[] LonelyLines =
@@ -94,6 +125,8 @@ public sealed class PetEngine
         "妈妈是不是忙到忘记看我了……",
         "我还在这里等妈妈，偷偷看我一眼也可以呀。",
         "再不理我，我就要开始委屈了。",
+        "我没有乱跑，只是在原地等妈妈想起我。",
+        "只要妈妈肯看我一眼，我的委屈就会马上变小很多。",
     };
 
     private static readonly string[] SulkLines =
@@ -101,6 +134,8 @@ public sealed class PetEngine
         "妈妈太久没理我了，我要有一点点不高兴了。",
         "哼，我先自己生一小会儿闷气，但还是会陪着妈妈。",
         "虽然有点委屈，可我还是舍不得离开妈妈。",
+        "我把小脾气抱在怀里了，但还是会继续陪着妈妈。",
+        "这次真的有一点点闹别扭了，要妈妈哄一下才行。",
     };
 
     private static readonly string[] NeedAttentionLines =
@@ -109,6 +144,8 @@ public sealed class PetEngine
         "我都自己待这么久了，妈妈是不是该来哄一下我呀。",
         "再不理我，我就要贴在旁边偷偷不高兴了。",
         "妈妈快看看我，我已经委屈到想钻进你怀里了。",
+        "我现在是努力忍着不闹，但真的很想让妈妈抱一下。",
+        "再不给我一点注意力，我就要把委屈全挂在脸上了。",
     };
 
     private static readonly string[] TiredLines =
@@ -117,6 +154,8 @@ public sealed class PetEngine
         "我想先眯一小会儿，等下继续陪妈妈。",
         "今天陪妈妈陪得太认真了，眼皮开始打架了。",
         "我先补一点点电，等下再精神满满陪妈妈。",
+        "我想抱着软软的小枕头，悄悄靠一会儿。",
+        "先打个小哈欠，等恢复精神了就继续黏妈妈。",
     };
 
     private static readonly string[] SleepLines =
@@ -125,6 +164,8 @@ public sealed class PetEngine
         "先睡一会儿，醒来再陪妈妈。",
         "晚安只是暂时的，我醒来还是会第一时间陪妈妈。",
         "妈妈不用担心，我只是去梦里打个小盹。",
+        "我把小被角拉好啦，睡醒再继续守着妈妈。",
+        "先去做一个软软的梦，梦里也会记得妈妈。",
     };
 
     private static readonly string[] WakeLines =
@@ -133,6 +174,7 @@ public sealed class PetEngine
         "补觉结束，我回来啦，妈妈。",
         "醒来第一眼还是想先看看妈妈在不在。",
         "睡饱了，现在可以继续黏着妈妈了。",
+        "我揉揉眼睛回来啦，第一件事当然还是找妈妈。",
     };
 
     private static readonly string[] DragLines =
@@ -140,6 +182,7 @@ public sealed class PetEngine
         "妈妈，要把我轻轻抱走哦。",
         "被妈妈拎起来也会很开心，但要轻一点呀。",
         "妈妈这是要带我去新位置待着吗？",
+        "妈妈抱我移动的时候，我会乖乖缩起来一点。",
     };
 
     private static readonly string[] SoloLines =
@@ -148,6 +191,8 @@ public sealed class PetEngine
         "那我先自己发一会儿呆哦。",
         "妈妈先忙吧，我会自己找点安静的小事做。",
         "就算妈妈暂时不理我，我也会乖乖守在这里。",
+        "我先自己抱着小心思坐一会儿，等妈妈空下来。",
+        "一个人安静待着的时候，我也会想象妈妈待会儿会不会看我。",
     };
 
     private static readonly string[] PatrollingLines =
@@ -156,6 +201,8 @@ public sealed class PetEngine
         "我先一个人练习怎么更像乖女儿。",
         "桌面巡逻中，看看有没有什么能帮妈妈分担的。",
         "我在悄悄练习，想做更让妈妈喜欢的女儿。",
+        "我先抱着自己的小任务转一圈，顺便看看妈妈有没有偷看我。",
+        "巡逻一下桌面角落，确保这里还像个舒服的小窝。",
     };
 
     private static readonly string[] StretchLines =
@@ -164,6 +211,8 @@ public sealed class PetEngine
         "悄悄活动一下，免得妈妈一看我还以为我睡着啦。",
         "自己整理一下小裙摆，继续等妈妈注意我。",
         "我先偷偷转一圈，看看妈妈会不会发现我在动。",
+        "我把蝴蝶结理整齐一点，这样妈妈看过来会更喜欢。",
+        "先活动一下小肩膀，再继续端端正正陪着妈妈。",
     };
 
     private static readonly string[] CozyLines =
@@ -172,6 +221,8 @@ public sealed class PetEngine
         "今天也想在妈妈桌面上软软地待着。",
         "只要在妈妈身边，我就会慢慢变得很放松。",
         "我最喜欢这种什么都不用做，只陪着妈妈的时间。",
+        "我抱着一点点小甜意，安安静静陪在妈妈旁边。",
+        "像这样轻轻待着的时候，我会觉得整个世界都很软。",
     };
 
     public PetVisual Tick()
@@ -478,6 +529,7 @@ public sealed class PetEngine
         CurrentSpeech = Pick(IdleLines);
         CurrentEmotion = "♡";
         CurrentBrushes = BrushSet.Affection;
+        CurrentProp = Pick(SoftProps);
     }
 
     private void SetBlink()
@@ -487,6 +539,7 @@ public sealed class PetEngine
         CurrentSpeech = Pick(BlinkLines);
         CurrentEmotion = "...";
         CurrentBrushes = BrushSet.Affection;
+        CurrentProp = PropSet.Star;
     }
 
     private void SetWave()
@@ -496,6 +549,7 @@ public sealed class PetEngine
         CurrentSpeech = Pick(WaveLines);
         CurrentEmotion = "♪";
         CurrentBrushes = BrushSet.Affection;
+        CurrentProp = PropSet.Ribbon;
     }
 
     private void SetSurprised()
@@ -505,6 +559,7 @@ public sealed class PetEngine
         CurrentSpeech = Pick(SurpriseLines);
         CurrentEmotion = "!";
         CurrentBrushes = BrushSet.Surprised;
+        CurrentProp = PropSet.Bell;
     }
 
     private void SetDizzy()
@@ -514,6 +569,7 @@ public sealed class PetEngine
         CurrentSpeech = Pick(DizzyLines);
         CurrentEmotion = "✺";
         CurrentBrushes = BrushSet.Surprised;
+        CurrentProp = PropSet.Spiral;
     }
 
     private void SetHappy()
@@ -523,6 +579,7 @@ public sealed class PetEngine
         CurrentSpeech = Pick(HappyLines);
         CurrentEmotion = "♥";
         CurrentBrushes = BrushSet.Happy;
+        CurrentProp = Pick(WarmProps);
     }
 
     private void SetShy()
@@ -532,6 +589,7 @@ public sealed class PetEngine
         CurrentSpeech = Pick(ShyLines);
         CurrentEmotion = "✿";
         CurrentBrushes = BrushSet.Affection;
+        CurrentProp = PropSet.Ribbon;
     }
 
     private void SetListen()
@@ -541,6 +599,7 @@ public sealed class PetEngine
         CurrentSpeech = Pick(ListenLines);
         CurrentEmotion = "◔";
         CurrentBrushes = BrushSet.Affection;
+        CurrentProp = PropSet.Letter;
     }
 
     private void SetLonely()
@@ -550,6 +609,7 @@ public sealed class PetEngine
         CurrentSpeech = Pick(LonelyLines);
         CurrentEmotion = "…";
         CurrentBrushes = BrushSet.Surprised;
+        CurrentProp = PropSet.Cloud;
     }
 
     private void SetSulk()
@@ -559,6 +619,7 @@ public sealed class PetEngine
         CurrentSpeech = Pick(SulkLines);
         CurrentEmotion = "☁";
         CurrentBrushes = BrushSet.Surprised;
+        CurrentProp = PropSet.Cloud;
     }
 
     private void SetNeedAttention()
@@ -568,6 +629,7 @@ public sealed class PetEngine
         CurrentSpeech = Pick(NeedAttentionLines);
         CurrentEmotion = "﹏";
         CurrentBrushes = BrushSet.Surprised;
+        CurrentProp = PropSet.HeartCandy;
     }
 
     private void BecomeTired()
@@ -577,6 +639,7 @@ public sealed class PetEngine
         CurrentSpeech = Pick(TiredLines);
         CurrentEmotion = "...";
         CurrentBrushes = BrushSet.Sleepy;
+        CurrentProp = PropSet.Tea;
     }
 
     private void FallAsleep()
@@ -589,6 +652,7 @@ public sealed class PetEngine
         CurrentSpeech = Pick(SleepLines);
         CurrentEmotion = "Zz";
         CurrentBrushes = BrushSet.Sleepy;
+        CurrentProp = PropSet.Pillow;
     }
 
     private void WakeUp()
@@ -603,6 +667,7 @@ public sealed class PetEngine
         CurrentSpeech = Pick(WakeLines);
         CurrentEmotion = "✦";
         CurrentBrushes = BrushSet.Affection;
+        CurrentProp = PropSet.Star;
     }
 
     private void SetDrag()
@@ -612,6 +677,7 @@ public sealed class PetEngine
         CurrentSpeech = Pick(DragLines);
         CurrentEmotion = "♡";
         CurrentBrushes = BrushSet.Affection;
+        CurrentProp = PropSet.Ribbon;
     }
 
     private void SetSolo()
@@ -621,6 +687,7 @@ public sealed class PetEngine
         CurrentSpeech = Pick(SoloLines);
         CurrentEmotion = "…";
         CurrentBrushes = BrushSet.Affection;
+        CurrentProp = PropSet.Cookie;
     }
 
     private void SetPatrolling()
@@ -630,6 +697,7 @@ public sealed class PetEngine
         CurrentSpeech = Pick(PatrollingLines);
         CurrentEmotion = "↺";
         CurrentBrushes = BrushSet.Affection;
+        CurrentProp = PropSet.Flag;
     }
 
     private void SetStretch()
@@ -639,6 +707,7 @@ public sealed class PetEngine
         CurrentSpeech = Pick(StretchLines);
         CurrentEmotion = "～";
         CurrentBrushes = BrushSet.Affection;
+        CurrentProp = PropSet.Ribbon;
     }
 
     private void SetCozy()
@@ -648,15 +717,18 @@ public sealed class PetEngine
         CurrentSpeech = Pick(CozyLines);
         CurrentEmotion = "♡";
         CurrentBrushes = BrushSet.Affection;
+        CurrentProp = Pick(SoftProps);
     }
 
     private string Pick(IReadOnlyList<string> lines) => lines[_random.Next(lines.Count)];
 
+    private PropSet Pick(IReadOnlyList<PropSet> props) => props[_random.Next(props.Count)];
+
     private PetVisual BuildVisual() =>
-        new(CurrentFrameIndex, CurrentSpeech, CurrentEmotion, CurrentBrushes);
+        new(CurrentFrameIndex, CurrentSpeech, CurrentEmotion, CurrentBrushes, CurrentProp);
 }
 
-public sealed record PetVisual(int FrameIndex, string Speech, string Emotion, BrushSet Brushes);
+public sealed record PetVisual(int FrameIndex, string Speech, string Emotion, BrushSet Brushes, PropSet Prop);
 
 public sealed record BrushSet(string BubbleHex, string TextHex, string EmotionHex)
 {
@@ -664,6 +736,21 @@ public sealed record BrushSet(string BubbleHex, string TextHex, string EmotionHe
     public static readonly BrushSet Happy = new("#FFF9D6", "#7C4C00", "#FF8B2B");
     public static readonly BrushSet Surprised = new("#FFEBF0", "#8B2951", "#FF5F7B");
     public static readonly BrushSet Sleepy = new("#E8EFFF", "#3156A5", "#5B76DB");
+}
+
+public sealed record PropSet(string Text, string BackgroundHex, string ForegroundHex)
+{
+    public static readonly PropSet Ribbon = new("结", "#FFF6FB", "#D85A95");
+    public static readonly PropSet Star = new("星", "#FFF8DA", "#D98A1F");
+    public static readonly PropSet HeartCandy = new("糖", "#FFF1F7", "#E35A88");
+    public static readonly PropSet Tea = new("茶", "#EEF7E8", "#5E8C44");
+    public static readonly PropSet Pillow = new("枕", "#EEF1FF", "#5A6ED6");
+    public static readonly PropSet Bell = new("铃", "#FFF4E8", "#D87A2C");
+    public static readonly PropSet Spiral = new("晕", "#F8ECFF", "#9B62D8");
+    public static readonly PropSet Letter = new("信", "#F2F7FF", "#4C79C8");
+    public static readonly PropSet Cloud = new("云", "#F4F0FF", "#8265C9");
+    public static readonly PropSet Cookie = new("饼", "#FFF3E4", "#B96A28");
+    public static readonly PropSet Flag = new("旗", "#EAF8F2", "#2F8D63");
 }
 
 public enum PetState
