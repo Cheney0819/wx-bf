@@ -75,10 +75,21 @@
                     Text="结" />
             </Border>
 
+            <Image
+                x:Name="PetImage"
+                Canvas.Left="40"
+                Canvas.Top="62"
+                Width="136"
+                Height="136"
+                Stretch="Uniform"
+                SnapsToDevicePixels="True"
+                RenderOptions.BitmapScalingMode="NearestNeighbor" />
+
             <Button
                 x:Name="MicButton"
                 Canvas.Left="150"
                 Canvas.Top="176"
+                Panel.ZIndex="10"
                 Width="28"
                 Height="28"
                 Padding="0"
@@ -107,16 +118,6 @@
                     FontWeight="Bold"
                     Text="麦" />
             </Button>
-
-            <Image
-                x:Name="PetImage"
-                Canvas.Left="40"
-                Canvas.Top="62"
-                Width="136"
-                Height="136"
-                Stretch="Uniform"
-                SnapsToDevicePixels="True"
-                RenderOptions.BitmapScalingMode="NearestNeighbor" />
         </Canvas>
     </Grid>
 </Window>
