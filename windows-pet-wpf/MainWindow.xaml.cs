@@ -524,14 +524,14 @@ public partial class MainWindow : Window
     private void SetMicButtonVisual(bool isRecording, string toolTip)
     {
         MicButton.Background = isRecording
-            ? new SolidColorBrush((Color)ColorConverter.ConvertFromString("#FFE9859D"))
-            : new SolidColorBrush((Color)ColorConverter.ConvertFromString("#FFF6FB"));
+            ? new SolidColorBrush((System.Windows.Media.Color)System.Windows.Media.ColorConverter.ConvertFromString("#FFE9859D")!)
+            : new SolidColorBrush((System.Windows.Media.Color)System.Windows.Media.ColorConverter.ConvertFromString("#FFF6FB")!);
         MicButton.BorderBrush = isRecording
-            ? new SolidColorBrush((Color)ColorConverter.ConvertFromString("#FFCE5A7B"))
-            : new SolidColorBrush((Color)ColorConverter.ConvertFromString("#FFDCA2BC"));
+            ? new SolidColorBrush((System.Windows.Media.Color)System.Windows.Media.ColorConverter.ConvertFromString("#FFCE5A7B")!)
+            : new SolidColorBrush((System.Windows.Media.Color)System.Windows.Media.ColorConverter.ConvertFromString("#FFDCA2BC")!);
         MicButton.Foreground = isRecording
-            ? Brushes.White
-            : new SolidColorBrush((Color)ColorConverter.ConvertFromString("#FFC55287"));
+            ? System.Windows.Media.Brushes.White
+            : new SolidColorBrush((System.Windows.Media.Color)System.Windows.Media.ColorConverter.ConvertFromString("#FFC55287")!);
         MicButtonText.Text = isRecording ? "停" : "麦";
         MicButton.ToolTip = toolTip;
     }
