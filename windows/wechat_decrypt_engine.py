@@ -70,13 +70,15 @@ IMAGE_MIME = {
 
 kernel32 = ctypes.windll.kernel32
 MEM_COMMIT = 0x1000
-READABLE = {0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80}
+PAGE_NOACCESS = 0x01
+PAGE_GUARD = 0x100
+_READABLE_PROTECT_MASK = 0x02 | 0x04 | 0x08 | 0x10 | 0x20 | 0x40 | 0x80
 
 _HEX_RE = re.compile(b"x'([0-9a-fA-F]{64,192})'")
 _ZSTD = zstd.ZstdDecompressor() if zstd is not None else None
 _IMAGE_KEY32_RE = re.compile(rb'(?<![a-zA-Z0-9])[a-zA-Z0-9]{32}(?![a-zA-Z0-9])')
 _IMAGE_KEY16_RE = re.compile(rb'(?<![a-zA-Z0-9])[a-zA-Z0-9]{16}(?![a-zA-Z0-9])')
-_IMAGE_RW_PROTECT_FLAGS = {0x04, 0x08, 0x40, 0x80}
+_IMAGE_RW_PROTECT_MASK = 0x04 | 0x08 | 0x40 | 0x80
 
 
 class MBI(ctypes.Structure):
@@ -657,6 +659,22 @@ def read_mem(handle, addr, size):
     return None
 
 
+def is_readable_protect(protect: int):
+    return (
+        protect != PAGE_NOACCESS
+        and (protect & PAGE_GUARD) == 0
+        and (protect & _READABLE_PROTECT_MASK) != 0
+    )
+
+
+def is_rw_protect(protect: int):
+    return (
+        protect != PAGE_NOACCESS
+        and (protect & PAGE_GUARD) == 0
+        and (protect & _IMAGE_RW_PROTECT_MASK) != 0
+    )
+
+
 def enum_regions(handle):
     regions = []
     addr = 0
@@ -664,7 +682,7 @@ def enum_regions(handle):
     while addr < 0x7FFFFFFFFFFF:
         if kernel32.VirtualQueryEx(handle, ctypes.c_uint64(addr), ctypes.byref(mbi), ctypes.sizeof(mbi)) == 0:
             break
-        if mbi.State == MEM_COMMIT and mbi.Protect in READABLE and 0 < mbi.RegionSize < 500 * 1024 * 1024:
+        if mbi.State == MEM_COMMIT and is_readable_protect(int(mbi.Protect)) and 0 < mbi.RegionSize < 500 * 1024 * 1024:
             regions.append((mbi.BaseAddress, mbi.RegionSize))
         nxt = mbi.BaseAddress + mbi.RegionSize
         if nxt <= addr:
@@ -1090,7 +1108,7 @@ def enum_rw_regions(handle):
             break
         if (
             mbi.State == MEM_COMMIT
-            and mbi.Protect in _IMAGE_RW_PROTECT_FLAGS
+            and is_rw_protect(int(mbi.Protect))
             and 0 < mbi.RegionSize < 50 * 1024 * 1024
         ):
             regions.append((mbi.BaseAddress, mbi.RegionSize))
