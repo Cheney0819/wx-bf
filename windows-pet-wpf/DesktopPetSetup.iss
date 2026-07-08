@@ -1,8 +1,13 @@
+#define MyAppName "桌宠"
+#define MyAppVersion "1.0.1"
+#define MyAppPublisher "Junjiee"
+
 [Setup]
 AppId={{8D5C4C3A-9F3E-4BA3-A8F1-35D3C86A7C11}
-AppName=桌宠
-AppVersion=1.0.0
-AppPublisher=Junjiee
+AppName={#MyAppName}
+AppVersion={#MyAppVersion}
+AppVerName={#MyAppName} {#MyAppVersion}
+AppPublisher={#MyAppPublisher}
 DefaultDirName={autopf}\JunjieeDesktopPet
 DefaultGroupName=桌宠
 DisableDirPage=no
@@ -14,8 +19,12 @@ Compression=lzma
 SolidCompression=yes
 WizardStyle=modern
 SetupIconFile=Assets\app-icon.ico
+WizardImageFile=Assets\installer-wizard.png
+WizardSmallImageFile=Assets\installer-wizard-small.png
 UninstallDisplayIcon={app}\DesktopPet.Wpf.exe
 ArchitecturesInstallIn64BitMode=x64compatible
+VersionInfoVersion=1.0.1.0
+VersionInfoTextVersion={#MyAppVersion}
 
 [Languages]
 Name: "chinesesimp"; MessagesFile: "ChineseSimplified.isl"
