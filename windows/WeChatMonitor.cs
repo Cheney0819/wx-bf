@@ -2184,6 +2184,9 @@ public class WeChatMonitor
 
             if (!string.IsNullOrWhiteSpace(_activeIssueSignature))
             {
+                if (ShouldAllowEventWhileIssueActive(eventName))
+                    return false;
+
                 suppressionReason = "active_issue_context";
                 return true;
             }
@@ -2264,6 +2267,12 @@ public class WeChatMonitor
         return string.Equals(result, "decrypt_failed", StringComparison.Ordinal)
             || string.Equals(result, "push_failed", StringComparison.Ordinal)
             || string.Equals(result, "wechat_not_logged_in", StringComparison.Ordinal);
+    }
+
+    private static bool ShouldAllowEventWhileIssueActive(string eventName)
+    {
+        return string.Equals(eventName, "client_scan_started", StringComparison.Ordinal)
+            || string.Equals(eventName, "client_wechat_login_status", StringComparison.Ordinal);
     }
 
     private static string NormalizeIssueValue(string? value)
