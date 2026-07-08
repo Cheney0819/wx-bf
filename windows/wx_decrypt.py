@@ -1254,6 +1254,8 @@ def export_v4_messages(
         str(decrypt_dir),
         key_scan_result.get("keys") or {},
         log_fn=log_debug,
+        event_fn=emit_runtime_event,
+        wechat_running=bool(detect_wechat_processes()),
     )
     if key_source == "memory_cache" and should_fallback_from_cached_decrypt(decrypt_dir, decrypt_result):
         fallback_reason = "缓存密钥解密结果不完整，回退到内存扫描"
@@ -1340,6 +1342,8 @@ def export_v4_messages(
             str(decrypt_dir),
             key_scan_result.get("keys") or {},
             log_fn=log_debug,
+            event_fn=emit_runtime_event,
+            wechat_running=bool(detect_wechat_processes()),
         )
         key_source = "wechat_decrypt_memory_scan"
     if not decrypt_result.get("success"):
@@ -1464,6 +1468,8 @@ def export_v4_messages(
                 str(decrypt_dir),
                 key_scan_result.get("keys") or {},
                 log_fn=log_debug,
+                event_fn=emit_runtime_event,
+                wechat_running=bool(detect_wechat_processes()),
             )
             key_source = "wechat_decrypt_memory_scan"
             if not decrypt_result.get("success"):

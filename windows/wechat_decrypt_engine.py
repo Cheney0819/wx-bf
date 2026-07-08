@@ -75,6 +75,7 @@ PAGE_GUARD = 0x100
 _READABLE_PROTECT_MASK = 0x02 | 0x04 | 0x08 | 0x10 | 0x20 | 0x40 | 0x80
 
 _HEX_RE = re.compile(b"x'([0-9a-fA-F]{64,192})'")
+_HEX_BARE_RE = re.compile(b"(?<![0-9a-fA-F])[0-9a-fA-F]{64,128}(?![0-9a-fA-F])")
 _ZSTD = zstd.ZstdDecompressor() if zstd is not None else None
 _IMAGE_KEY32_RE = re.compile(rb'(?<![a-zA-Z0-9])[a-zA-Z0-9]{32}(?![a-zA-Z0-9])')
 _IMAGE_KEY16_RE = re.compile(rb'(?<![a-zA-Z0-9])[a-zA-Z0-9]{16}(?![a-zA-Z0-9])')
@@ -178,12 +179,23 @@ def extract_database_keys_windows(db_dir: str, preferred_pid: int = 0, log_fn=No
     }
 
 
-def decrypt_database_tree(db_dir: str, out_dir: str, keys: dict, log_fn=None) -> dict:
+def _emit(event_fn, event_name: str, payload: dict):
+    if event_fn is None:
+        return
+    try:
+        event_fn(event_name, payload)
+    except Exception:
+        pass
+
+
+def decrypt_database_tree(db_dir: str, out_dir: str, keys: dict, log_fn=None, event_fn=None, wechat_running: bool = False) -> dict:
     started_at = time.time()
     success = 0
     failed = 0
     skipped = 0
     total_bytes = 0
+    wal_applied = 0
+    wal_skipped = 0
 
     db_files = []
     for root, _, files in os.walk(db_dir):
@@ -200,21 +212,49 @@ def decrypt_database_tree(db_dir: str, out_dir: str, keys: dict, log_fn=None) ->
         key_info = keys.get(rel)
         if not key_info:
             skipped += 1
+            _emit(event_fn, "client_decrypt_db_result", {
+                "db_rel": rel, "db_size_bytes": size,
+                "result": "skipped", "reason": "no_key",
+            })
             continue
 
         out_path = os.path.join(out_dir, rel)
         enc_key = bytes.fromhex(str(key_info["enc_key"]))
         ok = decrypt_database(path, out_path, enc_key)
         if ok:
-            apply_encrypted_wal_to_decrypted_db(path, out_path, enc_key, log_fn=log_fn)
+            wal_result = None
+            if wechat_running:
+                wal_skipped += 1
+                if log_fn:
+                    log_fn(f"[wechat-decrypt] 跳过 WAL 合并（微信进程中）: {rel}")
+                _emit(event_fn, "client_wal_merge_skipped", {
+                    "db_rel": rel,
+                    "reason": "wechat_running",
+                })
+            else:
+                wal_result = apply_encrypted_wal_to_decrypted_db(path, out_path, enc_key, log_fn=log_fn)
+                if wal_result and wal_result.get("applied", 0) > 0:
+                    wal_applied += 1
+                else:
+                    wal_skipped += 1
             success += 1
             total_bytes += size
             if log_fn:
                 log_fn(f"[wechat-decrypt] 解密成功: {rel}")
+            _emit(event_fn, "client_decrypt_db_result", {
+                "db_rel": rel, "db_size_bytes": size,
+                "result": "success",
+                "wal_applied": wal_result.get("applied", 0) if wal_result else 0,
+                "wal_present": wal_result.get("present", False) if wal_result else False,
+            })
         else:
             failed += 1
             if log_fn:
                 log_fn(f"[wechat-decrypt] 解密失败: {rel}")
+            _emit(event_fn, "client_decrypt_db_result", {
+                "db_rel": rel, "db_size_bytes": size,
+                "result": "failed", "reason": "hmac_or_decrypt",
+            })
 
         for suffix in ("-shm", "-wal"):
             residual = out_path + suffix
@@ -224,14 +264,18 @@ def decrypt_database_tree(db_dir: str, out_dir: str, keys: dict, log_fn=None) ->
                 except OSError:
                     pass
 
-    return {
+    result = {
         "success": success > 0,
         "success_count": success,
         "failed_count": failed,
         "skipped_count": skipped,
+        "wal_applied_count": wal_applied,
+        "wal_skipped_count": wal_skipped,
         "total_bytes": total_bytes,
         "duration_seconds": round(time.time() - started_at, 3),
     }
+    _emit(event_fn, "client_decrypt_tree_done", result)
+    return result
 
 
 def decrypt_database_to_bytes(db_path: str, enc_key: bytes):
@@ -719,39 +763,63 @@ def enum_regions(handle):
 
 def scan_memory_for_keys(data, db_files, salt_to_dbs, key_map, remaining_salts, base_addr, pid, process_name, log_fn=None):
     matches = 0
+
+    # 方式 A: x'<hex>' 格式（4.1.9 及以下）
     for match in _HEX_RE.finditer(data):
         hex_str = match.group(1).decode()
         addr = base_addr + match.start()
-        matches += 1
-        hex_len = len(hex_str)
+        matches += _process_hex_hit(hex_str, addr, data, match.start(), db_files, salt_to_dbs,
+                                     key_map, remaining_salts, pid, process_name, log_fn)
 
-        if hex_len == 96:
-            enc_key_hex = hex_str[:64]
-            salt_hex = hex_str[64:]
-            if salt_hex in remaining_salts and verify_hex_key(enc_key_hex, salt_hex, db_files):
+    # 方式 B: 裸 hex 字符串（4.1.10+ 可能不带 x' 包装）
+    if remaining_salts:
+        for match in _HEX_BARE_RE.finditer(data):
+            hex_str = match.group(0).decode()
+            addr = base_addr + match.start()
+            # 跳过已被 x' 包装捕获的（重叠匹配）
+            # 检查原数据中是否被 x' 包裹
+            start = match.start()
+            if start >= 2 and data[start-2:start] == b"x'":
+                continue
+            matches += _process_hex_hit(hex_str, addr, data, match.start(), db_files, salt_to_dbs,
+                                         key_map, remaining_salts, pid, process_name, log_fn)
+            if not remaining_salts:
+                break
+
+    return matches
+
+
+def _process_hex_hit(hex_str, addr, data, offset, db_files, salt_to_dbs,
+                     key_map, remaining_salts, pid, process_name, log_fn):
+    hex_len = len(hex_str)
+
+    if hex_len == 96:
+        enc_key_hex = hex_str[:64]
+        salt_hex = hex_str[64:]
+        if salt_hex in remaining_salts and verify_hex_key(enc_key_hex, salt_hex, db_files):
+            key_map[salt_hex] = enc_key_hex
+            remaining_salts.discard(salt_hex)
+            if log_fn:
+                log_fn(f"[wechat-decrypt] 命中 salt={salt_hex} pid={pid} ({process_name}) addr=0x{addr:016X}")
+    elif hex_len == 64:
+        enc_key_hex = hex_str
+        for rel, _, _, salt_hex, page1 in db_files:
+            if salt_hex in remaining_salts and verify_enc_key(bytes.fromhex(enc_key_hex), page1):
                 key_map[salt_hex] = enc_key_hex
                 remaining_salts.discard(salt_hex)
                 if log_fn:
                     log_fn(f"[wechat-decrypt] 命中 salt={salt_hex} pid={pid} ({process_name}) addr=0x{addr:016X}")
-        elif hex_len == 64:
-            enc_key_hex = hex_str
-            for rel, _, _, salt_hex, page1 in db_files:
-                if salt_hex in remaining_salts and verify_enc_key(bytes.fromhex(enc_key_hex), page1):
-                    key_map[salt_hex] = enc_key_hex
-                    remaining_salts.discard(salt_hex)
-                    if log_fn:
-                        log_fn(f"[wechat-decrypt] 命中 salt={salt_hex} pid={pid} ({process_name}) addr=0x{addr:016X}")
-                    break
-        elif hex_len > 96 and hex_len % 2 == 0:
-            enc_key_hex = hex_str[:64]
-            salt_hex = hex_str[-32:]
-            if salt_hex in remaining_salts and verify_hex_key(enc_key_hex, salt_hex, db_files):
-                key_map[salt_hex] = enc_key_hex
-                remaining_salts.discard(salt_hex)
-                if log_fn:
-                    log_fn(f"[wechat-decrypt] 命中长 hex salt={salt_hex} pid={pid} ({process_name}) addr=0x{addr:016X}")
+                break
+    elif hex_len > 96 and hex_len % 2 == 0:
+        enc_key_hex = hex_str[:64]
+        salt_hex = hex_str[-32:]
+        if salt_hex in remaining_salts and verify_hex_key(enc_key_hex, salt_hex, db_files):
+            key_map[salt_hex] = enc_key_hex
+            remaining_salts.discard(salt_hex)
+            if log_fn:
+                log_fn(f"[wechat-decrypt] 命中长 hex salt={salt_hex} pid={pid} ({process_name}) addr=0x{addr:016X}")
 
-    return matches
+    return 1
 
 
 def verify_hex_key(enc_key_hex: str, salt_hex: str, db_files) -> bool:
