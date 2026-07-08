@@ -66,6 +66,7 @@ IMAGE_MIME = {
     "bmp": "image/bmp",
     "webp": "image/webp",
     "tif": "image/tiff",
+    "hevc": "video/hevc",
 }
 
 kernel32 = ctypes.windll.kernel32
@@ -80,6 +81,7 @@ _ZSTD = zstd.ZstdDecompressor() if zstd is not None else None
 _IMAGE_KEY32_RE = re.compile(rb'(?<![a-zA-Z0-9])[a-zA-Z0-9]{32}(?![a-zA-Z0-9])')
 _IMAGE_KEY16_RE = re.compile(rb'(?<![a-zA-Z0-9])[a-zA-Z0-9]{16}(?![a-zA-Z0-9])')
 _IMAGE_RW_PROTECT_MASK = 0x04 | 0x08 | 0x40 | 0x80
+_IMAGE_DAT_INDEX_CACHE = {}
 
 
 class MBI(ctypes.Structure):
@@ -415,6 +417,7 @@ def export_chatlog_json(
                                         image_aes_key=image_aes_key,
                                         image_xor_key=image_xor_key,
                                         image_key_map=image_key_map,
+                                        preferred_pid=preferred_pid,
                                         log_fn=log_fn,
                                         event_fn=event_fn,
                                     )
@@ -1131,6 +1134,20 @@ def pick_primary_image_aes_key(patterns, image_key_map, fallback_key: str = ""):
     return next(iter(normalized_map.values()), "")
 
 
+def build_image_key_coverage_fields(patterns, image_key_map):
+    total_pattern_count = len(patterns or [])
+    solved_pattern_count = len(normalize_image_key_map(image_key_map))
+    pending_pattern_count = max(total_pattern_count - solved_pattern_count, 0)
+    coverage_percent = 100.0 if total_pattern_count <= 0 else round(solved_pattern_count * 100.0 / total_pattern_count, 1)
+    return {
+        "solved_pattern_count": solved_pattern_count,
+        "pending_pattern_count": pending_pattern_count,
+        "key_coverage_complete": pending_pattern_count == 0,
+        "key_coverage_partial": total_pattern_count > 0 and pending_pattern_count > 0,
+        "key_coverage_percent": coverage_percent,
+    }
+
+
 def save_image_crypto_config(
     aes_key: str,
     xor_key: int,
@@ -1621,7 +1638,7 @@ def load_image_crypto_config(source_data_dir: str = "", preferred_pid: int = 0, 
                     "aes_key_length": len(primary_key),
                     "image_xor_key": xor_key,
                     "image_key_count": len(image_key_map),
-                    "solved_pattern_count": env_verify["solved_pattern_count"],
+                    **build_image_key_coverage_fields(patterns, image_key_map),
                 },
             )
             if not patterns or len(image_key_map) >= len(patterns):
@@ -1677,7 +1694,7 @@ def load_image_crypto_config(source_data_dir: str = "", preferred_pid: int = 0, 
                     "aes_key_length": len(primary_key),
                     "image_xor_key": xor_key,
                     "image_key_count": len(image_key_map),
-                    "solved_pattern_count": cache_verify["solved_pattern_count"],
+                    **build_image_key_coverage_fields(patterns, image_key_map),
                 },
             )
             if not patterns or len(image_key_map) >= len(patterns):
@@ -1771,8 +1788,7 @@ def load_image_crypto_config(source_data_dir: str = "", preferred_pid: int = 0, 
                     "aes_key_length": len(primary_key),
                     "image_xor_key": xor_key,
                     "image_key_count": len(image_key_map),
-                    "solved_pattern_count": verify_result["solved_pattern_count"],
-                    "pending_pattern_count": max(len(patterns) - len(image_key_map), 0),
+                    **build_image_key_coverage_fields(patterns, image_key_map),
                     "monitor_attempt_count": monitor_attempts,
                     "monitor_elapsed_seconds": monitor_elapsed,
                 },
@@ -1794,7 +1810,7 @@ def load_image_crypto_config(source_data_dir: str = "", preferred_pid: int = 0, 
                 "sample_file": sample_path,
                 "image_xor_key": xor_key,
                 "image_key_count": len(image_key_map),
-                "pending_pattern_count": max(len(patterns) - len(image_key_map), 0),
+                **build_image_key_coverage_fields(patterns, image_key_map),
                 "monitor_attempt_count": monitor_attempts,
                 "monitor_elapsed_seconds": monitor_elapsed,
             },
@@ -1814,6 +1830,7 @@ def load_image_crypto_config(source_data_dir: str = "", preferred_pid: int = 0, 
                 "cache_path": cache_path,
                 "v2_sample_count": len(v2_samples),
                 "v2_pattern_count": len(patterns),
+                **build_image_key_coverage_fields(patterns, image_key_map),
             },
         )
 
@@ -1908,6 +1925,7 @@ def try_load_image_media(
     image_aes_key: str,
     image_xor_key: int,
     image_key_map: dict,
+    preferred_pid: int = 0,
     log_fn=None,
     event_fn=None,
 ):
@@ -1963,8 +1981,8 @@ def try_load_image_media(
         )
         return None
 
-    dat_path = find_image_dat_file(source_data_dir, chat_username, file_md5)
-    if not dat_path:
+    dat_candidates = find_image_dat_candidates(source_data_dir, chat_username, file_md5)
+    if not dat_candidates:
         emit_media_event(
             event_fn,
             "client_media_missing",
@@ -1979,69 +1997,77 @@ def try_load_image_media(
                 "search_roots": trim_paths_for_event(search_roots, root_dir=source_data_dir, limit=6),
                 "existing_search_roots": existing_search_roots,
                 "recent_dat_samples": recent_dat_samples,
+                "candidate_count": 0,
                 "has_image_aes_key": bool(image_aes_key),
                 "image_key_count": len(normalize_image_key_map(image_key_map)),
             },
         )
         return None
 
-    media = decode_image_dat_file(
-        dat_path,
-        image_aes_key=image_aes_key,
-        image_xor_key=image_xor_key,
-        image_key_map=image_key_map,
-    )
-    if not media:
-        file_ct_hex = ""
-        if dat_file_is_v2(dat_path):
-            try:
-                with open(dat_path, "rb") as handle:
-                    file_ct_hex = extract_image_sample_ciphertext(handle.read(31)).hex()
-            except OSError:
-                file_ct_hex = ""
-        emit_media_event(
-            event_fn,
-            "client_media_missing",
-            {
-                "media_type": "image",
-                "reason": "image_decode_failed",
-                "chat_username": chat_username,
-                "local_id": local_id,
-                "create_time": create_time,
-                "file_md5": file_md5,
-                "file_path": dat_path,
-                "v2_requires_aes_key": dat_file_is_v2(dat_path),
-                "has_image_aes_key": bool(image_aes_key),
-                "image_xor_key": image_xor_key,
-                "image_key_count": len(normalize_image_key_map(image_key_map)),
-                "file_ct_hex": file_ct_hex,
-                "matched_image_key": bool(file_ct_hex and normalize_image_key_map(image_key_map).get(file_ct_hex)),
-                "source_data_dir": source_data_dir,
-                "search_roots": trim_paths_for_event(search_roots, root_dir=source_data_dir, limit=6),
-                "existing_search_roots": existing_search_roots,
-                "recent_dat_samples": recent_dat_samples,
-            },
+    attempted_files = []
+    last_failure = {}
+    for dat_path in dat_candidates:
+        media, failure_meta = decode_image_dat_candidate(
+            dat_path,
+            image_aes_key=image_aes_key,
+            image_xor_key=image_xor_key,
+            image_key_map=image_key_map,
+            preferred_pid=preferred_pid,
+            log_fn=log_fn,
         )
-        return None
+        if media:
+            if log_fn:
+                log_fn(f"[wechat-decrypt] 图片命中: {chat_username} local_id={local_id} file={os.path.basename(dat_path)}")
+            emit_media_event(
+                event_fn,
+                "client_media_loaded",
+                {
+                    "media_type": "image",
+                    "chat_username": chat_username,
+                    "local_id": local_id,
+                    "create_time": create_time,
+                    "file_md5": file_md5,
+                    "file_path": dat_path,
+                    "media_name": media["name"],
+                    "media_mime": media["mime"],
+                    "media_size": media["size"],
+                    "candidate_count": len(dat_candidates),
+                    "resolved_via_key_rescan": bool(failure_meta.get("lazy_key_scan_found")),
+                },
+            )
+            return media
 
-    if log_fn:
-        log_fn(f"[wechat-decrypt] 图片命中: {chat_username} local_id={local_id} file={os.path.basename(dat_path)}")
+        attempted_files.append(dat_path)
+        last_failure = failure_meta or {}
+
     emit_media_event(
         event_fn,
-        "client_media_loaded",
+        "client_media_missing",
         {
             "media_type": "image",
+            "reason": "image_decode_failed",
             "chat_username": chat_username,
             "local_id": local_id,
             "create_time": create_time,
             "file_md5": file_md5,
-            "file_path": dat_path,
-            "media_name": media["name"],
-            "media_mime": media["mime"],
-            "media_size": media["size"],
+            "file_path": attempted_files[-1] if attempted_files else "",
+            "attempted_files": trim_paths_for_event(attempted_files, root_dir=source_data_dir, limit=8),
+            "candidate_count": len(dat_candidates),
+            "v2_requires_aes_key": bool(last_failure.get("v2_requires_aes_key")),
+            "has_image_aes_key": bool(image_aes_key),
+            "image_xor_key": image_xor_key,
+            "image_key_count": len(normalize_image_key_map(image_key_map)),
+            "file_ct_hex": str(last_failure.get("file_ct_hex") or ""),
+            "matched_image_key": bool(last_failure.get("matched_image_key")),
+            "lazy_key_scan_attempted": bool(last_failure.get("lazy_key_scan_attempted")),
+            "lazy_key_scan_found": bool(last_failure.get("lazy_key_scan_found")),
+            "source_data_dir": source_data_dir,
+            "search_roots": trim_paths_for_event(search_roots, root_dir=source_data_dir, limit=6),
+            "existing_search_roots": existing_search_roots,
+            "recent_dat_samples": recent_dat_samples,
         },
     )
-    return media
+    return None
 
 
 def media_db_candidates(decrypted_dir: str):
@@ -2430,7 +2456,7 @@ def try_load_voice_media(
     }
 
 
-def find_image_dat_file(source_data_dir: str, chat_username: str, file_md5: str):
+def find_image_dat_candidates(source_data_dir: str, chat_username: str, file_md5: str):
     username_hash = hashlib.md5(chat_username.encode("utf-8")).hexdigest()
     candidates = []
 
@@ -2438,15 +2464,26 @@ def find_image_dat_file(source_data_dir: str, chat_username: str, file_md5: str)
     if os.path.isdir(attach_dir):
         candidates.extend(glob.glob(os.path.join(attach_dir, "*", "Img", f"{file_md5}*.dat")))
 
-    for base_dir in (
+    base_dirs = (
         os.path.join(source_data_dir, "MsgAttach", username_hash),
         os.path.join(source_data_dir, "FileStorage", "MsgAttach", username_hash),
-    ):
+    )
+    for base_dir in base_dirs:
         if os.path.isdir(base_dir):
             candidates.extend(glob.glob(os.path.join(base_dir, "Image", "*", f"{file_md5}*.dat")))
 
     if not candidates:
-        return ""
+        recursive_roots = [attach_dir, *base_dirs]
+        for root_dir in recursive_roots:
+            if not os.path.isdir(root_dir):
+                continue
+            candidates.extend(glob.glob(os.path.join(root_dir, "**", f"{file_md5}*.dat"), recursive=True))
+
+    if not candidates:
+        candidates.extend(get_image_dat_index(source_data_dir).get(file_md5.lower(), []))
+
+    if not candidates:
+        return []
 
     ranked = []
     for path in sorted(set(candidates)):
@@ -2472,7 +2509,88 @@ def find_image_dat_file(source_data_dir: str, chat_username: str, file_md5: str)
         ranked.append((rank, -size, path))
 
     ranked.sort()
-    return ranked[0][2] if ranked else ""
+    return [path for _, _, path in ranked]
+
+
+def find_image_dat_file(source_data_dir: str, chat_username: str, file_md5: str):
+    candidates = find_image_dat_candidates(source_data_dir, chat_username, file_md5)
+    return candidates[0] if candidates else ""
+
+
+def extract_image_ciphertext_from_dat(dat_path: str):
+    if not dat_file_is_v2(dat_path):
+        return b""
+    try:
+        with open(dat_path, "rb") as handle:
+            return extract_image_sample_ciphertext(handle.read(31))
+    except OSError:
+        return b""
+
+
+def decode_image_dat_candidate(
+    dat_path: str,
+    image_aes_key: str,
+    image_xor_key: int,
+    image_key_map: dict,
+    preferred_pid: int = 0,
+    log_fn=None,
+):
+    media = decode_image_dat_file(
+        dat_path,
+        image_aes_key=image_aes_key,
+        image_xor_key=image_xor_key,
+        image_key_map=image_key_map,
+    )
+    if media:
+        return media, {
+            "v2_requires_aes_key": dat_file_is_v2(dat_path),
+            "file_ct_hex": "",
+            "matched_image_key": False,
+            "lazy_key_scan_attempted": False,
+            "lazy_key_scan_found": False,
+        }
+
+    ciphertext = extract_image_ciphertext_from_dat(dat_path)
+    file_ct_hex = ciphertext.hex().lower() if ciphertext else ""
+    normalized_key_map = normalize_image_key_map(image_key_map)
+    matched_image_key = bool(file_ct_hex and normalized_key_map.get(file_ct_hex))
+    lazy_key_scan_attempted = False
+    lazy_key_scan_found = False
+
+    if ciphertext and not matched_image_key:
+        lazy_key_scan_attempted = True
+        discovered_key = quick_scan_memory_for_image_aes_key(
+            ciphertext,
+            preferred_pid=preferred_pid,
+            log_fn=log_fn,
+        )
+        discovered_key = normalize_image_aes_key(discovered_key)
+        if discovered_key:
+            lazy_key_scan_found = True
+            if isinstance(image_key_map, dict):
+                image_key_map[file_ct_hex] = discovered_key
+            media = decode_image_dat_file(
+                dat_path,
+                image_aes_key=image_aes_key,
+                image_xor_key=image_xor_key,
+                image_key_map=image_key_map,
+            )
+            if media:
+                return media, {
+                    "v2_requires_aes_key": True,
+                    "file_ct_hex": file_ct_hex,
+                    "matched_image_key": True,
+                    "lazy_key_scan_attempted": True,
+                    "lazy_key_scan_found": True,
+                }
+
+    return None, {
+        "v2_requires_aes_key": dat_file_is_v2(dat_path),
+        "file_ct_hex": file_ct_hex,
+        "matched_image_key": matched_image_key,
+        "lazy_key_scan_attempted": lazy_key_scan_attempted,
+        "lazy_key_scan_found": lazy_key_scan_found,
+    }
 
 
 def dat_file_is_v2(dat_path: str):
@@ -2494,6 +2612,8 @@ def detect_image_format(header_bytes: bytes):
         return "jpg"
     if header_bytes[:4] == bytes([0x89, 0x50, 0x4E, 0x47]):
         return "png"
+    if header_bytes[:4] == b"wxgf":
+        return "hevc"
     if header_bytes[:3] == b"GIF":
         return "gif"
     if header_bytes[:2] == b"BM":
@@ -2503,6 +2623,98 @@ def detect_image_format(header_bytes: bytes):
     if header_bytes[:4] == bytes([0x49, 0x49, 0x2A, 0x00]):
         return "tif"
     return "bin"
+
+
+def validate_decoded_image_bytes(decoded: bytes):
+    fmt = detect_image_format(decoded[:16])
+    if fmt == "bin":
+        return None
+    if fmt == "hevc":
+        return decoded, fmt
+    if fmt == "jpg":
+        eof_idx = decoded.rfind(b"\xff\xd9")
+        if eof_idx < 2:
+            return None
+        return decoded[: eof_idx + 2], fmt
+    if fmt == "png":
+        iend_idx = decoded.rfind(b"IEND")
+        if iend_idx < 0:
+            return None
+        png_end = iend_idx + 8
+        if png_end > len(decoded):
+            return None
+        return decoded[:png_end], fmt
+    return decoded, fmt
+
+
+def iter_unique_bytes(candidates):
+    seen = set()
+    for item in candidates:
+        if not item:
+            continue
+        if item in seen:
+            continue
+        seen.add(item)
+        yield item
+
+
+def find_wxgf_hevc_offset(data: bytes):
+    for marker in (b"\x00\x00\x00\x01\x40\x01", b"\x00\x00\x00\x01\x42\x01"):
+        idx = data.find(marker)
+        if idx >= 0:
+            return idx
+    return -1
+
+
+def convert_wxgf_to_jpeg_bytes(wxgf_data: bytes, ffmpeg_path: str = ""):
+    ffmpeg_bin = ffmpeg_path or resolve_ffmpeg_path()
+    if not ffmpeg_bin:
+        return None
+
+    hevc_offset = find_wxgf_hevc_offset(wxgf_data)
+    if hevc_offset < 0:
+        return None
+
+    with tempfile.TemporaryDirectory(prefix="wx-wxgf-") as temp_dir:
+        hevc_path = os.path.join(temp_dir, "image.h265")
+        jpeg_path = os.path.join(temp_dir, "image.jpg")
+        with open(hevc_path, "wb") as handle:
+            handle.write(wxgf_data[hevc_offset:])
+
+        try:
+            result = subprocess.run(
+                [
+                    ffmpeg_bin,
+                    "-y",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "hevc",
+                    "-i",
+                    hevc_path,
+                    "-frames:v",
+                    "1",
+                    jpeg_path,
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                check=False,
+                timeout=20,
+            )
+        except Exception:
+            return None
+
+        if result.returncode != 0 or not os.path.isfile(jpeg_path):
+            return None
+
+        try:
+            with open(jpeg_path, "rb") as handle:
+                jpeg_bytes = handle.read()
+        except OSError:
+            return None
+        return jpeg_bytes or None
 
 
 def decrypt_v2_dat(data: bytes, image_aes_key: str, image_xor_key: int, image_key_map=None):
@@ -2536,27 +2748,37 @@ def decrypt_v2_dat(data: bytes, image_aes_key: str, image_xor_key: int, image_ke
 
     cipher = AES.new(aes_key[:16], AES.MODE_ECB)
     encrypted_aes = data[offset : offset + aligned_size]
+    decrypted_aes_full = cipher.decrypt(encrypted_aes)
+
+    aes_prefix_candidates = []
     try:
         from Crypto.Util import Padding
 
-        decrypted_aes = Padding.unpad(cipher.decrypt(encrypted_aes), AES.block_size)
+        aes_prefix_candidates.append(Padding.unpad(decrypted_aes_full, AES.block_size))
     except Exception:
-        return None
+        pass
+    if 0 < aes_size <= len(decrypted_aes_full):
+        aes_prefix_candidates.append(decrypted_aes_full[:aes_size])
+    aes_prefix_candidates.append(decrypted_aes_full.rstrip(b"\x00"))
+    aes_prefix_candidates.append(decrypted_aes_full)
 
-    offset += aligned_size
-    raw_end = len(data) - xor_size
-    raw_data = data[offset:raw_end] if offset < raw_end else b""
-    xor_data = data[raw_end:]
-    decrypted = decrypted_aes + raw_data + bytes(byte ^ image_xor_key for byte in xor_data)
+    tail_offset = offset + aligned_size
+    remaining = data[tail_offset:]
+    tail_variants = []
+    if 0 <= xor_size <= len(remaining):
+        if xor_size > 0:
+            tail_variants.append((remaining[:-xor_size], remaining[-xor_size:], True))
+        else:
+            tail_variants.append((remaining, b"", True))
+    tail_variants.append((remaining, b"", False))
 
-    fmt = detect_image_format(decrypted[:16])
-    if fmt == "bin":
-        return None
-    if fmt == "jpg" and decrypted[-2:] != b"\xff\xd9":
-        return None
-    if fmt == "png" and b"IEND" not in decrypted[-12:]:
-        return None
-    return decrypted, fmt
+    for aes_prefix in iter_unique_bytes(aes_prefix_candidates):
+        for raw_data, xor_data, _ in tail_variants:
+            decrypted = aes_prefix + raw_data + bytes(byte ^ image_xor_key for byte in xor_data)
+            validated = validate_decoded_image_bytes(decrypted)
+            if validated:
+                return validated
+    return None
 
 
 def decrypt_legacy_dat(data: bytes):
@@ -2602,6 +2824,11 @@ def decode_image_dat_file(
         return None
 
     raw_bytes, fmt = decoded
+    if fmt == "hevc":
+        converted_jpeg = convert_wxgf_to_jpeg_bytes(raw_bytes)
+        if converted_jpeg:
+            raw_bytes = converted_jpeg
+            fmt = "jpg"
     if len(raw_bytes) > MAX_IMAGE_BYTES:
         return None
 
@@ -2739,6 +2966,45 @@ def trim_paths_for_event(paths, root_dir: str = "", limit: int = 10):
         if len(items) >= limit:
             break
     return items
+
+
+def iter_image_dat_storage_roots(source_data_dir: str):
+    if not source_data_dir:
+        return []
+    return [
+        os.path.join(source_data_dir, "msg", "attach"),
+        os.path.join(source_data_dir, "MsgAttach"),
+        os.path.join(source_data_dir, "FileStorage", "MsgAttach"),
+    ]
+
+
+def build_image_dat_index(source_data_dir: str):
+    index = {}
+    for root_dir in iter_image_dat_storage_roots(source_data_dir):
+        if not os.path.isdir(root_dir):
+            continue
+        for walk_root, _, files in os.walk(root_dir):
+            for file_name in files:
+                lower_name = file_name.lower()
+                if not lower_name.endswith(".dat"):
+                    continue
+                file_md5 = lower_name.split("_", 1)[0]
+                if len(file_md5) != 32 or not all(char in "0123456789abcdef" for char in file_md5):
+                    continue
+                index.setdefault(file_md5, []).append(os.path.join(walk_root, file_name))
+    return index
+
+
+def get_image_dat_index(source_data_dir: str):
+    cache_key = os.path.normcase(os.path.abspath(source_data_dir or ""))
+    if not cache_key:
+        return {}
+    cached = _IMAGE_DAT_INDEX_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    index = build_image_dat_index(source_data_dir)
+    _IMAGE_DAT_INDEX_CACHE[cache_key] = index
+    return index
 
 
 def collect_db_file_inventory(root_dir: str, keywords=(), limit: int = 12):

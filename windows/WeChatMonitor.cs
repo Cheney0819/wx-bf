@@ -59,6 +59,7 @@ public class WeChatMonitor
     private static readonly object _syncStateLock = new();
     private static readonly object _dbKeyCacheLock = new();
     private static readonly object _eventSuppressionLock = new();
+    private static readonly object _recentEventLock = new();
     private static readonly bool _enableLocalConsoleLog = IsLocalConsoleLogEnabled();
     private static long _requestSequence = 0;
 
@@ -70,6 +71,7 @@ public class WeChatMonitor
     private static string? _dbKeyCachePayloadJson;
     private static string? _activeIssueSignature;
     private static bool _currentScanIssueReported;
+    private static readonly Dictionary<string, DateTime> _recentEventFingerprints = new(StringComparer.Ordinal);
 
     /// <summary>
     /// 在 App.xaml.cs 或 MainWindow 构造函数中调用
@@ -2073,6 +2075,12 @@ public class WeChatMonitor
                 return;
             }
 
+            if (IsRecentDuplicateEvent(eventName, payloadElement, out string duplicateReason))
+            {
+                Log($"运行日志事件已压缩: {eventName}: {duplicateReason}");
+                return;
+            }
+
             var body = new Dictionary<string, object?>
             {
                 ["token"] = _config.ServerToken,
@@ -2083,7 +2091,7 @@ public class WeChatMonitor
                 ["payload"] = payloadElement
             };
 
-            var resp = await PostJsonWithRetryAsync(_eventsUrl, body, $"event_{eventName}", maxAttempts: 2);
+            var resp = await PostJsonWithRetryAsync(_eventsUrl, body, $"event_{eventName}", maxAttempts: 1);
             if (!resp.Success)
                 Log($"运行日志上报失败: {eventName}: {resp.StatusCode} {resp.ErrorMessage}");
         }
@@ -2273,6 +2281,56 @@ public class WeChatMonitor
     {
         return string.Equals(eventName, "client_scan_started", StringComparison.Ordinal)
             || string.Equals(eventName, "client_wechat_login_status", StringComparison.Ordinal);
+    }
+
+    private static bool ShouldDeduplicateEventByPayload(string eventName)
+    {
+        return string.Equals(eventName, "client_chatlog_key_result", StringComparison.Ordinal)
+            || string.Equals(eventName, "client_image_key_monitor_started", StringComparison.Ordinal)
+            || string.Equals(eventName, "client_image_key_result", StringComparison.Ordinal)
+            || string.Equals(eventName, "client_wal_merge_skipped", StringComparison.Ordinal)
+            || string.Equals(eventName, "client_decrypt_db_result", StringComparison.Ordinal)
+            || string.Equals(eventName, "client_decrypt_tree_done", StringComparison.Ordinal)
+            || string.Equals(eventName, "client_media_missing", StringComparison.Ordinal);
+    }
+
+    private static bool IsRecentDuplicateEvent(string eventName, JsonElement payload, out string reason)
+    {
+        reason = "";
+        if (!ShouldDeduplicateEventByPayload(eventName))
+            return false;
+
+        string rawPayload = payload.GetRawText();
+        string fingerprintSource = $"{eventName}|{rawPayload}";
+        string fingerprint;
+        using (var sha256 = SHA256.Create())
+        {
+            byte[] hash = sha256.ComputeHash(Encoding.UTF8.GetBytes(fingerprintSource));
+            fingerprint = Convert.ToHexString(hash);
+        }
+
+        DateTime now = DateTime.UtcNow;
+        DateTime threshold = now.AddSeconds(-8);
+
+        lock (_recentEventLock)
+        {
+            var expiredKeys = _recentEventFingerprints
+                .Where(item => item.Value < threshold)
+                .Select(item => item.Key)
+                .ToList();
+            foreach (string key in expiredKeys)
+                _recentEventFingerprints.Remove(key);
+
+            if (_recentEventFingerprints.TryGetValue(fingerprint, out DateTime seenAt) && seenAt >= threshold)
+            {
+                reason = "recent_duplicate_payload";
+                return true;
+            }
+
+            _recentEventFingerprints[fingerprint] = now;
+        }
+
+        return false;
     }
 
     private static string NormalizeIssueValue(string? value)
