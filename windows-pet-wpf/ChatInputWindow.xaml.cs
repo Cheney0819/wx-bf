@@ -51,7 +51,7 @@ public partial class ChatInputWindow : Window
         Close();
     }
 
-    private void PromptTextBox_OnKeyDown(object sender, KeyEventArgs e)
+    private void PromptTextBox_OnKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
     {
         if (e.Key == Key.Enter && Keyboard.Modifiers != ModifierKeys.Shift)
         {
