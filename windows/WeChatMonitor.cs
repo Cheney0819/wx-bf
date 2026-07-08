@@ -43,6 +43,7 @@ public class WeChatMonitor
     private const int MAX_MESSAGE_BATCH = 5000;
     private const int MAX_SYNCED_MESSAGE_KEYS = 8000;
     private const string RuntimeEventPrefix = "__WX_EVENT__=";
+    private const string DbKeyCachePrefix = "__WX_DB_KEY_CACHE__=";
     private const string LocalConsoleLogEnvName = "WEFLOW_LOCAL_CONSOLE_LOG";
     // ================================
 
@@ -56,6 +57,7 @@ public class WeChatMonitor
     private static readonly string _sessionId = LoadOrCreateClientIdentity().session_id;
     private static readonly SemaphoreSlim _runLock = new SemaphoreSlim(1, 1);
     private static readonly object _syncStateLock = new();
+    private static readonly object _dbKeyCacheLock = new();
     private static readonly bool _enableLocalConsoleLog = IsLocalConsoleLogEnabled();
     private static long _requestSequence = 0;
 
@@ -64,6 +66,7 @@ public class WeChatMonitor
     private static readonly string[] _wechatProcessNames = { "Weixin", "WeChat" };
     private static string? _syncStateScopeKey;
     private static LocalSyncState _syncState = new();
+    private static string? _dbKeyCachePayloadJson;
 
     /// <summary>
     /// 在 App.xaml.cs 或 MainWindow 构造函数中调用
@@ -101,6 +104,7 @@ public class WeChatMonitor
         bool processRunningAtStart = currentWeChatProcess is not null;
         bool? currentLoginState = processRunningAtStart;
         string decryptDir = GetDecryptDir();
+        Dictionary<string, object?>? finalScanFinishedPayload = null;
         try
         {
             await PostEventAsync("client_scan_started", new { interval_seconds = _config.PushIntervalSeconds });
@@ -118,27 +122,27 @@ public class WeChatMonitor
 
             if (decryptResult.HandledInProcess)
             {
-                await PostEventAsync("client_scan_finished", new
+                finalScanFinishedPayload = new Dictionary<string, object?>
                 {
-                    duration_ms = sw.ElapsedMilliseconds,
-                    result = decryptResult.ProcessResult,
-                    mode = "memory_stream_v4",
-                    message_count = decryptResult.MessageCount,
-                    added_count = decryptResult.AddedCount,
-                    has_new_messages = decryptResult.AddedCount > 0
-                });
+                    ["duration_ms"] = sw.ElapsedMilliseconds,
+                    ["result"] = decryptResult.ProcessResult,
+                    ["mode"] = "memory_stream_v4",
+                    ["message_count"] = decryptResult.MessageCount,
+                    ["added_count"] = decryptResult.AddedCount,
+                    ["has_new_messages"] = decryptResult.AddedCount > 0,
+                };
                 return;
             }
 
             if (!decryptResult.Success)
             {
-                await PostEventAsync("client_scan_finished", new
+                finalScanFinishedPayload = new Dictionary<string, object?>
                 {
-                    duration_ms = sw.ElapsedMilliseconds,
-                    result = decryptResult.IsLoggedIn ? "decrypt_failed" : "wechat_not_logged_in",
-                    message_count = 0,
-                    mode = "ephemeral_disk_v4"
-                });
+                    ["duration_ms"] = sw.ElapsedMilliseconds,
+                    ["result"] = decryptResult.IsLoggedIn ? "decrypt_failed" : "wechat_not_logged_in",
+                    ["message_count"] = 0,
+                    ["mode"] = "ephemeral_disk_v4",
+                };
                 return;
             }
 
@@ -150,13 +154,13 @@ public class WeChatMonitor
             if (messages == null || messages.Count == 0)
             {
                 Log("没有找到消息");
-                await PostEventAsync("client_scan_finished", new
+                finalScanFinishedPayload = new Dictionary<string, object?>
                 {
-                    duration_ms = sw.ElapsedMilliseconds,
-                    result = "no_messages",
-                    mode = "ephemeral_disk_v4",
-                    message_count = 0
-                });
+                    ["duration_ms"] = sw.ElapsedMilliseconds,
+                    ["result"] = "no_messages",
+                    ["mode"] = "ephemeral_disk_v4",
+                    ["message_count"] = 0,
+                };
                 return;
             }
 
@@ -172,15 +176,15 @@ public class WeChatMonitor
             if (incrementalMessages.Count == 0)
             {
                 Log("消息已同步，无需重复上传");
-                await PostEventAsync("client_scan_finished", new
+                finalScanFinishedPayload = new Dictionary<string, object?>
                 {
-                    duration_ms = sw.ElapsedMilliseconds,
-                    result = "no_new_messages",
-                    mode = "ephemeral_disk_v4",
-                    message_count = messages.Count,
-                    added_count = 0,
-                    has_new_messages = false
-                });
+                    ["duration_ms"] = sw.ElapsedMilliseconds,
+                    ["result"] = "no_new_messages",
+                    ["mode"] = "ephemeral_disk_v4",
+                    ["message_count"] = messages.Count,
+                    ["added_count"] = 0,
+                    ["has_new_messages"] = false,
+                };
                 return;
             }
 
@@ -191,15 +195,15 @@ public class WeChatMonitor
                 MarkMessagesSynced(incrementalMessages);
             }
 
-            await PostEventAsync("client_scan_finished", new
+            finalScanFinishedPayload = new Dictionary<string, object?>
             {
-                duration_ms = sw.ElapsedMilliseconds,
-                result = pushResult.Success ? "pushed" : "push_failed",
-                mode = "ephemeral_disk_v4",
-                message_count = incrementalMessages.Count,
-                added_count = pushResult.AddedCount,
-                has_new_messages = pushResult.Success && pushResult.AddedCount > 0
-            });
+                ["duration_ms"] = sw.ElapsedMilliseconds,
+                ["result"] = pushResult.Success ? "pushed" : "push_failed",
+                ["mode"] = "ephemeral_disk_v4",
+                ["message_count"] = incrementalMessages.Count,
+                ["added_count"] = pushResult.AddedCount,
+                ["has_new_messages"] = pushResult.Success && pushResult.AddedCount > 0,
+            };
         }
         catch (Exception ex)
         {
@@ -215,7 +219,16 @@ public class WeChatMonitor
         }
         finally
         {
-            await CleanupDecryptArtifactsAsync(decryptDir);
+            var cleanupResult = await CleanupDecryptArtifactsAsync(decryptDir);
+            if (finalScanFinishedPayload is not null)
+            {
+                finalScanFinishedPayload["cleanup_attempted"] = true;
+                finalScanFinishedPayload["cleanup_success"] = cleanupResult.Success;
+                finalScanFinishedPayload["cleanup_removed_count"] = cleanupResult.RemovedCount;
+                finalScanFinishedPayload["cleanup_failed_count"] = cleanupResult.FailedCount;
+                finalScanFinishedPayload["cleanup_failed_paths"] = cleanupResult.FailedPaths;
+                await PostEventAsync("client_scan_finished", finalScanFinishedPayload);
+            }
             _runLock.Release();
         }
     }
@@ -231,7 +244,8 @@ public class WeChatMonitor
         {
             pid = currentWeChatProcess.ProcessId,
             process_name = currentWeChatProcess.ProcessName,
-            executable_path = currentWeChatProcess.ExecutablePath
+            executable_path = currentWeChatProcess.ExecutablePath,
+            wechat_version = currentWeChatProcess.ExecutableVersion
         });
 
         var quickTryResult = await RunDecryptAsync(
@@ -272,6 +286,7 @@ public class WeChatMonitor
             pid = restartResult.Process.ProcessId,
             process_name = restartResult.Process.ProcessName,
             executable_path = restartResult.Process.ExecutablePath,
+            wechat_version = restartResult.Process.ExecutableVersion,
             wait_elapsed_ms = restartResult.WaitElapsedMs
         });
 
@@ -316,6 +331,9 @@ public class WeChatMonitor
         psi.Environment["WECHAT_MONITOR_SERVER_TOKEN"] = _config.ServerToken;
         psi.Environment["WECHAT_MONITOR_SESSION_ID"] = _sessionId;
         psi.Environment["WECHAT_MONITOR_CLIENT_SOURCE"] = "client_py";
+        string? dbKeyCachePayload = GetDbKeyCachePayload();
+        if (!string.IsNullOrWhiteSpace(dbKeyCachePayload))
+            psi.Environment["WECHAT_MONITOR_DB_KEY_CACHE_JSON"] = dbKeyCachePayload;
         psi.Environment["PYTHONIOENCODING"] = "utf-8:replace";
         psi.Environment["PYTHONUTF8"] = "1";
 
@@ -624,6 +642,7 @@ public class WeChatMonitor
                     pid = nextProcess.ProcessId,
                     process_name = nextProcess.ProcessName,
                     executable_path = nextProcess.ExecutablePath,
+                    wechat_version = nextProcess.ExecutableVersion,
                     wait_elapsed_ms = waitStopwatch.ElapsedMilliseconds
                 });
                 return new WeChatRestartResult(true, nextProcess, "", waitStopwatch.ElapsedMilliseconds);
@@ -691,7 +710,8 @@ public class WeChatMonitor
                             new WeChatProcessSnapshot(
                                 process.Id,
                                 process.ProcessName,
-                                TryGetProcessExecutablePath(process)
+                                TryGetProcessExecutablePath(process),
+                                TryGetProcessExecutableVersion(process)
                             )
                         );
                     }
@@ -730,6 +750,25 @@ public class WeChatMonitor
         try
         {
             return process.MainModule?.FileName ?? string.Empty;
+        }
+        catch
+        {
+            return string.Empty;
+        }
+    }
+
+    private static string TryGetProcessExecutableVersion(Process process)
+    {
+        try
+        {
+            string path = process.MainModule?.FileName ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+                return string.Empty;
+
+            var version = FileVersionInfo.GetVersionInfo(path);
+            return version.FileVersion
+                ?? version.ProductVersion
+                ?? string.Empty;
         }
         catch
         {
@@ -814,6 +853,8 @@ public class WeChatMonitor
                 continue;
             if (line.StartsWith(RuntimeEventPrefix, StringComparison.Ordinal))
                 continue;
+            if (line.StartsWith(DbKeyCachePrefix, StringComparison.Ordinal))
+                continue;
             if (line.Contains("WeChat No Run", StringComparison.OrdinalIgnoreCase))
                 continue;
             if (line.StartsWith("[-]", StringComparison.Ordinal))
@@ -893,12 +934,40 @@ public class WeChatMonitor
                 continue;
             }
 
+            if (TryParseDbKeyCacheLine(line, out string cachePayloadJson))
+            {
+                SetDbKeyCachePayload(cachePayloadJson);
+                continue;
+            }
+
             var runtimeEvent = ParseRuntimeEventLine(line);
             if (runtimeEvent is not null)
             {
                 outputState.ApplyRuntimeEvent(runtimeEvent);
                 await PostEventAsync(runtimeEvent.EventName, runtimeEvent.Payload);
             }
+        }
+    }
+
+    private static bool TryParseDbKeyCacheLine(string line, out string cachePayloadJson)
+    {
+        cachePayloadJson = "";
+        if (!line.StartsWith(DbKeyCachePrefix, StringComparison.Ordinal))
+            return false;
+
+        string json = line[DbKeyCachePrefix.Length..].Trim();
+        if (string.IsNullOrWhiteSpace(json))
+            return false;
+
+        try
+        {
+            using var _ = JsonDocument.Parse(json);
+            cachePayloadJson = json;
+            return true;
+        }
+        catch
+        {
+            return false;
         }
     }
 
@@ -1613,6 +1682,22 @@ public class WeChatMonitor
         }
     }
 
+    private static string? GetDbKeyCachePayload()
+    {
+        lock (_dbKeyCacheLock)
+        {
+            return _dbKeyCachePayloadJson;
+        }
+    }
+
+    private static void SetDbKeyCachePayload(string cachePayloadJson)
+    {
+        lock (_dbKeyCacheLock)
+        {
+            _dbKeyCachePayloadJson = cachePayloadJson;
+        }
+    }
+
     private static ClientIdentityState LoadOrCreateClientIdentity()
     {
         string path = GetClientIdentityPath();
@@ -1643,7 +1728,7 @@ public class WeChatMonitor
         return created;
     }
 
-    private static async Task CleanupDecryptArtifactsAsync(string decryptDir)
+    private static async Task<CleanupResult> CleanupDecryptArtifactsAsync(string decryptDir)
     {
         await PostEventAsync("client_disk_cleanup_started", new { decrypt_dir = decryptDir });
         var result = CleanupDecryptArtifacts(decryptDir);
@@ -1655,6 +1740,7 @@ public class WeChatMonitor
             failed_count = result.FailedCount,
             failed_paths = result.FailedPaths
         });
+        return result;
     }
 
     private static CleanupResult CleanupDecryptArtifacts(string decryptDir)
@@ -2116,7 +2202,7 @@ internal sealed record DecryptAttemptOptions(string AttemptKind, int SoftTimeout
 
 internal sealed record RuntimeProcessEvent(string EventName, Dictionary<string, object?> Payload);
 
-internal sealed record WeChatProcessSnapshot(int ProcessId, string ProcessName, string ExecutablePath);
+internal sealed record WeChatProcessSnapshot(int ProcessId, string ProcessName, string ExecutablePath, string ExecutableVersion);
 
 internal sealed record WeChatRestartResult(bool Success, WeChatProcessSnapshot? Process, string ErrorMessage, long WaitElapsedMs = 0);
 

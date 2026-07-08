@@ -30,6 +30,7 @@ from wechat_decrypt_engine import (
 
 LOGIN_STATUS_PREFIX = "__WX_LOGIN_STATUS__="
 RUNTIME_EVENT_PREFIX = "__WX_EVENT__="
+DB_KEY_CACHE_PREFIX = "__WX_DB_KEY_CACHE__="
 EXPORT_JSON_NAME = "chatlog_export.json"
 CONTACT_EXPORT_JSON_NAME = "contact_export.json"
 FAVORITE_EXPORT_JSON_NAME = "favorite_export.json"
@@ -83,6 +84,10 @@ def emit_runtime_event(event_name: str, payload: dict):
     )
 
 
+def emit_db_key_cache(cache_payload: dict):
+    print(f"{DB_KEY_CACHE_PREFIX}{json.dumps(cache_payload, ensure_ascii=False)}", flush=True)
+
+
 def log_debug(message: str):
     if LOCAL_DEBUG_LOG_ENABLED:
         print(f"[wx_decrypt] {message}", flush=True)
@@ -114,6 +119,19 @@ def get_runtime_session_context() -> tuple[str, str]:
     return session_id, source
 
 
+def get_runtime_db_key_cache():
+    raw = (os.environ.get("WECHAT_MONITOR_DB_KEY_CACHE_JSON") or "").strip()
+    if not raw:
+        return None
+
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return None
+
+    return parsed if isinstance(parsed, dict) else None
+
+
 def build_request_id(prefix: str, batch_index: int = 0) -> str:
     global _REQUEST_SEQUENCE
 
@@ -127,6 +145,92 @@ def build_request_id(prefix: str, batch_index: int = 0) -> str:
         f"{session_id}-{safe_prefix}-{int(time.time() * 1000)}"
         f"-b{batch_index}-n{_REQUEST_SEQUENCE}"
     )
+
+
+def build_db_key_cache_payload(
+    *,
+    pid: int,
+    wxid: str,
+    data_dir: str,
+    db_storage_dir: str,
+    key_scan_result: dict,
+):
+    return {
+        "schema": 1,
+        "pid": int(key_scan_result.get("selected_pid") or pid or 0),
+        "wxid": wxid or "",
+        "data_dir": normalize_windows_path(data_dir or ""),
+        "db_storage_dir": normalize_windows_path(db_storage_dir or ""),
+        "db_count": int(key_scan_result.get("db_count") or 0),
+        "matched_count": int(key_scan_result.get("matched_count") or 0),
+        "missing_count": int(key_scan_result.get("missing_count") or 0),
+        "missing_dbs": list(key_scan_result.get("missing_dbs") or [])[:200],
+        "keys": key_scan_result.get("keys") or {},
+        "cached_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+    }
+
+
+def try_get_cached_key_scan_result(
+    *,
+    pid: int,
+    selected_wxid: str,
+    selected_data_dir: str,
+    selected_db_storage_dir: str,
+):
+    cache_payload = get_runtime_db_key_cache()
+    if not cache_payload:
+        return None
+
+    keys = cache_payload.get("keys") or {}
+    if not isinstance(keys, dict) or not keys:
+        return None
+
+    cached_pid = int(cache_payload.get("pid") or 0)
+    if cached_pid <= 0 or cached_pid != int(pid or 0):
+        return None
+
+    cached_wxid = str(cache_payload.get("wxid") or "").strip()
+    if cached_wxid and cached_wxid != (selected_wxid or "").strip():
+        return None
+
+    cached_data_dir = normalize_windows_path(str(cache_payload.get("data_dir") or ""))
+    current_data_dir = normalize_windows_path(selected_data_dir or "")
+    if cached_data_dir and current_data_dir and cached_data_dir != current_data_dir:
+        return None
+
+    cached_db_storage_dir = normalize_windows_path(str(cache_payload.get("db_storage_dir") or ""))
+    current_db_storage_dir = normalize_windows_path(selected_db_storage_dir or "")
+    if cached_db_storage_dir and current_db_storage_dir and cached_db_storage_dir != current_db_storage_dir:
+        return None
+
+    for value in keys.values():
+        if not isinstance(value, dict) or not str(value.get("enc_key") or "").strip():
+            return None
+
+    matched_count = int(cache_payload.get("matched_count") or len(keys))
+    missing_dbs = list(cache_payload.get("missing_dbs") or [])
+    missing_count = int(cache_payload.get("missing_count") or len(missing_dbs))
+
+    return {
+        "success": True,
+        "selected_pid": cached_pid,
+        "db_count": int(cache_payload.get("db_count") or (matched_count + missing_count)),
+        "matched_count": matched_count,
+        "missing_count": missing_count,
+        "missing_dbs": missing_dbs,
+        "total_hex_matches": 0,
+        "duration_seconds": 0.0,
+        "keys": keys,
+        "source": "memory_cache",
+    }
+
+
+def should_fallback_from_cached_decrypt(decrypt_dir: Path, decrypt_result: dict) -> bool:
+    if not decrypt_result.get("success"):
+        return True
+    if int(decrypt_result.get("failed_count") or 0) > 0:
+        return True
+    return not (decrypt_dir / "message").is_dir()
 
 
 def should_retry_status_code(status_code: int) -> bool:
@@ -1022,59 +1126,111 @@ def export_v4_messages(
         if stale_dir.exists():
             shutil.rmtree(stale_dir, ignore_errors=True)
 
-    emit_runtime_event(
-        "client_chatlog_key_attempt",
-        {
-            "pid": pid,
-            "helper_used": False,
-            "source": "wechat_decrypt_memory_scan",
-            "attempt_index": 1,
-            "attempt_total": 1,
-            "candidate_count": len(candidate_dirs),
-            "data_dir": selected_data_dir,
-            "db_storage_dir": selected_db_storage_dir,
-        },
+    key_scan_result = try_get_cached_key_scan_result(
+        pid=pid,
+        selected_wxid=selected_wxid,
+        selected_data_dir=selected_data_dir,
+        selected_db_storage_dir=selected_db_storage_dir,
     )
+    key_source = "memory_cache" if key_scan_result else "wechat_decrypt_memory_scan"
 
-    try:
-        key_scan_result = extract_database_keys_windows(
-            selected_db_storage_dir,
-            preferred_pid=pid,
-            log_fn=log_debug,
+    if key_scan_result:
+        emit_runtime_event(
+            "client_chatlog_key_attempt",
+            {
+                "pid": pid,
+                "helper_used": False,
+                "source": "memory_cache",
+                "attempt_index": 1,
+                "attempt_total": 2,
+                "candidate_count": len(candidate_dirs),
+                "data_dir": selected_data_dir,
+                "db_storage_dir": selected_db_storage_dir,
+                "cache_hit": True,
+            },
         )
-    except Exception as exc:
         emit_runtime_event(
             "client_chatlog_key_result",
             {
-                "success": False,
+                "success": True,
+                "pid": pid,
+                "helper_used": False,
+                "source": "memory_cache",
+                "has_key": True,
+                "selected_data_dir": selected_data_dir,
+                "db_storage_dir": selected_db_storage_dir,
+                "selected_wxid": selected_wxid,
+                "selection_reason": "runtime_cache_pid_match",
+                "matched_db_count": int(key_scan_result.get("matched_count") or 0),
+                "missing_db_count": int(key_scan_result.get("missing_count") or 0),
+                "duration_seconds": 0.0,
+                "cache_hit": True,
+            },
+        )
+
+    if key_scan_result is None:
+        emit_runtime_event(
+            "client_chatlog_key_attempt",
+            {
                 "pid": pid,
                 "helper_used": False,
                 "source": "wechat_decrypt_memory_scan",
-                "has_key": False,
-                "attempted_dirs": candidate_dirs[:5],
+                "attempt_index": 1,
+                "attempt_total": 1,
+                "candidate_count": len(candidate_dirs),
+                "data_dir": selected_data_dir,
                 "db_storage_dir": selected_db_storage_dir,
-                "error_message": str(exc),
             },
         )
-        raise RuntimeError(f"内存扫描数据库密钥失败: {exc}") from exc
 
-    emit_runtime_event(
-        "client_chatlog_key_result",
-        {
-            "success": True,
-            "pid": pid,
-            "helper_used": False,
-            "source": "wechat_decrypt_memory_scan",
-            "has_key": True,
-            "selected_data_dir": selected_data_dir,
-            "db_storage_dir": selected_db_storage_dir,
-            "selected_wxid": selected_wxid,
-            "selection_reason": "mtime_priority_candidate",
-            "matched_db_count": int(key_scan_result.get("matched_count") or 0),
-            "missing_db_count": int(key_scan_result.get("missing_count") or 0),
-            "duration_seconds": float(key_scan_result.get("duration_seconds") or 0),
-        },
-    )
+        try:
+            key_scan_result = extract_database_keys_windows(
+                selected_db_storage_dir,
+                preferred_pid=pid,
+                log_fn=log_debug,
+            )
+        except Exception as exc:
+            emit_runtime_event(
+                "client_chatlog_key_result",
+                {
+                    "success": False,
+                    "pid": pid,
+                    "helper_used": False,
+                    "source": "wechat_decrypt_memory_scan",
+                    "has_key": False,
+                    "attempted_dirs": candidate_dirs[:5],
+                    "db_storage_dir": selected_db_storage_dir,
+                    "error_message": str(exc),
+                },
+            )
+            raise RuntimeError(f"内存扫描数据库密钥失败: {exc}") from exc
+
+        emit_runtime_event(
+            "client_chatlog_key_result",
+            {
+                "success": True,
+                "pid": pid,
+                "helper_used": False,
+                "source": "wechat_decrypt_memory_scan",
+                "has_key": True,
+                "selected_data_dir": selected_data_dir,
+                "db_storage_dir": selected_db_storage_dir,
+                "selected_wxid": selected_wxid,
+                "selection_reason": "mtime_priority_candidate",
+                "matched_db_count": int(key_scan_result.get("matched_count") or 0),
+                "missing_db_count": int(key_scan_result.get("missing_count") or 0),
+                "duration_seconds": float(key_scan_result.get("duration_seconds") or 0),
+            },
+        )
+        emit_db_key_cache(
+            build_db_key_cache_payload(
+                pid=pid,
+                wxid=selected_wxid,
+                data_dir=selected_data_dir,
+                db_storage_dir=selected_db_storage_dir,
+                key_scan_result=key_scan_result,
+            )
+        )
 
     if server_url and server_token:
         emit_runtime_event(
@@ -1094,6 +1250,92 @@ def export_v4_messages(
         key_scan_result.get("keys") or {},
         log_fn=log_debug,
     )
+    if key_source == "memory_cache" and should_fallback_from_cached_decrypt(decrypt_dir, decrypt_result):
+        fallback_reason = "缓存密钥解密结果不完整，回退到内存扫描"
+        emit_runtime_event(
+            "client_chatlog_key_result",
+            {
+                "success": False,
+                "pid": pid,
+                "helper_used": False,
+                "source": "memory_cache",
+                "has_key": False,
+                "db_storage_dir": selected_db_storage_dir,
+                "cache_hit": True,
+                "cache_fallback": True,
+                "error_message": fallback_reason,
+            },
+        )
+        emit_runtime_event(
+            "client_chatlog_key_attempt",
+            {
+                "pid": pid,
+                "helper_used": False,
+                "source": "wechat_decrypt_memory_scan",
+                "attempt_index": 2,
+                "attempt_total": 2,
+                "candidate_count": len(candidate_dirs),
+                "data_dir": selected_data_dir,
+                "db_storage_dir": selected_db_storage_dir,
+                "fallback_after_cache": True,
+            },
+        )
+        try:
+            key_scan_result = extract_database_keys_windows(
+                selected_db_storage_dir,
+                preferred_pid=pid,
+                log_fn=log_debug,
+            )
+        except Exception as exc:
+            emit_runtime_event(
+                "client_chatlog_key_result",
+                {
+                    "success": False,
+                    "pid": pid,
+                    "helper_used": False,
+                    "source": "wechat_decrypt_memory_scan",
+                    "has_key": False,
+                    "attempted_dirs": candidate_dirs[:5],
+                    "db_storage_dir": selected_db_storage_dir,
+                    "error_message": str(exc),
+                    "fallback_after_cache": True,
+                },
+            )
+            raise RuntimeError(f"缓存密钥失效，内存扫描数据库密钥失败: {exc}") from exc
+
+        emit_runtime_event(
+            "client_chatlog_key_result",
+            {
+                "success": True,
+                "pid": pid,
+                "helper_used": False,
+                "source": "wechat_decrypt_memory_scan",
+                "has_key": True,
+                "selected_data_dir": selected_data_dir,
+                "db_storage_dir": selected_db_storage_dir,
+                "selected_wxid": selected_wxid,
+                "selection_reason": "cache_fallback_rescan",
+                "matched_db_count": int(key_scan_result.get("matched_count") or 0),
+                "missing_db_count": int(key_scan_result.get("missing_count") or 0),
+                "duration_seconds": float(key_scan_result.get("duration_seconds") or 0),
+                "fallback_after_cache": True,
+            },
+        )
+        emit_db_key_cache(
+            build_db_key_cache_payload(
+                pid=pid,
+                wxid=selected_wxid,
+                data_dir=selected_data_dir,
+                db_storage_dir=selected_db_storage_dir,
+                key_scan_result=key_scan_result,
+            )
+        )
+        decrypt_result = decrypt_database_tree(
+            selected_db_storage_dir,
+            str(decrypt_dir),
+            key_scan_result.get("keys") or {},
+            log_fn=log_debug,
+        )
     if not decrypt_result.get("success"):
         if server_url and server_token:
             emit_runtime_event(
