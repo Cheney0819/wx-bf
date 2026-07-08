@@ -233,6 +233,10 @@ def should_fallback_from_cached_decrypt(decrypt_dir: Path, decrypt_result: dict)
     return not (decrypt_dir / "message").is_dir()
 
 
+def is_malformed_sqlite_error(exc: Exception) -> bool:
+    return "database disk image is malformed" in str(exc or "").lower()
+
+
 def should_retry_status_code(status_code: int) -> bool:
     return status_code in {408, 429} or status_code >= 500
 
@@ -1121,7 +1125,8 @@ def export_v4_messages(
     export_path = decrypt_dir / EXPORT_JSON_NAME
     contact_export_path = decrypt_dir / CONTACT_EXPORT_JSON_NAME
     favorite_export_path = decrypt_dir / FAVORITE_EXPORT_JSON_NAME
-    for stale_dir_name in ("session", "message", "contact", "Contact"):
+    stale_dir_names = ("session", "message", "contact", "Contact")
+    for stale_dir_name in stale_dir_names:
         stale_dir = decrypt_dir / stale_dir_name
         if stale_dir.exists():
             shutil.rmtree(stale_dir, ignore_errors=True)
@@ -1336,6 +1341,7 @@ def export_v4_messages(
             key_scan_result.get("keys") or {},
             log_fn=log_debug,
         )
+        key_source = "wechat_decrypt_memory_scan"
     if not decrypt_result.get("success"):
         if server_url and server_token:
             emit_runtime_event(
@@ -1354,15 +1360,126 @@ def export_v4_messages(
             )
         raise RuntimeError("wechat-decrypt 解密数据库失败")
 
-    exported_messages = export_chatlog_json(
-        str(decrypt_dir),
-        str(export_path),
-        max_messages=MAX_MESSAGES,
-        source_data_dir=selected_data_dir,
-        preferred_pid=pid,
-        log_fn=log_debug,
-        event_fn=emit_runtime_event,
-    )
+    try:
+        exported_messages = export_chatlog_json(
+            str(decrypt_dir),
+            str(export_path),
+            max_messages=MAX_MESSAGES,
+            source_data_dir=selected_data_dir,
+            preferred_pid=pid,
+            log_fn=log_debug,
+            event_fn=emit_runtime_event,
+        )
+    except Exception as exc:
+        if key_source == "memory_cache" and is_malformed_sqlite_error(exc):
+            fallback_reason = "缓存密钥导出消息时命中 malformed，回退到内存扫描"
+            emit_runtime_event(
+                "client_chatlog_key_result",
+                {
+                    "success": False,
+                    "pid": pid,
+                    "helper_used": False,
+                    "source": "memory_cache",
+                    "has_key": False,
+                    "db_storage_dir": selected_db_storage_dir,
+                    "cache_hit": True,
+                    "cache_fallback": True,
+                    "fallback_stage": "chatlog_export",
+                    "error_message": f"{fallback_reason}: {exc}",
+                },
+            )
+            emit_runtime_event(
+                "client_chatlog_key_attempt",
+                {
+                    "pid": pid,
+                    "helper_used": False,
+                    "source": "wechat_decrypt_memory_scan",
+                    "attempt_index": 2,
+                    "attempt_total": 2,
+                    "candidate_count": len(candidate_dirs),
+                    "data_dir": selected_data_dir,
+                    "db_storage_dir": selected_db_storage_dir,
+                    "fallback_after_cache": True,
+                    "fallback_stage": "chatlog_export",
+                },
+            )
+            try:
+                key_scan_result = extract_database_keys_windows(
+                    selected_db_storage_dir,
+                    preferred_pid=pid,
+                    log_fn=log_debug,
+                )
+            except Exception as scan_exc:
+                emit_runtime_event(
+                    "client_chatlog_key_result",
+                    {
+                        "success": False,
+                        "pid": pid,
+                        "helper_used": False,
+                        "source": "wechat_decrypt_memory_scan",
+                        "has_key": False,
+                        "attempted_dirs": candidate_dirs[:5],
+                        "db_storage_dir": selected_db_storage_dir,
+                        "error_message": str(scan_exc),
+                        "fallback_after_cache": True,
+                        "fallback_stage": "chatlog_export",
+                    },
+                )
+                raise RuntimeError(f"缓存密钥导出失败，重新扫描数据库密钥仍失败: {scan_exc}") from scan_exc
+
+            emit_runtime_event(
+                "client_chatlog_key_result",
+                {
+                    "success": True,
+                    "pid": pid,
+                    "helper_used": False,
+                    "source": "wechat_decrypt_memory_scan",
+                    "has_key": True,
+                    "selected_data_dir": selected_data_dir,
+                    "db_storage_dir": selected_db_storage_dir,
+                    "selected_wxid": selected_wxid,
+                    "selection_reason": "cache_fallback_export_rescan",
+                    "matched_db_count": int(key_scan_result.get("matched_count") or 0),
+                    "missing_db_count": int(key_scan_result.get("missing_count") or 0),
+                    "duration_seconds": float(key_scan_result.get("duration_seconds") or 0),
+                    "fallback_after_cache": True,
+                    "fallback_stage": "chatlog_export",
+                },
+            )
+            emit_db_key_cache(
+                build_db_key_cache_payload(
+                    pid=pid,
+                    wxid=selected_wxid,
+                    data_dir=selected_data_dir,
+                    db_storage_dir=selected_db_storage_dir,
+                    key_scan_result=key_scan_result,
+                )
+            )
+            for stale_dir_name in stale_dir_names:
+                stale_dir = decrypt_dir / stale_dir_name
+                if stale_dir.exists():
+                    shutil.rmtree(stale_dir, ignore_errors=True)
+            decrypt_result = decrypt_database_tree(
+                selected_db_storage_dir,
+                str(decrypt_dir),
+                key_scan_result.get("keys") or {},
+                log_fn=log_debug,
+            )
+            key_source = "wechat_decrypt_memory_scan"
+            if not decrypt_result.get("success"):
+                raise RuntimeError("缓存密钥导出失败，重新扫描后再次解密仍失败") from exc
+
+            exported_messages = export_chatlog_json(
+                str(decrypt_dir),
+                str(export_path),
+                max_messages=MAX_MESSAGES,
+                source_data_dir=selected_data_dir,
+                preferred_pid=pid,
+                log_fn=log_debug,
+                event_fn=emit_runtime_event,
+            )
+        else:
+            raise
     exported_contacts = export_contacts_json(
         str(decrypt_dir),
         str(contact_export_path),

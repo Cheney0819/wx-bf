@@ -58,6 +58,7 @@ public class WeChatMonitor
     private static readonly SemaphoreSlim _runLock = new SemaphoreSlim(1, 1);
     private static readonly object _syncStateLock = new();
     private static readonly object _dbKeyCacheLock = new();
+    private static readonly object _eventSuppressionLock = new();
     private static readonly bool _enableLocalConsoleLog = IsLocalConsoleLogEnabled();
     private static long _requestSequence = 0;
 
@@ -67,6 +68,8 @@ public class WeChatMonitor
     private static string? _syncStateScopeKey;
     private static LocalSyncState _syncState = new();
     private static string? _dbKeyCachePayloadJson;
+    private static string? _activeIssueSignature;
+    private static bool _currentScanIssueReported;
 
     /// <summary>
     /// 在 App.xaml.cs 或 MainWindow 构造函数中调用
@@ -99,6 +102,7 @@ public class WeChatMonitor
             return;
         }
 
+        BeginScanCycle();
         var sw = Stopwatch.StartNew();
         var currentWeChatProcess = GetPreferredWeChatProcess();
         bool processRunningAtStart = currentWeChatProcess is not null;
@@ -229,6 +233,7 @@ public class WeChatMonitor
                 finalScanFinishedPayload["cleanup_failed_paths"] = cleanupResult.FailedPaths;
                 await PostEventAsync("client_scan_finished", finalScanFinishedPayload);
             }
+            EndScanCycle();
             _runLock.Release();
         }
     }
@@ -2020,6 +2025,13 @@ public class WeChatMonitor
     {
         try
         {
+            JsonElement payloadElement = ConvertToJsonElement(payload);
+            if (ShouldSuppressEvent(eventName, payloadElement, out string suppressionReason))
+            {
+                Log($"运行日志事件已抑制: {eventName}: {suppressionReason}");
+                return;
+            }
+
             var body = new Dictionary<string, object?>
             {
                 ["token"] = _config.ServerToken,
@@ -2027,7 +2039,7 @@ public class WeChatMonitor
                 ["session_id"] = _sessionId,
                 ["request_id"] = CreateRequestId($"event_{eventName}"),
                 ["event_name"] = eventName,
-                ["payload"] = payload
+                ["payload"] = payloadElement
             };
 
             var resp = await PostJsonWithRetryAsync(_eventsUrl, body, $"event_{eventName}", maxAttempts: 2);
@@ -2038,6 +2050,175 @@ public class WeChatMonitor
         {
             Log($"运行日志上报失败: {eventName}: {ex.Message}");
         }
+    }
+
+    private static void BeginScanCycle()
+    {
+        lock (_eventSuppressionLock)
+        {
+            _currentScanIssueReported = false;
+        }
+    }
+
+    private static void EndScanCycle()
+    {
+        lock (_eventSuppressionLock)
+        {
+            _currentScanIssueReported = false;
+        }
+    }
+
+    private static bool ShouldSuppressEvent(string eventName, JsonElement payload, out string suppressionReason)
+    {
+        suppressionReason = "";
+
+        lock (_eventSuppressionLock)
+        {
+            if (TryHandleIssueRecovery(eventName, payload, out string recoveryReason))
+            {
+                suppressionReason = recoveryReason;
+                return false;
+            }
+
+            if (TryBuildIssueSignature(eventName, payload, out string issueSignature))
+            {
+                if (string.Equals(_activeIssueSignature, issueSignature, StringComparison.Ordinal))
+                {
+                    _currentScanIssueReported = true;
+                    suppressionReason = "duplicate_issue";
+                    return true;
+                }
+
+                _activeIssueSignature = issueSignature;
+                _currentScanIssueReported = true;
+                return false;
+            }
+
+            if (IsFailureScanFinishedEvent(eventName, payload, out string scanResult))
+            {
+                string scanFailureSignature = $"scan_failure|{NormalizeIssueValue(scanResult)}";
+                if (_currentScanIssueReported)
+                {
+                    suppressionReason = "issue_already_reported_in_scan";
+                    return true;
+                }
+
+                if (!string.IsNullOrWhiteSpace(_activeIssueSignature))
+                {
+                    if (string.Equals(_activeIssueSignature, scanFailureSignature, StringComparison.Ordinal))
+                    {
+                        _currentScanIssueReported = true;
+                        suppressionReason = "duplicate_scan_failure";
+                        return true;
+                    }
+
+                    _activeIssueSignature = scanFailureSignature;
+                    _currentScanIssueReported = true;
+                    return false;
+                }
+
+                _activeIssueSignature = scanFailureSignature;
+                _currentScanIssueReported = true;
+                return false;
+            }
+
+            if (!string.IsNullOrWhiteSpace(_activeIssueSignature))
+            {
+                suppressionReason = "active_issue_context";
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool TryHandleIssueRecovery(string eventName, JsonElement payload, out string recoveryReason)
+    {
+        recoveryReason = "";
+        if (!string.Equals(eventName, "client_scan_finished", StringComparison.Ordinal))
+            return false;
+
+        string result = NormalizeIssueValue(ReadJsonString(payload, "result"));
+        if (IsFailureScanResult(result))
+            return false;
+
+        if (!string.IsNullOrWhiteSpace(_activeIssueSignature))
+        {
+            Log($"问题状态已恢复，解除事件静默: {_activeIssueSignature} -> {result}");
+        }
+
+        _activeIssueSignature = null;
+        _currentScanIssueReported = false;
+        recoveryReason = "issue_recovered";
+        return true;
+    }
+
+    private static bool TryBuildIssueSignature(string eventName, JsonElement payload, out string issueSignature)
+    {
+        issueSignature = "";
+
+        if (string.Equals(eventName, "client_extract_failed", StringComparison.Ordinal))
+        {
+            string stage = NormalizeIssueValue(ReadJsonString(payload, "stage"));
+            string attemptKind = NormalizeIssueValue(ReadJsonString(payload, "attempt_kind"));
+            string errorMessage = NormalizeIssueValue(ReadJsonString(payload, "error_message"));
+            string reason = NormalizeIssueValue(ReadJsonString(payload, "reason"));
+            string detail = errorMessage == "unknown" ? reason : errorMessage;
+            issueSignature = $"extract_failed|{stage}|{attemptKind}|{detail}";
+            return true;
+        }
+
+        if (string.Equals(eventName, "client_push_failed", StringComparison.Ordinal))
+        {
+            string statusCode = NormalizeIssueValue(ReadJsonString(payload, "status_code"));
+            string errorMessage = NormalizeIssueValue(ReadJsonString(payload, "error_message"));
+            issueSignature = $"push_failed|{statusCode}|{errorMessage}";
+            return true;
+        }
+
+        if (string.Equals(eventName, "client_wechat_restart_result", StringComparison.Ordinal))
+        {
+            if (ReadJsonBool(payload, "success"))
+                return false;
+
+            string errorMessage = NormalizeIssueValue(ReadJsonString(payload, "error_message"));
+            issueSignature = $"wechat_restart_failed|{errorMessage}";
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool IsFailureScanFinishedEvent(string eventName, JsonElement payload, out string result)
+    {
+        result = "";
+        if (!string.Equals(eventName, "client_scan_finished", StringComparison.Ordinal))
+            return false;
+
+        result = NormalizeIssueValue(ReadJsonString(payload, "result"));
+        return IsFailureScanResult(result);
+    }
+
+    private static bool IsFailureScanResult(string result)
+    {
+        return string.Equals(result, "decrypt_failed", StringComparison.Ordinal)
+            || string.Equals(result, "push_failed", StringComparison.Ordinal)
+            || string.Equals(result, "wechat_not_logged_in", StringComparison.Ordinal);
+    }
+
+    private static string NormalizeIssueValue(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return "unknown";
+
+        return Regex.Replace(value.Trim(), @"\s+", " ").ToLowerInvariant();
+    }
+
+    private static JsonElement ConvertToJsonElement(object payload)
+    {
+        return payload is JsonElement jsonElement
+            ? jsonElement
+            : JsonSerializer.SerializeToElement(payload);
     }
 
     private static string CreateRequestId(string scope)
