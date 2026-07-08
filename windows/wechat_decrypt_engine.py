@@ -1101,6 +1101,16 @@ def enum_rw_regions(handle):
     return regions
 
 
+def enum_readable_non_rw_regions(handle, rw_regions=None):
+    readable_regions = enum_regions(handle)
+    rw_set = {(base, size) for base, size in (rw_regions or [])}
+    return [
+        (base, size)
+        for base, size in readable_regions
+        if (base, size) not in rw_set
+    ]
+
+
 def scan_regions_for_image_aes_key(handle, regions, ciphertext: bytes):
     for base, size in regions:
         data = read_mem(handle, base, size)
@@ -1138,13 +1148,23 @@ def quick_scan_memory_for_image_aes_key(ciphertext: bytes, preferred_pid: int = 
             continue
 
         try:
-            regions = enum_rw_regions(handle)
-            key, fmt = scan_regions_for_image_aes_key(handle, regions, ciphertext)
+            rw_regions = enum_rw_regions(handle)
+            key, fmt = scan_regions_for_image_aes_key(handle, rw_regions, ciphertext)
             if key:
                 if log_fn:
                     log_fn(
                         f"[wechat-decrypt] 监控命中图片 AES key pid={pid} ({process_name}) "
-                        f"fmt={fmt} rw_regions={len(regions)}"
+                        f"fmt={fmt} rw_regions={len(rw_regions)} phase=rw"
+                    )
+                return key
+
+            readable_non_rw_regions = enum_readable_non_rw_regions(handle, rw_regions=rw_regions)
+            key, fmt = scan_regions_for_image_aes_key(handle, readable_non_rw_regions, ciphertext)
+            if key:
+                if log_fn:
+                    log_fn(
+                        f"[wechat-decrypt] 监控命中图片 AES key pid={pid} ({process_name}) "
+                        f"fmt={fmt} rw_regions={len(rw_regions)} readable_non_rw_regions={len(readable_non_rw_regions)} phase=readable"
                     )
                 return key
         finally:
@@ -1921,6 +1941,11 @@ def try_load_voice_media(
 
     mp3_bytes, convert_error = silk_voice_to_mp3_bytes(silk_data, voice_context.get("ffmpeg_path", ""))
     if not mp3_bytes:
+        if log_fn:
+            log_fn(
+                f"[wechat-decrypt] 语音转换失败: chat={chat_username} local_id={local_id} "
+                f"db={os.path.basename(db_path)} reason={convert_error}"
+            )
         emit_media_event(
             event_fn,
             "client_media_missing",

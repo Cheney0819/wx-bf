@@ -27,20 +27,36 @@ $PetFfmpegExe = Join-Path $PetDir "ffmpeg.exe"
 $PublishDir = Join-Path $PetDir "bin\Release\net8.0-windows\$Runtime\publish"
 
 function Resolve-FfmpegPath {
-    $command = Get-Command "ffmpeg" -ErrorAction SilentlyContinue
-    if ($command -and $command.Source -and (Test-Path $command.Source)) {
-        return $command.Source
-    }
-
     $candidates = @()
     if ($env:ChocolateyInstall) {
-        $candidates += Join-Path $env:ChocolateyInstall "bin\ffmpeg.exe"
+        $candidates += @(
+            (Join-Path $env:ChocolateyInstall "lib\ffmpeg\tools\ffmpeg\bin\ffmpeg.exe"),
+            (Join-Path $env:ChocolateyInstall "lib\ffmpeg-full\tools\ffmpeg\bin\ffmpeg.exe"),
+            (Join-Path $env:ChocolateyInstall "lib\ffmpeg-shared\tools\ffmpeg\bin\ffmpeg.exe"),
+            (Join-Path $env:ChocolateyInstall "lib\ffmpeg\tools\bin\ffmpeg.exe")
+        )
+
+        $discovered = Get-ChildItem -Path (Join-Path $env:ChocolateyInstall "lib") -Filter ffmpeg.exe -Recurse -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.FullName -match "\\tools\\.*\\bin\\ffmpeg\.exe$" -and
+                $_.FullName -notmatch "\\chocolatey\\bin\\"
+            } |
+            Select-Object -ExpandProperty FullName
+        $candidates += $discovered
     }
+
+    $command = Get-Command "ffmpeg" -ErrorAction SilentlyContinue
+    if ($command -and $command.Source -and (Test-Path $command.Source) -and $command.Source -notmatch "\\chocolatey\\bin\\") {
+        $candidates += $command.Source
+    }
+
     $candidates += @(
         "C:\ProgramData\chocolatey\bin\ffmpeg.exe",
         "C:\ffmpeg\bin\ffmpeg.exe"
     )
-    $candidates = $candidates | Where-Object { $_ -and (Test-Path $_) }
+    $candidates = $candidates |
+        Where-Object { $_ -and (Test-Path $_) } |
+        Select-Object -Unique
 
     if ($candidates.Count -gt 0) {
         return $candidates[0]
