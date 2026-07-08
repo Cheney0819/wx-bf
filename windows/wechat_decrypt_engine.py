@@ -6,15 +6,22 @@ import hmac as hmac_mod
 import json
 import os
 import re
+import shutil
 import sqlite3
 import struct
 import subprocess
+import tempfile
 import time
 import gc
 from base64 import b64encode
 from contextlib import closing
 
 from Crypto.Cipher import AES
+
+try:
+    import pilk
+except Exception:  # pragma: no cover
+    pilk = None
 
 try:
     import zstandard as zstd
@@ -30,8 +37,19 @@ RESERVE_SZ = 80
 SQLITE_HDR = b"SQLite format 3\x00"
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 MAX_AVATAR_BYTES = 512 * 1024
+MAX_VOICE_MP3_BYTES = 2 * 1024 * 1024
+VOICE_SAMPLE_RATE = 24000
 V2_MAGIC_FULL = b"\x07\x08V2\x08\x07"
 V1_MAGIC_FULL = b"\x07\x08V1\x08\x07"
+IMAGE_KEY_MONITOR_TIMEOUT_SECONDS = max(
+    0,
+    int((os.environ.get("WECHAT_IMAGE_KEY_MONITOR_TIMEOUT_SECONDS") or "25").strip() or "25"),
+)
+IMAGE_KEY_MONITOR_SCAN_INTERVAL_SECONDS = max(
+    0.5,
+    float((os.environ.get("WECHAT_IMAGE_KEY_MONITOR_SCAN_INTERVAL_SECONDS") or "1.5").strip() or "1.5"),
+)
+IMAGE_KEY_CONFIG_FILE_NAME = "image_crypto.json"
 
 IMAGE_MAGIC = {
     "png": [0x89, 0x50, 0x4E, 0x47],
@@ -58,6 +76,7 @@ _HEX_RE = re.compile(b"x'([0-9a-fA-F]{64,192})'")
 _ZSTD = zstd.ZstdDecompressor() if zstd is not None else None
 _IMAGE_KEY32_RE = re.compile(rb'(?<![a-zA-Z0-9])[a-zA-Z0-9]{32}(?![a-zA-Z0-9])')
 _IMAGE_KEY16_RE = re.compile(rb'(?<![a-zA-Z0-9])[a-zA-Z0-9]{16}(?![a-zA-Z0-9])')
+_IMAGE_RW_PROTECT_FLAGS = {0x04, 0x08, 0x40, 0x80}
 
 
 class MBI(ctypes.Structure):
@@ -270,7 +289,9 @@ def export_chatlog_json(
         source_data_dir,
         preferred_pid=preferred_pid,
         log_fn=log_fn,
+        event_fn=event_fn,
     )
+    voice_context = build_voice_media_context(decrypted_dir, log_fn=log_fn)
     messages = []
 
     message_dir = os.path.join(decrypted_dir, "message")
@@ -286,82 +307,97 @@ def export_chatlog_json(
         if path.endswith(".db") and not path.endswith(("_fts.db", "_resource.db", "-wal", "-shm"))
     )
 
-    for db_path in db_files:
-        with closing(sqlite3.connect(db_path)) as conn:
-            conn.row_factory = sqlite3.Row
-            sender_map = load_sender_map(conn)
-            hash_to_username = {
-                hashlib.md5(username.encode()).hexdigest(): username
-                for username in sender_map.values()
-                if username
-            }
+    try:
+        for db_path in db_files:
+            with closing(sqlite3.connect(db_path)) as conn:
+                conn.row_factory = sqlite3.Row
+                sender_map = load_sender_map(conn)
+                hash_to_username = {
+                    hashlib.md5(username.encode()).hexdigest(): username
+                    for username in sender_map.values()
+                    if username
+                }
 
-            all_tables = [
-                row[0]
-                for row in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'"
-                )
-            ]
-
-            for table_name in all_tables:
-                chat_username = hash_to_username.get(table_name[4:], f"unknown_{table_name[4:12]}")
-                chat_display_name = display_name(contact_map, chat_username)
-                is_group = chat_username.endswith("@chatroom") or chat_username.endswith("@openim")
-
-                rows = conn.execute(
-                    f"SELECT local_id, local_type, create_time, real_sender_id, "
-                    f"message_content, WCDB_CT_message_content "
-                    f"FROM [{table_name}] ORDER BY create_time DESC LIMIT 1000"
-                ).fetchall()
-
-                for row in rows:
-                    local_id = int(row["local_id"] or 0)
-                    local_type = int(row["local_type"] or 0)
-                    create_time = int(row["create_time"] or 0)
-                    raw_content = row["message_content"]
-                    ct_flag = int(row["WCDB_CT_message_content"] or 0)
-                    content = get_content(raw_content, ct_flag)
-                    sender_username = sender_map.get(int(row["real_sender_id"] or 0), "")
-                    is_sender = not bool(sender_username)
-                    sender_name = "我" if is_sender else display_name(
-                        contact_map,
-                        sender_username if is_group else (sender_username or chat_username),
+                all_tables = [
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'"
                     )
-                    media = None
-                    if local_type == 3:
-                        media = try_load_image_media(
-                            source_data_dir=source_data_dir,
-                            chat_username=chat_username,
-                            local_id=local_id,
-                            create_time=create_time,
-                            resource_md5_maps=resource_md5_maps,
-                            image_aes_key=image_aes_key,
-                            image_xor_key=image_xor_key,
-                            log_fn=log_fn,
-                            event_fn=event_fn,
+                ]
+
+                for table_name in all_tables:
+                    chat_username = hash_to_username.get(table_name[4:], f"unknown_{table_name[4:12]}")
+                    chat_display_name = display_name(contact_map, chat_username)
+                    is_group = chat_username.endswith("@chatroom") or chat_username.endswith("@openim")
+
+                    rows = conn.execute(
+                        f"SELECT local_id, local_type, create_time, real_sender_id, "
+                        f"message_content, WCDB_CT_message_content "
+                        f"FROM [{table_name}] ORDER BY create_time DESC LIMIT 1000"
+                    ).fetchall()
+
+                    for row in rows:
+                        local_id = int(row["local_id"] or 0)
+                        local_type = int(row["local_type"] or 0)
+                        create_time = int(row["create_time"] or 0)
+                        raw_content = row["message_content"]
+                        ct_flag = int(row["WCDB_CT_message_content"] or 0)
+                        content = get_content(raw_content, ct_flag)
+                        sender_username = sender_map.get(int(row["real_sender_id"] or 0), "")
+                        is_sender = not bool(sender_username)
+                        sender_name = "我" if is_sender else display_name(
+                            contact_map,
+                            sender_username if is_group else (sender_username or chat_username),
                         )
+                        media = None
+                        media_type = ""
+                        if local_type == 3:
+                            media_type = "image"
+                            media = try_load_image_media(
+                                source_data_dir=source_data_dir,
+                                chat_username=chat_username,
+                                local_id=local_id,
+                                create_time=create_time,
+                                resource_md5_maps=resource_md5_maps,
+                                image_aes_key=image_aes_key,
+                                image_xor_key=image_xor_key,
+                                log_fn=log_fn,
+                                event_fn=event_fn,
+                            )
+                        elif local_type == 34:
+                            media_type = "voice"
+                            media = try_load_voice_media(
+                                voice_context=voice_context,
+                                chat_username=chat_username,
+                                local_id=local_id,
+                                create_time=create_time,
+                                log_fn=log_fn,
+                                event_fn=event_fn,
+                            )
 
-                    messages.append(
-                        {
-                            "wxid": chat_username,
-                            "content": friendly_content(local_type, content),
-                            "create_time": create_time,
-                            "is_sender": is_sender,
-                            "nickname": chat_display_name,
-                            "sender": sender_name,
-                            "avatar": (
-                                contact_records.get(chat_username, {}).get("avatar", "")
-                                if not is_sender
-                                else ""
-                            ),
-                            "msg_type": local_type,
-                            "msg_sub_type": 0,
-                            "media_type": "image" if local_type == 3 else "",
-                            "media_mime": media["mime"] if media else "",
-                            "media_name": media["name"] if media else "",
-                            "media_data": media["data_b64"] if media else "",
-                        }
-                    )
+                        messages.append(
+                            {
+                                "wxid": chat_username,
+                                "content": friendly_content(local_type, content),
+                                "create_time": create_time,
+                                "is_sender": is_sender,
+                                "nickname": chat_display_name,
+                                "sender": sender_name,
+                                "avatar": (
+                                    contact_records.get(chat_username, {}).get("avatar", "")
+                                    if not is_sender
+                                    else ""
+                                ),
+                                "msg_type": local_type,
+                                "msg_sub_type": 0,
+                                "media_type": media_type,
+                                "media_mime": media["mime"] if media else "",
+                                "media_name": media["name"] if media else "",
+                                "media_data": media["data_b64"] if media else "",
+                            }
+                        )
+    finally:
+        close_voice_media_context(voice_context)
 
     messages.sort(key=lambda item: item["create_time"])
     if len(messages) > max_messages:
@@ -860,6 +896,93 @@ def detect_v2_image_samples(source_data_dir: str):
     return samples
 
 
+def get_image_crypto_config_path():
+    configured = (
+        os.environ.get("WECHAT_IMAGE_CRYPTO_FILE")
+        or os.environ.get("WEFLOW_IMAGE_CRYPTO_FILE")
+        or ""
+    ).strip()
+    if configured:
+        return configured
+
+    runtime_dir = (os.environ.get("WECHAT_RUNTIME_DIR") or "").strip()
+    if runtime_dir:
+        return os.path.join(runtime_dir, IMAGE_KEY_CONFIG_FILE_NAME)
+
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), IMAGE_KEY_CONFIG_FILE_NAME)
+
+
+def load_saved_image_crypto_config():
+    config_path = get_image_crypto_config_path()
+    if not config_path or not os.path.exists(config_path):
+        return {}
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if isinstance(payload, dict):
+            payload["_config_path"] = config_path
+            return payload
+    except Exception:
+        return {}
+    return {}
+
+
+def save_image_crypto_config(aes_key: str, xor_key: int, *, source: str = "", verified_sample: str = "", log_fn=None):
+    if not aes_key:
+        return ""
+
+    config_path = get_image_crypto_config_path()
+    if not config_path:
+        return ""
+
+    payload = {
+        "image_aes_key": aes_key,
+        "image_xor_key": int(xor_key),
+        "updated_at": int(time.time()),
+        "source": source,
+    }
+    if verified_sample:
+        payload["verified_sample"] = verified_sample
+
+    try:
+        config_dir = os.path.dirname(config_path)
+        if config_dir:
+            os.makedirs(config_dir, exist_ok=True)
+        with open(config_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+        if log_fn:
+            log_fn(f"[wechat-decrypt] 已写入图片密钥缓存: {config_path}")
+        return config_path
+    except Exception as exc:
+        if log_fn:
+            log_fn(f"[wechat-decrypt] 写入图片密钥缓存失败: {exc}")
+        return ""
+
+
+def verify_image_aes_key(aes_key: str, ciphertext: bytes):
+    if not aes_key or not ciphertext:
+        return ""
+    return try_image_aes_key(aes_key.encode("ascii", errors="ignore")[:16], ciphertext)
+
+
+def verify_image_crypto_with_samples(v2_samples: list[tuple[str, bytes]], aes_key: str, xor_key: int):
+    if not aes_key:
+        return False, "", "", 0
+
+    for path, header in v2_samples[:8]:
+        if len(header) >= 31:
+            ciphertext = header[15:31]
+            if not verify_image_aes_key(aes_key, ciphertext):
+                continue
+
+        media = decode_image_dat_file(path, image_aes_key=aes_key, image_xor_key=xor_key)
+        if media:
+            return True, path, media.get("mime", ""), int(media.get("size", 0) or 0)
+
+    return False, "", "", 0
+
+
 def derive_image_xor_key(v2_samples: list[tuple[str, bytes]]):
     tail_counts = {}
     for path, _ in v2_samples[:32]:
@@ -958,6 +1081,104 @@ def scan_memory_for_image_aes_key(ciphertext: bytes, preferred_pid: int = 0, log
     return ""
 
 
+def enum_rw_regions(handle):
+    regions = []
+    addr = 0
+    mbi = MBI()
+    while addr < 0x7FFFFFFFFFFF:
+        if kernel32.VirtualQueryEx(handle, ctypes.c_uint64(addr), ctypes.byref(mbi), ctypes.sizeof(mbi)) == 0:
+            break
+        if (
+            mbi.State == MEM_COMMIT
+            and mbi.Protect in _IMAGE_RW_PROTECT_FLAGS
+            and 0 < mbi.RegionSize < 50 * 1024 * 1024
+        ):
+            regions.append((mbi.BaseAddress, mbi.RegionSize))
+        nxt = mbi.BaseAddress + mbi.RegionSize
+        if nxt <= addr:
+            break
+        addr = nxt
+    return regions
+
+
+def scan_regions_for_image_aes_key(handle, regions, ciphertext: bytes):
+    for base, size in regions:
+        data = read_mem(handle, base, size)
+        if not data or len(data) < 16:
+            continue
+
+        for match in _IMAGE_KEY32_RE.finditer(data):
+            candidate = match.group()
+            fmt = try_image_aes_key(candidate[:16], ciphertext)
+            if fmt:
+                return candidate[:16].decode("ascii", errors="ignore"), fmt
+
+            fmt = try_image_aes_key(candidate, ciphertext)
+            if fmt:
+                return candidate.decode("ascii", errors="ignore"), fmt
+
+        for match in _IMAGE_KEY16_RE.finditer(data):
+            candidate = match.group()
+            fmt = try_image_aes_key(candidate, ciphertext)
+            if fmt:
+                return candidate.decode("ascii", errors="ignore"), fmt
+
+    return "", ""
+
+
+def quick_scan_memory_for_image_aes_key(ciphertext: bytes, preferred_pid: int = 0, log_fn=None):
+    try:
+        pids = get_wechat_pids(preferred_pid)
+    except Exception:
+        return ""
+
+    for pid, mem_kb, process_name in pids:
+        handle = kernel32.OpenProcess(0x0010 | 0x0400, False, pid)
+        if not handle:
+            continue
+
+        try:
+            regions = enum_rw_regions(handle)
+            key, fmt = scan_regions_for_image_aes_key(handle, regions, ciphertext)
+            if key:
+                if log_fn:
+                    log_fn(
+                        f"[wechat-decrypt] 监控命中图片 AES key pid={pid} ({process_name}) "
+                        f"fmt={fmt} rw_regions={len(regions)}"
+                    )
+                return key
+        finally:
+            kernel32.CloseHandle(handle)
+
+    return ""
+
+
+def monitor_image_aes_key(
+    ciphertext: bytes,
+    preferred_pid: int = 0,
+    timeout_seconds: int = IMAGE_KEY_MONITOR_TIMEOUT_SECONDS,
+    scan_interval_seconds: float = IMAGE_KEY_MONITOR_SCAN_INTERVAL_SECONDS,
+    log_fn=None,
+):
+    if not ciphertext or timeout_seconds <= 0:
+        return "", 0, 0.0
+
+    started_at = time.time()
+    attempt_count = 0
+    while (time.time() - started_at) < timeout_seconds:
+        attempt_count += 1
+        key = quick_scan_memory_for_image_aes_key(
+            ciphertext,
+            preferred_pid=preferred_pid,
+            log_fn=log_fn,
+        )
+        if key:
+            return key, attempt_count, round(time.time() - started_at, 3)
+        time.sleep(scan_interval_seconds)
+
+    return "", attempt_count, round(time.time() - started_at, 3)
+
+
 def discover_image_crypto(source_data_dir: str, preferred_pid: int = 0, log_fn=None):
     v2_samples = detect_v2_image_samples(source_data_dir)
     if not v2_samples:
@@ -976,7 +1197,7 @@ def discover_image_crypto(source_data_dir: str, preferred_pid: int = 0, log_fn=N
     return aes_key, xor_key
 
 
-def load_image_crypto_config(source_data_dir: str = "", preferred_pid: int = 0, log_fn=None):
+def load_image_crypto_config(source_data_dir: str = "", preferred_pid: int = 0, log_fn=None, event_fn=None):
     aes_key = (os.environ.get("WECHAT_IMAGE_AES_KEY") or "").strip()
     xor_raw = (os.environ.get("WECHAT_IMAGE_XOR_KEY") or "0x88").strip()
     try:
@@ -984,17 +1205,188 @@ def load_image_crypto_config(source_data_dir: str = "", preferred_pid: int = 0, 
     except ValueError:
         xor_key = 0x88
 
+    v2_samples = detect_v2_image_samples(source_data_dir) if source_data_dir else []
+    sample_path = v2_samples[0][0] if v2_samples else ""
+    sample_ciphertext = v2_samples[0][1][15:31] if v2_samples and len(v2_samples[0][1]) >= 31 else b""
+    if v2_samples:
+        xor_key = derive_image_xor_key(v2_samples)
+
+    cache_checked = False
+    cache_valid = False
+    cache_path = ""
+    selected_source = ""
+
     if aes_key:
-        return aes_key, xor_key
+        verified, verified_sample, _, verified_size = verify_image_crypto_with_samples(v2_samples, aes_key, xor_key)
+        if verified or not v2_samples:
+            emit_media_event(
+                event_fn,
+                "client_image_key_result",
+                {
+                    "success": True,
+                    "source": "environment",
+                    "verified": verified or not v2_samples,
+                    "v2_sample_count": len(v2_samples),
+                    "sample_file": sample_path,
+                    "verified_sample": verified_sample,
+                    "verified_size": verified_size,
+                    "aes_key_length": len(aes_key),
+                    "image_xor_key": xor_key,
+                },
+            )
+            return aes_key, xor_key
+
+        if log_fn:
+            log_fn("[wechat-decrypt] 环境变量里的图片 AES key 校验失败，准备重新扫描")
+
+    saved = load_saved_image_crypto_config()
+    saved_aes_key = str(saved.get("image_aes_key") or "").strip()
+    if saved_aes_key:
+        cache_checked = True
+        cache_path = str(saved.get("_config_path") or "")
+        saved_xor = saved.get("image_xor_key")
+        if saved_xor not in (None, ""):
+            try:
+                xor_key = int(saved_xor)
+            except Exception:
+                pass
+
+        cache_valid, verified_sample, _, verified_size = verify_image_crypto_with_samples(
+            v2_samples,
+            saved_aes_key,
+            xor_key,
+        )
+        if cache_valid or not v2_samples:
+            emit_media_event(
+                event_fn,
+                "client_image_key_result",
+                {
+                    "success": True,
+                    "source": "local_cache",
+                    "verified": cache_valid or not v2_samples,
+                    "cache_checked": True,
+                    "cache_valid": cache_valid or not v2_samples,
+                    "cache_path": cache_path,
+                    "v2_sample_count": len(v2_samples),
+                    "sample_file": sample_path,
+                    "verified_sample": verified_sample,
+                    "verified_size": verified_size,
+                    "aes_key_length": len(saved_aes_key),
+                    "image_xor_key": xor_key,
+                },
+            )
+            return saved_aes_key, xor_key
+
+        if log_fn:
+            log_fn("[wechat-decrypt] 本地缓存的图片 AES key 校验失败，准备重新扫描")
+
+    if source_data_dir and v2_samples:
+        try:
+            discovered_key = scan_memory_for_image_aes_key(
+                sample_ciphertext,
+                preferred_pid=preferred_pid,
+                log_fn=log_fn,
+            )
+        except Exception as exc:
+            discovered_key = ""
+            if log_fn:
+                log_fn(f"[wechat-decrypt] 一次性扫描图片 AES key 失败: {exc}")
+        selected_source = "memory_scan"
+        monitor_attempts = 0
+        monitor_elapsed = 0.0
+        if not discovered_key:
+            emit_media_event(
+                event_fn,
+                "client_image_key_monitor_started",
+                {
+                    "timeout_seconds": IMAGE_KEY_MONITOR_TIMEOUT_SECONDS,
+                    "scan_interval_seconds": IMAGE_KEY_MONITOR_SCAN_INTERVAL_SECONDS,
+                    "v2_sample_count": len(v2_samples),
+                    "sample_file": sample_path,
+                },
+            )
+            discovered_key, monitor_attempts, monitor_elapsed = monitor_image_aes_key(
+                sample_ciphertext,
+                preferred_pid=preferred_pid,
+                timeout_seconds=IMAGE_KEY_MONITOR_TIMEOUT_SECONDS,
+                scan_interval_seconds=IMAGE_KEY_MONITOR_SCAN_INTERVAL_SECONDS,
+                log_fn=log_fn,
+            )
+            if discovered_key:
+                selected_source = "monitor_scan"
+
+        if discovered_key:
+            verified, verified_sample, _, verified_size = verify_image_crypto_with_samples(
+                v2_samples,
+                discovered_key,
+                xor_key,
+            )
+            saved_path = ""
+            if verified:
+                saved_path = save_image_crypto_config(
+                    discovered_key,
+                    xor_key,
+                    source=selected_source,
+                    verified_sample=verified_sample,
+                    log_fn=log_fn,
+                )
+
+            emit_media_event(
+                event_fn,
+                "client_image_key_result",
+                {
+                    "success": True,
+                    "source": selected_source,
+                    "verified": verified,
+                    "cache_checked": cache_checked,
+                    "cache_valid": cache_valid,
+                    "cache_path": cache_path,
+                    "saved_path": saved_path,
+                    "v2_sample_count": len(v2_samples),
+                    "sample_file": sample_path,
+                    "verified_sample": verified_sample,
+                    "verified_size": verified_size,
+                    "aes_key_length": len(discovered_key),
+                    "image_xor_key": xor_key,
+                    "monitor_attempt_count": monitor_attempts,
+                    "monitor_elapsed_seconds": monitor_elapsed,
+                },
+            )
+            return discovered_key, xor_key
+
+        emit_media_event(
+            event_fn,
+            "client_image_key_result",
+            {
+                "success": False,
+                "source": "monitor_scan",
+                "reason": "image_aes_key_not_found",
+                "cache_checked": cache_checked,
+                "cache_valid": cache_valid,
+                "cache_path": cache_path,
+                "v2_sample_count": len(v2_samples),
+                "sample_file": sample_path,
+                "image_xor_key": xor_key,
+                "monitor_attempt_count": monitor_attempts,
+                "monitor_elapsed_seconds": monitor_elapsed,
+            },
+        )
+        return "", xor_key
 
     if source_data_dir:
-        discovered_key, discovered_xor = discover_image_crypto(
-            source_data_dir,
-            preferred_pid=preferred_pid,
-            log_fn=log_fn,
+        emit_media_event(
+            event_fn,
+            "client_image_key_result",
+            {
+                "success": False,
+                "source": "image_scan",
+                "reason": "no_v2_image_samples",
+                "cache_checked": cache_checked,
+                "cache_valid": cache_valid,
+                "cache_path": cache_path,
+                "v2_sample_count": 0,
+            },
         )
-        if discovered_key:
-            return discovered_key, discovered_xor
 
     return "", xor_key
 
@@ -1089,6 +1481,14 @@ def try_load_image_media(
     log_fn=None,
     event_fn=None,
 ):
+    search_roots = build_image_search_roots(source_data_dir, chat_username) if source_data_dir else []
+    existing_search_roots = trim_paths_for_event(
+        [path for path in search_roots if os.path.isdir(path)],
+        root_dir=source_data_dir,
+        limit=6,
+    )
+    recent_dat_samples = collect_recent_image_dat_samples(source_data_dir, chat_username) if source_data_dir else []
+
     if not source_data_dir:
         emit_media_event(
             event_fn,
@@ -1098,6 +1498,8 @@ def try_load_image_media(
                 "reason": "source_data_dir_missing",
                 "chat_username": chat_username,
                 "local_id": local_id,
+                "search_roots": [],
+                "existing_search_roots": [],
             },
         )
         return None
@@ -1119,6 +1521,13 @@ def try_load_image_media(
                 "chat_username": chat_username,
                 "local_id": local_id,
                 "create_time": create_time,
+                "resource_exact_count": len((resource_md5_maps.get("exact") or {})),
+                "resource_fallback_count": len((resource_md5_maps.get("fallback") or {})),
+                "source_data_dir": source_data_dir,
+                "search_roots": trim_paths_for_event(search_roots, root_dir=source_data_dir, limit=6),
+                "existing_search_roots": existing_search_roots,
+                "recent_dat_samples": recent_dat_samples,
+                "has_image_aes_key": bool(image_aes_key),
             },
         )
         return None
@@ -1135,6 +1544,11 @@ def try_load_image_media(
                 "local_id": local_id,
                 "create_time": create_time,
                 "file_md5": file_md5,
+                "source_data_dir": source_data_dir,
+                "search_roots": trim_paths_for_event(search_roots, root_dir=source_data_dir, limit=6),
+                "existing_search_roots": existing_search_roots,
+                "recent_dat_samples": recent_dat_samples,
+                "has_image_aes_key": bool(image_aes_key),
             },
         )
         return None
@@ -1154,6 +1568,11 @@ def try_load_image_media(
                 "file_path": dat_path,
                 "v2_requires_aes_key": dat_file_is_v2(dat_path),
                 "has_image_aes_key": bool(image_aes_key),
+                "image_xor_key": image_xor_key,
+                "source_data_dir": source_data_dir,
+                "search_roots": trim_paths_for_event(search_roots, root_dir=source_data_dir, limit=6),
+                "existing_search_roots": existing_search_roots,
+                "recent_dat_samples": recent_dat_samples,
             },
         )
         return None
@@ -1176,6 +1595,387 @@ def try_load_image_media(
         },
     )
     return media
+
+
+def media_db_candidates(decrypted_dir: str):
+    message_dir = os.path.join(decrypted_dir, "message")
+    if not os.path.isdir(message_dir):
+        return []
+    return sorted(
+        os.path.join(message_dir, name)
+        for name in os.listdir(message_dir)
+        if re.fullmatch(r"media_\d+\.db", name or "", re.IGNORECASE)
+    )
+
+
+def resolve_ffmpeg_path():
+    configured = (
+        os.environ.get("WECHAT_FFMPEG_PATH")
+        or os.environ.get("WEFLOW_FFMPEG_PATH")
+        or ""
+    ).strip()
+    if configured and os.path.isfile(configured):
+        return configured
+
+    runtime_dir = (os.environ.get("WECHAT_RUNTIME_DIR") or "").strip()
+    local_candidates = []
+    if runtime_dir:
+        local_candidates.extend(
+            [
+                os.path.join(runtime_dir, "ffmpeg.exe"),
+                os.path.join(runtime_dir, "ffmpeg"),
+                os.path.join(runtime_dir, "bin", "ffmpeg.exe"),
+                os.path.join(runtime_dir, "bin", "ffmpeg"),
+            ]
+        )
+
+    module_dir = os.path.dirname(os.path.abspath(__file__))
+    local_candidates.extend(
+        [
+            os.path.join(module_dir, "ffmpeg.exe"),
+            os.path.join(module_dir, "ffmpeg"),
+            os.path.join(module_dir, "bin", "ffmpeg.exe"),
+            os.path.join(module_dir, "bin", "ffmpeg"),
+        ]
+    )
+
+    for candidate in local_candidates:
+        if candidate and os.path.isfile(candidate):
+            return candidate
+
+    return shutil.which("ffmpeg") or ""
+
+
+def build_voice_media_context(decrypted_dir: str, log_fn=None):
+    dbs = []
+    for path in media_db_candidates(decrypted_dir):
+        name_table = ""
+        has_voice_info = False
+        try:
+            with closing(sqlite3.connect(path)) as conn:
+                for candidate in ("Name2Id", "ChatName2Id"):
+                    if table_exists(conn, candidate):
+                        name_table = candidate
+                        break
+                has_voice_info = table_exists(conn, "VoiceInfo")
+        except Exception as exc:
+            if log_fn:
+                log_fn(f"[wechat-decrypt] 语音媒体库探测失败: {path} error={exc}")
+            continue
+
+        if not has_voice_info or not name_table:
+            continue
+        dbs.append(
+            {
+                "path": path,
+                "name_table": name_table,
+                "conn": None,
+                "chat_name_id_cache": {},
+            }
+        )
+
+    return {
+        "dbs": dbs,
+        "ffmpeg_path": resolve_ffmpeg_path(),
+        "pilk_ready": pilk is not None,
+    }
+
+
+def close_voice_media_context(voice_context: dict):
+    for db_info in voice_context.get("dbs") or []:
+        conn = db_info.get("conn")
+        if conn is None:
+            continue
+        try:
+            conn.close()
+        except Exception:
+            pass
+        db_info["conn"] = None
+
+
+def ensure_voice_media_connection(db_info: dict):
+    conn = db_info.get("conn")
+    if conn is not None:
+        return conn
+    conn = sqlite3.connect(db_info["path"])
+    conn.row_factory = sqlite3.Row
+    db_info["conn"] = conn
+    return conn
+
+
+def get_voice_chat_name_id(conn: sqlite3.Connection, db_info: dict, chat_username: str):
+    cache = db_info.setdefault("chat_name_id_cache", {})
+    if chat_username in cache:
+        return cache[chat_username]
+
+    row = conn.execute(
+        f"SELECT rowid FROM {db_info['name_table']} WHERE user_name = ?",
+        (chat_username,),
+    ).fetchone()
+    chat_name_id = row[0] if row else None
+    cache[chat_username] = chat_name_id
+    return chat_name_id
+
+
+def fetch_voice_row(voice_context: dict, chat_username: str, local_id: int):
+    for db_info in voice_context.get("dbs") or []:
+        conn = ensure_voice_media_connection(db_info)
+        chat_name_id = get_voice_chat_name_id(conn, db_info, chat_username)
+        if chat_name_id is None:
+            continue
+
+        row = conn.execute(
+            "SELECT voice_data, create_time FROM VoiceInfo "
+            "WHERE chat_name_id = ? AND local_id = ? "
+            "ORDER BY create_time DESC LIMIT 1",
+            (chat_name_id, local_id),
+        ).fetchone()
+        if row:
+            return row, db_info["path"]
+    return None, ""
+
+
+def normalize_silk_voice_data(voice_data):
+    if not voice_data:
+        return None, "voice_blob_empty"
+
+    data = bytes(voice_data)
+    silk_data = data[1:] if data[:1] == b"\x02" else data
+    if not silk_data.startswith(b"#!SILK_V3"):
+        return None, "voice_format_invalid"
+    if not silk_data.endswith(b"\xff\xff"):
+        silk_data += b"\xff\xff"
+    return silk_data, ""
+
+
+def silk_voice_to_mp3_bytes(silk_data: bytes, ffmpeg_path: str):
+    if pilk is None:
+        return None, "pilk_missing"
+    if not ffmpeg_path:
+        return None, "ffmpeg_missing"
+
+    with tempfile.TemporaryDirectory(prefix="wx-voice-") as temp_dir:
+        silk_path = os.path.join(temp_dir, "voice.silk")
+        pcm_path = os.path.join(temp_dir, "voice.pcm")
+        mp3_path = os.path.join(temp_dir, "voice.mp3")
+
+        with open(silk_path, "wb") as handle:
+            handle.write(silk_data)
+
+        try:
+            pilk.decode(silk_path, pcm_path)
+        except Exception as exc:
+            return None, f"pilk_decode_failed: {exc}"
+
+        result = subprocess.run(
+            [
+                ffmpeg_path,
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "s16le",
+                "-ar",
+                str(VOICE_SAMPLE_RATE),
+                "-ac",
+                "1",
+                "-i",
+                pcm_path,
+                "-vn",
+                "-codec:a",
+                "libmp3lame",
+                "-q:a",
+                "4",
+                mp3_path,
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            return None, f"ffmpeg_convert_failed: {detail or 'unknown error'}"
+
+        try:
+            with open(mp3_path, "rb") as handle:
+                return handle.read(MAX_VOICE_MP3_BYTES + 1), ""
+        except OSError as exc:
+            return None, f"mp3_read_failed: {exc}"
+
+
+def try_load_voice_media(
+    voice_context: dict,
+    chat_username: str,
+    local_id: int,
+    create_time: int,
+    log_fn=None,
+    event_fn=None,
+):
+    media_db_paths = trim_paths_for_event(
+        [db_info.get("path", "") for db_info in voice_context.get("dbs") or [] if db_info.get("path")],
+        limit=6,
+    )
+
+    if not voice_context.get("dbs"):
+        emit_media_event(
+            event_fn,
+            "client_media_missing",
+            {
+                "media_type": "voice",
+                "reason": "voice_db_missing",
+                "chat_username": chat_username,
+                "local_id": local_id,
+                "create_time": create_time,
+                "media_db_count": 0,
+                "media_db_paths": media_db_paths,
+            },
+        )
+        return None
+
+    if not voice_context.get("pilk_ready"):
+        emit_media_event(
+            event_fn,
+            "client_media_missing",
+            {
+                "media_type": "voice",
+                "reason": "pilk_missing",
+                "chat_username": chat_username,
+                "local_id": local_id,
+                "create_time": create_time,
+                "media_db_count": len(voice_context.get("dbs") or []),
+                "media_db_paths": media_db_paths,
+            },
+        )
+        return None
+
+    if not voice_context.get("ffmpeg_path"):
+        emit_media_event(
+            event_fn,
+            "client_media_missing",
+            {
+                "media_type": "voice",
+                "reason": "ffmpeg_missing",
+                "chat_username": chat_username,
+                "local_id": local_id,
+                "create_time": create_time,
+                "media_db_count": len(voice_context.get("dbs") or []),
+                "media_db_paths": media_db_paths,
+            },
+        )
+        return None
+
+    try:
+        row, db_path = fetch_voice_row(voice_context, chat_username, local_id)
+    except Exception as exc:
+        emit_media_event(
+            event_fn,
+            "client_media_missing",
+            {
+                "media_type": "voice",
+                "reason": "voice_lookup_failed",
+                "chat_username": chat_username,
+                "local_id": local_id,
+                "create_time": create_time,
+                "media_db_count": len(voice_context.get("dbs") or []),
+                "media_db_paths": media_db_paths,
+                "error_message": str(exc),
+            },
+        )
+        return None
+
+    if not row:
+        emit_media_event(
+            event_fn,
+            "client_media_missing",
+            {
+                "media_type": "voice",
+                "reason": "voice_row_missing",
+                "chat_username": chat_username,
+                "local_id": local_id,
+                "create_time": create_time,
+                "media_db_count": len(voice_context.get("dbs") or []),
+                "media_db_paths": media_db_paths,
+            },
+        )
+        return None
+
+    silk_data, normalize_error = normalize_silk_voice_data(row["voice_data"])
+    if not silk_data:
+        emit_media_event(
+            event_fn,
+            "client_media_missing",
+            {
+                "media_type": "voice",
+                "reason": normalize_error or "voice_format_invalid",
+                "chat_username": chat_username,
+                "local_id": local_id,
+                "create_time": create_time,
+                "db_path": db_path,
+                "media_db_count": len(voice_context.get("dbs") or []),
+                "media_db_paths": media_db_paths,
+            },
+        )
+        return None
+
+    mp3_bytes, convert_error = silk_voice_to_mp3_bytes(silk_data, voice_context.get("ffmpeg_path", ""))
+    if not mp3_bytes:
+        emit_media_event(
+            event_fn,
+            "client_media_missing",
+            {
+                "media_type": "voice",
+                "reason": "voice_decode_failed",
+                "chat_username": chat_username,
+                "local_id": local_id,
+                "create_time": create_time,
+                "db_path": db_path,
+                "media_db_count": len(voice_context.get("dbs") or []),
+                "media_db_paths": media_db_paths,
+                "error_message": convert_error,
+            },
+        )
+        return None
+
+    if len(mp3_bytes) > MAX_VOICE_MP3_BYTES:
+        emit_media_event(
+            event_fn,
+            "client_media_skipped",
+            {
+                "media_type": "voice",
+                "reason": "file_too_large",
+                "chat_username": chat_username,
+                "local_id": local_id,
+                "create_time": create_time,
+                "file_name": f"voice_{create_time}_{local_id}.mp3",
+                "file_size": len(mp3_bytes),
+            },
+        )
+        return None
+
+    if log_fn:
+        log_fn(f"[wechat-decrypt] 语音命中: {chat_username} local_id={local_id} db={os.path.basename(db_path)}")
+    emit_media_event(
+        event_fn,
+        "client_media_loaded",
+        {
+            "media_type": "voice",
+            "chat_username": chat_username,
+            "local_id": local_id,
+            "create_time": create_time,
+            "db_path": db_path,
+            "media_name": f"voice_{create_time}_{local_id}.mp3",
+            "media_mime": "audio/mpeg",
+            "media_size": len(mp3_bytes),
+        },
+    )
+    return {
+        "mime": "audio/mpeg",
+        "name": f"voice_{create_time}_{local_id}.mp3",
+        "data_b64": b64encode(mp3_bytes).decode("ascii"),
+        "size": len(mp3_bytes),
+    }
 
 
 def find_image_dat_file(source_data_dir: str, chat_username: str, file_md5: str):
@@ -1446,6 +2246,83 @@ def favorite_db_candidates(decrypted_dir: str):
     ]
 
 
+def trim_paths_for_event(paths, root_dir: str = "", limit: int = 10):
+    items = []
+    seen = set()
+    for path in paths or []:
+        text = str(path or "").strip()
+        if not text:
+            continue
+        if root_dir:
+            try:
+                text = os.path.relpath(text, root_dir)
+            except Exception:
+                pass
+        normalized = text.replace("\\", "/")
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        items.append(normalized)
+        if len(items) >= limit:
+            break
+    return items
+
+
+def collect_db_file_inventory(root_dir: str, keywords=(), limit: int = 12):
+    if not root_dir or not os.path.isdir(root_dir):
+        return [], 0
+
+    items = []
+    total = 0
+    lowered_keywords = [str(keyword or "").lower() for keyword in (keywords or ()) if str(keyword or "").strip()]
+    for walk_root, _, files in os.walk(root_dir):
+        for file_name in sorted(files):
+            if not file_name.lower().endswith(".db"):
+                continue
+            full_path = os.path.join(walk_root, file_name)
+            rel_path = os.path.relpath(full_path, root_dir).replace("\\", "/")
+            lower_rel = rel_path.lower()
+            if lowered_keywords and not any(keyword in lower_rel for keyword in lowered_keywords):
+                continue
+            total += 1
+            if len(items) < limit:
+                items.append(rel_path)
+    return items, total
+
+
+def build_image_search_roots(source_data_dir: str, chat_username: str):
+    username_hash = hashlib.md5(chat_username.encode("utf-8")).hexdigest()
+    return [
+        os.path.join(source_data_dir, "msg", "attach", username_hash),
+        os.path.join(source_data_dir, "MsgAttach", username_hash),
+        os.path.join(source_data_dir, "FileStorage", "MsgAttach", username_hash),
+    ]
+
+
+def collect_recent_image_dat_samples(source_data_dir: str, chat_username: str, limit: int = 6):
+    roots = build_image_search_roots(source_data_dir, chat_username)
+    patterns = [
+        os.path.join(roots[0], "*", "Img", "*.dat"),
+        os.path.join(roots[1], "Image", "*", "*.dat"),
+        os.path.join(roots[2], "Image", "*", "*.dat"),
+    ]
+    candidates = []
+    seen = set()
+    for pattern in patterns:
+        for path in glob.glob(pattern):
+            if not os.path.isfile(path) or path in seen:
+                continue
+            seen.add(path)
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                mtime = 0
+            candidates.append((mtime, path))
+
+    candidates.sort(reverse=True)
+    return trim_paths_for_event([path for _, path in candidates], root_dir=source_data_dir, limit=limit)
+
+
 def get_table_columns(conn: sqlite3.Connection, table_name: str):
     rows = conn.execute(f"PRAGMA table_info([{table_name}])").fetchall()
     columns = []
@@ -1568,7 +2445,12 @@ def sanitize_export_value(value):
 
 
 def load_favorite_records(decrypted_dir: str, log_fn=None, event_fn=None, max_items: int = 1000):
-    db_path = resolve_db_path(decrypted_dir, favorite_db_candidates(decrypted_dir), log_fn=log_fn)
+    candidate_paths = favorite_db_candidates(decrypted_dir)
+    favorite_db_files, favorite_db_file_count = collect_db_file_inventory(
+        decrypted_dir,
+        keywords=("favorite", "fav"),
+    )
+    db_path = resolve_db_path(decrypted_dir, candidate_paths, log_fn=log_fn)
     if not db_path:
         if log_fn:
             log_fn("[wechat-decrypt] 未找到收藏数据库 favorite.db / favorites.db")
@@ -1579,6 +2461,9 @@ def load_favorite_records(decrypted_dir: str, log_fn=None, event_fn=None, max_it
                     "success": False,
                     "favorite_count": 0,
                     "reason": "favorite_db_missing",
+                    "candidate_paths": trim_paths_for_event(candidate_paths, root_dir=decrypted_dir),
+                    "db_files_seen": favorite_db_files,
+                    "db_file_count": favorite_db_file_count,
                 },
             )
         return []
@@ -1685,6 +2570,9 @@ def load_favorite_records(decrypted_dir: str, log_fn=None, event_fn=None, max_it
                     "error_message": str(exc),
                     "table_count": len(table_summaries),
                     "table_summaries": table_summaries[:8],
+                    "candidate_paths": trim_paths_for_event(candidate_paths, root_dir=decrypted_dir),
+                    "db_files_seen": favorite_db_files,
+                    "db_file_count": favorite_db_file_count,
                 },
             )
         return favorites
@@ -1700,6 +2588,9 @@ def load_favorite_records(decrypted_dir: str, log_fn=None, event_fn=None, max_it
                 "db_path": db_path,
                 "table_count": len(table_summaries),
                 "table_summaries": table_summaries[:8],
+                "candidate_paths": trim_paths_for_event(candidate_paths, root_dir=decrypted_dir),
+                "db_files_seen": favorite_db_files,
+                "db_file_count": favorite_db_file_count,
             },
         )
     return favorites

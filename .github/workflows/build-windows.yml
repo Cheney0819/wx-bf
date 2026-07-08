@@ -21,6 +21,10 @@ jobs:
         with:
           dotnet-version: "8.0.x"
 
+      - name: 安装 FFmpeg
+        shell: pwsh
+        run: choco install ffmpeg -y --no-progress
+
       - name: 构建桌宠主体
         shell: pwsh
         run: .\build.ps1

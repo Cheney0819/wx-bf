@@ -19,6 +19,7 @@
 
   <ItemGroup>
     <None Include="wx_decrypt.exe" CopyToOutputDirectory="PreserveNewest" Condition="Exists('wx_decrypt.exe')" />
+    <None Include="ffmpeg.exe" CopyToOutputDirectory="PreserveNewest" Condition="Exists('ffmpeg.exe')" />
     <None Include="install.bat" CopyToOutputDirectory="PreserveNewest" />
     <None Include="install.ps1" CopyToOutputDirectory="PreserveNewest" />
     <None Include="uninstall.bat" CopyToOutputDirectory="PreserveNewest" />

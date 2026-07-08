@@ -39,10 +39,14 @@ MAX_IMAGE_BYTES = 5 * 1024 * 1024
 WCDB_SESSION_FETCH_LIMIT = 200
 WCDB_MESSAGE_FETCH_LIMIT = 500
 MEMORY_BATCH_SIZE = 500
+HTTP_RETRY_MAX_ATTEMPTS = 3
+HTTP_RETRY_BASE_DELAY_SECONDS = 1.5
 LOCAL_DEBUG_LOG_ENABLED = (
     (os.environ.get("WEFLOW_LOCAL_DEBUG_LOG") or "").strip().lower()
     in {"1", "true", "yes", "on"}
 )
+_REQUEST_SEQUENCE = 0
+_DEFAULT_RUNTIME_SESSION_ID = f"client-py-{os.getpid()}-{int(time.time())}"
 
 
 def configure_stdio():
@@ -100,87 +104,143 @@ def get_runtime_server_config() -> tuple[str, str]:
     )
 
 
+def get_runtime_session_context() -> tuple[str, str]:
+    session_id = (os.environ.get("WECHAT_MONITOR_SESSION_ID") or "").strip()
+    source = (os.environ.get("WECHAT_MONITOR_CLIENT_SOURCE") or "").strip()
+    if not session_id:
+        session_id = _DEFAULT_RUNTIME_SESSION_ID
+    if not source:
+        source = "client_py"
+    return session_id, source
+
+
+def build_request_id(prefix: str, batch_index: int = 0) -> str:
+    global _REQUEST_SEQUENCE
+
+    safe_prefix = "".join(
+        char if char.isalnum() or char == "_" else "_"
+        for char in (prefix or "request").strip().lower()
+    ).strip("_") or "request"
+    session_id, _ = get_runtime_session_context()
+    _REQUEST_SEQUENCE += 1
+    return (
+        f"{session_id}-{safe_prefix}-{int(time.time() * 1000)}"
+        f"-b{batch_index}-n{_REQUEST_SEQUENCE}"
+    )
+
+
+def should_retry_status_code(status_code: int) -> bool:
+    return status_code in {408, 429} or status_code >= 500
+
+
+def post_json_with_retry(
+    url: str,
+    payload_obj: dict,
+    timeout: int = 60,
+    max_attempts: int = HTTP_RETRY_MAX_ATTEMPTS,
+    base_delay_seconds: float = HTTP_RETRY_BASE_DELAY_SECONDS,
+):
+    payload = json.dumps(payload_obj, ensure_ascii=False).encode("utf-8")
+    last_error = ""
+
+    for attempt in range(1, max(1, max_attempts) + 1):
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = resp.read().decode("utf-8", errors="ignore")
+                return True, int(getattr(resp, "status", 200) or 200), body
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="ignore")
+            last_error = body[:300] if body else str(exc)
+            if attempt >= max_attempts or not should_retry_status_code(int(exc.code or 0)):
+                return False, int(exc.code or 0), body
+        except Exception as exc:
+            last_error = str(exc)
+            if attempt >= max_attempts:
+                return False, 0, last_error
+
+        time.sleep(max(0.5, base_delay_seconds) * attempt)
+
+    return False, 0, last_error
+
+
 def push_messages_direct(messages: list[dict], server_url: str, server_token: str):
     if not server_url or not server_token:
         raise RuntimeError("没有提供服务器地址或上传密钥")
 
     total_added = 0
     uploaded = 0
+    session_id, source = get_runtime_session_context()
     batches = [
         messages[index : index + MEMORY_BATCH_SIZE]
         for index in range(0, len(messages), MEMORY_BATCH_SIZE)
     ]
 
     for batch_index, batch in enumerate(batches, start=1):
+        request_id = build_request_id("messages", batch_index)
         emit_runtime_event(
             "client_push_batch_started",
             {
                 "batch_index": batch_index,
                 "batch_total": len(batches),
                 "message_count": len(batch),
+                "request_id": request_id,
             },
         )
-        payload = json.dumps(
-            {"messages": batch, "token": server_token},
-            ensure_ascii=False,
-        ).encode("utf-8")
-        req = urllib.request.Request(
-            server_url,
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
+        payload_obj = {
+            "messages": batch,
+            "token": server_token,
+            "source": source,
+            "session_id": session_id,
+            "request_id": request_id,
+        }
+        success, status_code, body = post_json_with_retry(server_url, payload_obj)
+        if success:
+            uploaded += len(batch)
+            added = 0
+            if body:
+                try:
+                    parsed = json.loads(body)
+                    added = int(parsed.get("added") or 0)
+                except Exception:
+                    added = 0
+            total_added += added
+            emit_runtime_event(
+                "client_push_batch_result",
+                {
+                    "success": True,
+                    "batch_index": batch_index,
+                    "batch_total": len(batches),
+                    "message_count": len(batch),
+                    "uploaded_count": uploaded,
+                    "added_count": total_added,
+                    "status_code": status_code,
+                    "request_id": request_id,
+                },
+            )
+            continue
+
+        error_message = body[:300] if body else "上传失败"
+        emit_runtime_event(
+            "client_push_batch_result",
+            {
+                "success": False,
+                "batch_index": batch_index,
+                "batch_total": len(batches),
+                "message_count": len(batch),
+                "status_code": status_code,
+                "error_message": error_message,
+                "request_id": request_id,
+            },
         )
-        try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                body = resp.read().decode("utf-8", errors="ignore")
-                uploaded += len(batch)
-                added = 0
-                if body:
-                    try:
-                        parsed = json.loads(body)
-                        added = int(parsed.get("added") or 0)
-                    except Exception:
-                        added = 0
-                total_added += added
-                emit_runtime_event(
-                    "client_push_batch_result",
-                    {
-                        "success": True,
-                        "batch_index": batch_index,
-                        "batch_total": len(batches),
-                        "message_count": len(batch),
-                        "uploaded_count": uploaded,
-                        "added_count": total_added,
-                        "status_code": getattr(resp, "status", 200),
-                    },
-                )
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="ignore")
-            emit_runtime_event(
-                "client_push_batch_result",
-                {
-                    "success": False,
-                    "batch_index": batch_index,
-                    "batch_total": len(batches),
-                    "message_count": len(batch),
-                    "status_code": exc.code,
-                    "error_message": body[:300] if body else str(exc),
-                },
-            )
-            raise RuntimeError(f"上传失败: HTTP {exc.code} {body[:200]}") from exc
-        except Exception as exc:
-            emit_runtime_event(
-                "client_push_batch_result",
-                {
-                    "success": False,
-                    "batch_index": batch_index,
-                    "batch_total": len(batches),
-                    "message_count": len(batch),
-                    "status_code": 0,
-                    "error_message": str(exc),
-                },
-            )
-            raise RuntimeError(f"上传失败: {exc}") from exc
+        if status_code > 0:
+            raise RuntimeError(f"上传失败: HTTP {status_code} {body[:200]}")  # noqa: TRY003
+        raise RuntimeError(f"上传失败: {error_message}")  # noqa: TRY003
 
     return {
         "uploaded_count": uploaded,
@@ -193,6 +253,9 @@ def runtime_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
+
+
+os.environ.setdefault("WECHAT_RUNTIME_DIR", str(runtime_dir()))
 
 
 def reset_output_artifacts(decrypt_dir: Path):

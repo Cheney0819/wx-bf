@@ -23,12 +23,42 @@ $WindowsDir = Join-Path $Root "windows"
 $PetDir = Join-Path $Root "windows-pet-wpf"
 $DecryptExe = Join-Path $WindowsDir "dist\wx_decrypt.exe"
 $PetDecryptExe = Join-Path $PetDir "wx_decrypt.exe"
+$PetFfmpegExe = Join-Path $PetDir "ffmpeg.exe"
 $PublishDir = Join-Path $PetDir "bin\Release\net8.0-windows\$Runtime\publish"
+
+function Resolve-FfmpegPath {
+    $command = Get-Command "ffmpeg" -ErrorAction SilentlyContinue
+    if ($command -and $command.Source -and (Test-Path $command.Source)) {
+        return $command.Source
+    }
+
+    $candidates = @()
+    if ($env:ChocolateyInstall) {
+        $candidates += Join-Path $env:ChocolateyInstall "bin\ffmpeg.exe"
+    }
+    $candidates += @(
+        "C:\ProgramData\chocolatey\bin\ffmpeg.exe",
+        "C:\ffmpeg\bin\ffmpeg.exe"
+    )
+    $candidates = $candidates | Where-Object { $_ -and (Test-Path $_) }
+
+    if ($candidates.Count -gt 0) {
+        return $candidates[0]
+    }
+
+    return $null
+}
 
 Step "检查环境"
 Require-Command "python" "请先安装 Python 3，并勾选 Add python.exe to PATH。"
 Require-Command "pip" "请确认 Python 的 pip 已安装。"
 Require-Command "dotnet" "请先安装 .NET SDK 8：https://dotnet.microsoft.com/download"
+$ffmpegPath = Resolve-FfmpegPath
+if (-not $ffmpegPath) {
+    Write-Host "缺少命令：ffmpeg" -ForegroundColor Red
+    Write-Host "请先安装 ffmpeg，或在 GitHub Actions 里先执行 choco install ffmpeg -y --no-progress。" -ForegroundColor Yellow
+    exit 1
+}
 
 Step "安装 Python 依赖"
 Push-Location $WindowsDir
@@ -62,6 +92,7 @@ if (-not (Test-Path $DecryptExe)) {
 }
 
 Copy-Item $DecryptExe $PetDecryptExe -Force
+Copy-Item $ffmpegPath $PetFfmpegExe -Force
 Pop-Location
 
 Step "发布桌宠"
@@ -76,6 +107,7 @@ Step "检查发布产物"
 $required = @(
     "DesktopPet.Wpf.exe",
     "wx_decrypt.exe",
+    "ffmpeg.exe",
     "Assets\sprite-sheet.png",
     "System.Data.SQLite.dll"
 )
@@ -100,4 +132,4 @@ Write-Host "最终目录：" -ForegroundColor Green
 Write-Host $PublishDir -ForegroundColor Green
 Write-Host ""
 Write-Host "把整个 publish 文件夹放到登录微信的 Windows 电脑上，双击 DesktopPet.Wpf.exe。" -ForegroundColor Yellow
-Write-Host "当前产物只保留桌宠主程序和 wx_decrypt.exe 自动解密链路。" -ForegroundColor Green
+Write-Host "当前产物已内置 wx_decrypt.exe 和 ffmpeg.exe，语音解码不再依赖用户手动安装 ffmpeg。" -ForegroundColor Green

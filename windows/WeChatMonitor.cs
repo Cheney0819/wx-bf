@@ -33,9 +33,12 @@ public class WeChatMonitor
     private const int WECHAT_NEW_PROCESS_POLL_INTERVAL_MS = 250;
     private const int WECHAT_EXIT_WAIT_TIMEOUT_SECONDS = 10;
     private const int MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+    private const int HTTP_RETRY_MAX_ATTEMPTS = 3;
+    private const int HTTP_RETRY_BASE_DELAY_MS = 1500;
     private const string CHATLOG_EXPORT_FILE_NAME = "chatlog_export.json";
     private const string CONTACT_EXPORT_FILE_NAME = "contact_export.json";
     private const string FAVORITE_EXPORT_FILE_NAME = "favorite_export.json";
+    private const string CLIENT_IDENTITY_FILE_NAME = "client_identity.json";
     private const string SYNC_STATE_FILE_NAME = "sync_state.json";
     private const int MAX_MESSAGE_BATCH = 5000;
     private const int MAX_SYNCED_MESSAGE_KEYS = 8000;
@@ -50,16 +53,17 @@ public class WeChatMonitor
     private static readonly string _contactsUrl = _config.ServerUrl.Replace("/api/messages", "/api/contacts");
     private static readonly string _favoritesUrl = _config.ServerUrl.Replace("/api/messages", "/api/favorites");
     private const string ClientSource = "client_cs";
-    private static readonly string _sessionId = $"client-cs-{Guid.NewGuid():N}"[..22];
+    private static readonly string _sessionId = LoadOrCreateClientIdentity().session_id;
     private static readonly SemaphoreSlim _runLock = new SemaphoreSlim(1, 1);
     private static readonly object _syncStateLock = new();
     private static readonly bool _enableLocalConsoleLog = IsLocalConsoleLogEnabled();
+    private static long _requestSequence = 0;
 
     private static DispatcherTimer _timer;
-    private static string _lastHash = "";
     private static bool? _lastKnownLoginState;
     private static readonly string[] _wechatProcessNames = { "Weixin", "WeChat" };
-    private static LocalSyncState _syncState = LoadSyncState();
+    private static string? _syncStateScopeKey;
+    private static LocalSyncState _syncState = new();
 
     /// <summary>
     /// 在 App.xaml.cs 或 MainWindow 构造函数中调用
@@ -141,6 +145,7 @@ public class WeChatMonitor
             await PushSupplementalDataAsync(decryptResult.DecryptDir);
 
             List<WeChatMessage>? messages = ExtractMessages(decryptResult.DecryptDir, decryptResult.WeChatDbDir);
+            EnsureSyncStateLoaded(GetSyncStateScopeKey(decryptResult.DecryptDir));
 
             if (messages == null || messages.Count == 0)
             {
@@ -151,21 +156,6 @@ public class WeChatMonitor
                     result = "no_messages",
                     mode = "ephemeral_disk_v4",
                     message_count = 0
-                });
-                return;
-            }
-
-            string currentHash = GetContentHash(messages);
-            if (currentHash == _lastHash)
-            {
-                Log("没有新消息");
-                await PostEventAsync("client_scan_finished", new
-                {
-                    duration_ms = sw.ElapsedMilliseconds,
-                    result = "no_new_messages",
-                    mode = "ephemeral_disk_v4",
-                    message_count = messages.Count,
-                    has_new_messages = false
                 });
                 return;
             }
@@ -181,7 +171,6 @@ public class WeChatMonitor
 
             if (incrementalMessages.Count == 0)
             {
-                _lastHash = currentHash;
                 Log("消息已同步，无需重复上传");
                 await PostEventAsync("client_scan_finished", new
                 {
@@ -199,7 +188,6 @@ public class WeChatMonitor
             var pushResult = await PushToServerAsync(incrementalMessages);
             if (pushResult.Success)
             {
-                _lastHash = currentHash;
                 MarkMessagesSynced(incrementalMessages);
             }
 
@@ -326,6 +314,8 @@ public class WeChatMonitor
         psi.StandardErrorEncoding = Encoding.UTF8;
         psi.Environment["WECHAT_MONITOR_SERVER_URL"] = _config.ServerUrl;
         psi.Environment["WECHAT_MONITOR_SERVER_TOKEN"] = _config.ServerToken;
+        psi.Environment["WECHAT_MONITOR_SESSION_ID"] = _sessionId;
+        psi.Environment["WECHAT_MONITOR_CLIENT_SOURCE"] = "client_py";
         psi.Environment["PYTHONIOENCODING"] = "utf-8:replace";
         psi.Environment["PYTHONUTF8"] = "1";
 
@@ -1465,25 +1455,6 @@ public class WeChatMonitor
         _ => "image/jpeg",
     };
 
-    private static string GetContentHash(List<WeChatMessage> messages)
-    {
-        var last50 = messages.TakeLast(50);
-        var sb = new StringBuilder();
-
-        foreach (var message in last50)
-        {
-            sb.Append(message.wxid)
-                .Append(message.create_time)
-                .Append(message.content)
-                .Append(message.media_type)
-                .Append(message.media_name);
-        }
-
-        using var md5 = MD5.Create();
-        byte[] hash = md5.ComputeHash(Encoding.UTF8.GetBytes(sb.ToString()));
-        return Convert.ToHexString(hash);
-    }
-
     private static List<WeChatMessage> FilterIncrementalMessages(List<WeChatMessage> messages, out int skippedCount)
     {
         HashSet<string> existing;
@@ -1552,14 +1523,43 @@ public class WeChatMonitor
     }
 
     private static string GetDecryptDir() =>
-        Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "wechat_data", "decrypted");
+        Path.Combine(GetWeChatDataDir(), "decrypted");
 
-    private static string GetSyncStatePath() =>
-        Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "wechat_data", SYNC_STATE_FILE_NAME);
+    private static string GetLegacySyncStatePath() =>
+        Path.Combine(GetWeChatDataDir(), SYNC_STATE_FILE_NAME);
 
-    private static LocalSyncState LoadSyncState()
+    private static string GetSyncStateDir() =>
+        Path.Combine(GetWeChatDataDir(), "sync_state");
+
+    private static string GetSyncStatePath(string scopeKey)
     {
-        string path = GetSyncStatePath();
+        if (string.IsNullOrWhiteSpace(scopeKey))
+            return GetLegacySyncStatePath();
+
+        return Path.Combine(GetSyncStateDir(), $"{scopeKey}.json");
+    }
+
+    private static string GetClientIdentityPath() =>
+        Path.Combine(GetWeChatDataDir(), CLIENT_IDENTITY_FILE_NAME);
+
+    private static string GetWeChatDataDir() =>
+        Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "wechat_data");
+
+    private static string GetSyncStateScopeKey(string decryptDir)
+    {
+        string wxid = ReadDecryptMeta(decryptDir)?.Wxid ?? "";
+        if (string.IsNullOrWhiteSpace(wxid))
+            return "";
+
+        string safe = Regex.Replace(wxid.Trim(), @"[^\w.-]+", "_");
+        return string.IsNullOrWhiteSpace(safe) ? "" : safe;
+    }
+
+    private static LocalSyncState LoadSyncState(string scopeKey)
+    {
+        string path = GetSyncStatePath(scopeKey);
+        if (!string.IsNullOrWhiteSpace(scopeKey))
+            MigrateLegacySyncStateIfNeeded(path);
         if (!File.Exists(path))
             return new LocalSyncState();
 
@@ -1578,9 +1578,69 @@ public class WeChatMonitor
 
     private static void SaveSyncState(LocalSyncState state)
     {
-        string path = GetSyncStatePath();
+        string path = GetSyncStatePath(_syncStateScopeKey ?? "");
         Directory.CreateDirectory(Path.GetDirectoryName(path) ?? AppDomain.CurrentDomain.BaseDirectory);
         File.WriteAllText(path, JsonSerializer.Serialize(state), Encoding.UTF8);
+    }
+
+    private static void EnsureSyncStateLoaded(string scopeKey)
+    {
+        lock (_syncStateLock)
+        {
+            if (_syncStateScopeKey is not null && string.Equals(_syncStateScopeKey, scopeKey, StringComparison.Ordinal))
+                return;
+
+            _syncState = LoadSyncState(scopeKey);
+            _syncStateScopeKey = scopeKey;
+        }
+    }
+
+    private static void MigrateLegacySyncStateIfNeeded(string scopedPath)
+    {
+        string legacyPath = GetLegacySyncStatePath();
+        if (File.Exists(scopedPath) || !File.Exists(legacyPath))
+            return;
+
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(scopedPath) ?? AppDomain.CurrentDomain.BaseDirectory);
+            File.Copy(legacyPath, scopedPath, overwrite: false);
+            File.Delete(legacyPath);
+        }
+        catch (Exception ex)
+        {
+            Log($"迁移旧版 sync_state 失败: {ex.Message}");
+        }
+    }
+
+    private static ClientIdentityState LoadOrCreateClientIdentity()
+    {
+        string path = GetClientIdentityPath();
+        Directory.CreateDirectory(Path.GetDirectoryName(path) ?? AppDomain.CurrentDomain.BaseDirectory);
+
+        try
+        {
+            if (File.Exists(path))
+            {
+                var existing = JsonSerializer.Deserialize<ClientIdentityState>(
+                    File.ReadAllText(path, Encoding.UTF8),
+                    new JsonSerializerOptions { PropertyNameCaseInsensitive = true }
+                );
+                if (!string.IsNullOrWhiteSpace(existing?.session_id))
+                    return existing;
+            }
+        }
+        catch
+        {
+        }
+
+        var created = new ClientIdentityState
+        {
+            session_id = $"client-cs-{Guid.NewGuid():N}",
+            created_at = DateTime.UtcNow.ToString("O"),
+        };
+        File.WriteAllText(path, JsonSerializer.Serialize(created), Encoding.UTF8);
+        return created;
     }
 
     private static async Task CleanupDecryptArtifactsAsync(string decryptDir)
@@ -1602,7 +1662,7 @@ public class WeChatMonitor
         var failedPaths = new List<string>();
         int removedCount = 0;
 
-        foreach (string fileName in new[] { CHATLOG_EXPORT_FILE_NAME, "decrypt_meta.json" })
+        foreach (string fileName in new[] { CHATLOG_EXPORT_FILE_NAME, CONTACT_EXPORT_FILE_NAME, FAVORITE_EXPORT_FILE_NAME, "decrypt_meta.json" })
         {
             string path = Path.Combine(decryptDir, fileName);
             try
@@ -1691,6 +1751,7 @@ public class WeChatMonitor
 
     private static async Task<SupplementPushResult> PushJsonArrayAsync(string url, string fieldName, List<JsonElement> items)
     {
+        string requestId = CreateRequestId(fieldName);
         try
         {
             var payload = new Dictionary<string, object?>
@@ -1699,12 +1760,11 @@ public class WeChatMonitor
                 ["token"] = _config.ServerToken,
                 ["source"] = ClientSource,
                 ["session_id"] = _sessionId,
+                ["request_id"] = requestId,
             };
 
-            string json = JsonSerializer.Serialize(payload);
-            using var content = new StringContent(json, Encoding.UTF8, "application/json");
-            var resp = await _http.PostAsync(url, content);
-            string responseText = await resp.Content.ReadAsStringAsync();
+            var resp = await PostJsonWithRetryAsync(url, payload, $"{fieldName}_upload");
+            string responseText = resp.ResponseText;
 
             int changedCount = 0;
             try
@@ -1718,16 +1778,19 @@ public class WeChatMonitor
             }
 
             string trimmedResponse = responseText.Length > 500 ? responseText[..500] : responseText;
-            if (!resp.IsSuccessStatusCode)
+            if (!resp.Success)
             {
-                Log($"{fieldName} 上传失败: {(int)resp.StatusCode} {trimmedResponse}");
+                string message = !string.IsNullOrWhiteSpace(resp.ErrorMessage)
+                    ? resp.ErrorMessage
+                    : trimmedResponse;
+                Log($"{fieldName} 上传失败: {resp.StatusCode} {message}");
             }
 
             return new SupplementPushResult(
-                resp.IsSuccessStatusCode,
+                resp.Success,
                 changedCount,
-                (int)resp.StatusCode,
-                resp.IsSuccessStatusCode ? "" : trimmedResponse,
+                resp.StatusCode,
+                resp.Success ? "" : (!string.IsNullOrWhiteSpace(resp.ErrorMessage) ? resp.ErrorMessage : trimmedResponse),
                 trimmedResponse
             );
         }
@@ -1742,25 +1805,25 @@ public class WeChatMonitor
     {
         var sw = Stopwatch.StartNew();
         await PostEventAsync("client_push_started", new { message_count = messages.Count });
+        string requestId = CreateRequestId("messages");
 
         try
         {
-            var payload = new
+            var payload = new Dictionary<string, object?>
             {
-                messages,
-                token = _config.ServerToken,
-                source = ClientSource,
-                session_id = _sessionId,
+                ["messages"] = messages,
+                ["token"] = _config.ServerToken,
+                ["source"] = ClientSource,
+                ["session_id"] = _sessionId,
+                ["request_id"] = requestId,
             };
 
-            string json = JsonSerializer.Serialize(payload);
-            using var content = new StringContent(json, Encoding.UTF8, "application/json");
-            var resp = await _http.PostAsync(_config.ServerUrl, content);
+            var resp = await PostJsonWithRetryAsync(_config.ServerUrl, payload, "messages_upload");
 
-            if (resp.IsSuccessStatusCode)
+            if (resp.Success)
             {
                 Log("推送成功");
-                string responseText = await resp.Content.ReadAsStringAsync();
+                string responseText = resp.ResponseText;
                 int addedCount = 0;
 
                 try
@@ -1776,25 +1839,29 @@ public class WeChatMonitor
                 await PostEventAsync("client_push_result", new
                 {
                     success = true,
-                    status_code = (int)resp.StatusCode,
+                    status_code = resp.StatusCode,
                     message_count = messages.Count,
                     added_count = addedCount,
                     duration_ms = sw.ElapsedMilliseconds
                 });
-                return new PushToServerResult(true, messages.Count, addedCount, (int)resp.StatusCode);
+                return new PushToServerResult(true, messages.Count, addedCount, resp.StatusCode);
             }
             else
             {
-                Log($"推送失败: {resp.StatusCode}");
-                string responseText = await resp.Content.ReadAsStringAsync();
+                string responseText = resp.ResponseText;
+                string errorText = !string.IsNullOrWhiteSpace(resp.ErrorMessage)
+                    ? resp.ErrorMessage
+                    : (responseText.Length > 300 ? responseText[..300] : responseText);
+                Log($"推送失败: {resp.StatusCode} {errorText}");
                 await PostEventAsync("client_push_failed", new
                 {
-                    status_code = (int)resp.StatusCode,
+                    status_code = resp.StatusCode,
                     message_count = messages.Count,
                     response_text = responseText.Length > 300 ? responseText[..300] : responseText,
+                    error_message = errorText,
                     duration_ms = sw.ElapsedMilliseconds
                 });
-                return new PushToServerResult(false, 0, 0, (int)resp.StatusCode);
+                return new PushToServerResult(false, 0, 0, resp.StatusCode);
             }
         }
         catch (Exception ex)
@@ -1820,6 +1887,7 @@ public class WeChatMonitor
                 ["token"] = _config.ServerToken,
                 ["source"] = ClientSource,
                 ["session_id"] = _sessionId,
+                ["request_id"] = CreateRequestId("status"),
                 ["wechat_logged_in"] = wechatLoggedIn,
                 ["decrypt_ok"] = decryptOk,
             };
@@ -1827,9 +1895,9 @@ public class WeChatMonitor
             if (!string.IsNullOrWhiteSpace(error))
                 body["error"] = error;
 
-            string json = JsonSerializer.Serialize(body);
-            using var content = new StringContent(json, Encoding.UTF8, "application/json");
-            await _http.PostAsync(_statusUrl, content);
+            var resp = await PostJsonWithRetryAsync(_statusUrl, body, "status_report");
+            if (!resp.Success)
+                Log($"状态上报失败: {resp.StatusCode} {resp.ErrorMessage}");
         }
         catch (Exception ex)
         {
@@ -1846,14 +1914,15 @@ public class WeChatMonitor
                 ["token"] = _config.ServerToken,
                 ["source"] = ClientSource,
                 ["session_id"] = _sessionId,
+                ["request_id"] = CreateRequestId("heartbeat"),
             };
 
             if (wechatLoggedIn.HasValue)
                 body["wechat_logged_in"] = wechatLoggedIn.Value;
 
-            string json = JsonSerializer.Serialize(body);
-            using var content = new StringContent(json, Encoding.UTF8, "application/json");
-            await _http.PostAsync(_statusUrl, content);
+            var resp = await PostJsonWithRetryAsync(_statusUrl, body, "heartbeat");
+            if (!resp.Success)
+                Log($"心跳上报失败: {resp.StatusCode} {resp.ErrorMessage}");
         }
         catch (Exception ex)
         {
@@ -1865,23 +1934,95 @@ public class WeChatMonitor
     {
         try
         {
-            var body = new
+            var body = new Dictionary<string, object?>
             {
-                token = _config.ServerToken,
-                source = ClientSource,
-                session_id = _sessionId,
-                event_name = eventName,
-                payload
+                ["token"] = _config.ServerToken,
+                ["source"] = ClientSource,
+                ["session_id"] = _sessionId,
+                ["request_id"] = CreateRequestId($"event_{eventName}"),
+                ["event_name"] = eventName,
+                ["payload"] = payload
             };
 
-            string json = JsonSerializer.Serialize(body);
-            using var content = new StringContent(json, Encoding.UTF8, "application/json");
-            await _http.PostAsync(_eventsUrl, content);
+            var resp = await PostJsonWithRetryAsync(_eventsUrl, body, $"event_{eventName}", maxAttempts: 2);
+            if (!resp.Success)
+                Log($"运行日志上报失败: {eventName}: {resp.StatusCode} {resp.ErrorMessage}");
         }
         catch (Exception ex)
         {
             Log($"运行日志上报失败: {eventName}: {ex.Message}");
         }
+    }
+
+    private static string CreateRequestId(string scope)
+    {
+        string normalizedScope = string.IsNullOrWhiteSpace(scope)
+            ? "request"
+            : Regex.Replace(scope.Trim().ToLowerInvariant(), "[^a-z0-9_]+", "_");
+        long sequence = Interlocked.Increment(ref _requestSequence);
+        long timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        return $"{_sessionId}-{normalizedScope}-{timestamp}-{sequence}";
+    }
+
+    private static bool ShouldRetryStatusCode(int statusCode)
+    {
+        return statusCode == 408
+            || statusCode == 429
+            || statusCode >= 500;
+    }
+
+    private static async Task<HttpPostResult> PostJsonWithRetryAsync(
+        string url,
+        object body,
+        string operationName,
+        int maxAttempts = HTTP_RETRY_MAX_ATTEMPTS,
+        int baseDelayMs = HTTP_RETRY_BASE_DELAY_MS
+    )
+    {
+        string json = JsonSerializer.Serialize(body);
+        int attempts = Math.Max(1, maxAttempts);
+        int delayMs = Math.Max(250, baseDelayMs);
+
+        for (int attempt = 1; attempt <= attempts; attempt++)
+        {
+            try
+            {
+                using var content = new StringContent(json, Encoding.UTF8, "application/json");
+                using var response = await _http.PostAsync(url, content);
+                string responseText = await response.Content.ReadAsStringAsync();
+                int statusCode = (int)response.StatusCode;
+
+                if (response.IsSuccessStatusCode)
+                    return new HttpPostResult(true, statusCode, responseText, "");
+
+                string errorMessage = string.IsNullOrWhiteSpace(responseText)
+                    ? $"HTTP {statusCode}"
+                    : responseText;
+                if (attempt >= attempts || !ShouldRetryStatusCode(statusCode))
+                    return new HttpPostResult(false, statusCode, responseText, errorMessage);
+            }
+            catch (TaskCanceledException ex)
+            {
+                if (attempt >= attempts)
+                    return new HttpPostResult(false, 0, "", $"请求超时: {ex.Message}");
+            }
+            catch (HttpRequestException ex)
+            {
+                if (attempt >= attempts)
+                    return new HttpPostResult(false, 0, "", ex.Message);
+            }
+            catch (Exception ex)
+            {
+                return new HttpPostResult(false, 0, "", ex.Message);
+            }
+
+            if (attempt < attempts)
+            {
+                await Task.Delay(delayMs * attempt);
+            }
+        }
+
+        return new HttpPostResult(false, 0, "", $"{operationName} 请求失败");
     }
 
     private static void Log(string message)
@@ -1936,6 +2077,12 @@ public class LocalSyncState
     public string updated_at { get; set; } = "";
 }
 
+public class ClientIdentityState
+{
+    public string session_id { get; set; } = "";
+    public string created_at { get; set; } = "";
+}
+
 internal sealed record ImageMedia(string Type, string Mime, string Name, string Base64);
 internal sealed record CleanupResult(bool Success, int RemovedCount, int FailedCount, List<string> FailedPaths);
 internal sealed record SupplementPushResult(
@@ -1944,6 +2091,13 @@ internal sealed record SupplementPushResult(
     int StatusCode,
     string ErrorMessage,
     string ResponseText
+);
+
+internal sealed record HttpPostResult(
+    bool Success,
+    int StatusCode,
+    string ResponseText,
+    string ErrorMessage
 );
 
 internal sealed record DecryptRunResult(
