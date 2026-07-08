@@ -1,3 +1,5 @@
+using System.IO;
+
 namespace DesktopPet.Wpf.Services;
 
 internal static class SecretStore
