@@ -1,4 +1,3 @@
-using System.Drawing;
 using System.IO;
 using System.Windows;
 using System.Windows.Input;
@@ -6,6 +5,7 @@ using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 using DesktopPet.Wpf.Services;
+using Drawing = System.Drawing;
 using Forms = System.Windows.Forms;
 
 namespace DesktopPet.Wpf;
@@ -90,7 +90,7 @@ public partial class MainWindow : Window
     private void ConfigureTray()
     {
         _notifyIcon.Text = "桌宠助手";
-        _notifyIcon.Icon = SystemIcons.Information;
+        _notifyIcon.Icon = Drawing.SystemIcons.Information;
         _notifyIcon.Visible = true;
 
         var menu = new Forms.ContextMenuStrip();
