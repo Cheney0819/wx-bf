@@ -26,5 +26,5 @@
 
 - 不要上传 `server/.env`，里面有数据库密码。
 - `.gitignore` 已经排除了 `server/.env`、日志、数据库文件、编译产物。
-- GitHub Actions 现在只打包桌宠主程序和 `wx_decrypt.exe` 自动解密链路，不再额外塞旧桥接组件。
+- GitHub Actions 现在只打包桌宠主程序和 `wx_decrypt.exe` 自动解密链路。
 - 如果杀毒软件拦截 `资料整理.exe`，需要在 Windows 上手动允许。

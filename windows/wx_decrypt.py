@@ -6,7 +6,6 @@ import csv
 import io
 import json
 import os
-import re
 import shutil
 import socket
 import subprocess
@@ -35,8 +34,6 @@ EXPORT_JSON_NAME = "chatlog_export.json"
 CONTACT_EXPORT_JSON_NAME = "contact_export.json"
 FAVORITE_EXPORT_JSON_NAME = "favorite_export.json"
 META_JSON_NAME = "decrypt_meta.json"
-WEFLOW_KEY_BRIDGE_EXE_NAME = "WeFlowKeyBridge.exe"
-WEFLOW_WCDB_BRIDGE_EXE_NAME = "WeFlowWcdbBridge.exe"
 MAX_MESSAGES = 5000
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 WCDB_SESSION_FETCH_LIMIT = 200
@@ -725,214 +722,6 @@ def detect_v4_instance():
     return fallback
 
 
-def find_weflow_key_bridge_exe() -> Path | None:
-    candidates = [
-        runtime_dir() / WEFLOW_KEY_BRIDGE_EXE_NAME,
-        Path.cwd() / WEFLOW_KEY_BRIDGE_EXE_NAME,
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    return None
-
-
-def find_weflow_wcdb_bridge_exe() -> Path | None:
-    candidates = [
-        runtime_dir() / WEFLOW_WCDB_BRIDGE_EXE_NAME,
-        Path.cwd() / WEFLOW_WCDB_BRIDGE_EXE_NAME,
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    return None
-
-
-def normalize_weflow_wxid(value: str) -> str:
-    text = (value or "").strip()
-    if not text:
-        return ""
-
-    if text.lower().startswith("wxid_"):
-        match = re.match(r"^(wxid_[^_]+)", text, re.IGNORECASE)
-        return match.group(1) if match else text
-
-    match = re.match(r"^(.+)_([a-zA-Z0-9]{4})$", text)
-    return match.group(1) if match else text
-
-
-def parse_bridge_json(text: str):
-    payload = (text or "").strip()
-    if not payload:
-        return None
-
-    try:
-        return json.loads(payload)
-    except json.JSONDecodeError:
-        lines = [line.strip() for line in payload.splitlines() if line.strip()]
-        for line in reversed(lines):
-            try:
-                return json.loads(line)
-            except json.JSONDecodeError:
-                continue
-    return None
-
-
-def try_resolve_key_via_weflow_bridge(pid: int, candidate_dirs: list[str]):
-    bridge_exe = find_weflow_key_bridge_exe()
-    if not bridge_exe:
-        log_debug("未找到 WeFlowKeyBridge.exe，跳过 WeFlow 取密钥桥接")
-        return None
-
-    emit_runtime_event(
-        "client_chatlog_key_attempt",
-        {
-            "pid": pid,
-            "helper_used": False,
-            "source": "weflow_bridge",
-            "attempt_index": 1,
-            "attempt_total": 1,
-            "candidate_count": len(candidate_dirs),
-            "data_dir": candidate_dirs[0] if candidate_dirs else "",
-        },
-    )
-
-    result = run_command(
-        [
-            str(bridge_exe),
-            "--pid",
-            str(pid),
-            "--timeout-ms",
-            "180000",
-        ],
-        timeout=210,
-    )
-    output = "\n".join(filter(None, [result.stdout.strip(), result.stderr.strip()]))
-    parsed = parse_bridge_json(result.stdout)
-
-    if not isinstance(parsed, dict) or not parsed.get("success"):
-        error_message = ""
-        if isinstance(parsed, dict):
-            error_message = str(parsed.get("error") or "").strip()
-        if not error_message:
-            error_message = output[:500] if output else "WeFlow 桥接未返回成功结果"
-
-        emit_runtime_event(
-            "client_chatlog_key_result",
-            {
-                "success": False,
-                "pid": pid,
-                "helper_used": False,
-                "source": "weflow_bridge",
-                "exit_code": result.returncode,
-                "has_key": False,
-                "attempted_dirs": candidate_dirs[:5],
-                "error_message": error_message,
-            },
-        )
-        return None
-
-    key = str(
-        parsed.get("dbKey")
-        or parsed.get("decryptKey")
-        or parsed.get("aesKey")
-        or ""
-    ).strip()
-    accounts = parsed.get("accounts")
-    if not key and isinstance(accounts, list):
-        for account in accounts:
-            if not isinstance(account, dict):
-                continue
-            key = str(
-                account.get("decryptKey")
-                or account.get("aesKey")
-                or ""
-            ).strip()
-            if key:
-                break
-
-    if not key:
-        emit_runtime_event(
-            "client_chatlog_key_result",
-            {
-                "success": False,
-                "pid": pid,
-                "helper_used": False,
-                "source": "weflow_bridge",
-                "exit_code": result.returncode,
-                "has_key": False,
-                "attempted_dirs": candidate_dirs[:5],
-                "error_message": "WeFlow 桥接返回成功，但没有可用数据库密钥",
-                "raw_payload_preview": str(parsed.get("rawPayloadPreview") or "")[:200],
-            },
-        )
-        return None
-
-    normalized_dir_map = {}
-    for candidate in candidate_dirs:
-        candidate_name = normalize_weflow_wxid(Path(candidate).name)
-        if candidate_name and candidate_name not in normalized_dir_map:
-            normalized_dir_map[candidate_name] = candidate
-
-    selected_account = None
-    selected_data_dir = candidate_dirs[0] if candidate_dirs else ""
-    selection_reason = ""
-    if isinstance(accounts, list):
-        for account in accounts:
-            if not isinstance(account, dict):
-                continue
-            normalized_wxid = normalize_weflow_wxid(str(account.get("normalizedWxid") or account.get("wxid") or ""))
-            if normalized_wxid and normalized_wxid in normalized_dir_map:
-                selected_account = account
-                selected_data_dir = normalized_dir_map[normalized_wxid]
-                selection_reason = "wxid_matched"
-                break
-
-    if selected_account is None and len(candidate_dirs) == 1:
-        first = accounts[0] if isinstance(accounts, list) and accounts else None
-        if isinstance(first, dict):
-            selected_account = first
-        selected_data_dir = candidate_dirs[0]
-        selection_reason = "single_candidate_dir"
-
-    if selected_account is None and isinstance(accounts, list) and len(accounts) == 1 and candidate_dirs:
-        first = accounts[0]
-        if isinstance(first, dict):
-            selected_account = first
-            selected_data_dir = candidate_dirs[0]
-            selection_reason = "single_account_fallback"
-
-    if not selection_reason:
-        selection_reason = "mtime_priority_candidate"
-
-    selected_wxid = ""
-    if isinstance(selected_account, dict):
-        selected_wxid = str(selected_account.get("wxid") or "").strip()
-    if not selected_wxid and selected_data_dir:
-        selected_wxid = Path(selected_data_dir).name
-    emit_runtime_event(
-        "client_chatlog_key_result",
-        {
-            "success": True,
-            "pid": pid,
-            "helper_used": False,
-            "source": "weflow_bridge",
-            "exit_code": result.returncode,
-            "has_key": True,
-            "key_length": len(key),
-            "selected_data_dir": selected_data_dir,
-            "selected_wxid": selected_wxid,
-            "selection_reason": selection_reason,
-            "account_count": len(accounts) if isinstance(accounts, list) else 0,
-        },
-    )
-    return {
-        "key": key,
-        "selected_data_dir": selected_data_dir,
-        "selected_wxid": selected_wxid,
-        "source": "weflow_bridge",
-    }
-
-
 def run_command(args, timeout=180, env_overrides: dict | None = None):
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     env = os.environ.copy()
@@ -952,15 +741,6 @@ def run_command(args, timeout=180, env_overrides: dict | None = None):
         creationflags=creationflags,
         env=env,
     )
-
-
-def parse_chatlog_key(output: str) -> str:
-    matches = re.findall(r"\b[0-9a-fA-F]{32,64}\b", output)
-    if not matches:
-        return ""
-    return max(matches, key=len)
-
-
 def find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))

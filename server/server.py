@@ -5,7 +5,8 @@
 import json
 import hashlib
 import os
-from datetime import datetime
+import re
+from datetime import datetime, timedelta
 from pathlib import Path
 from flask import Flask, request, jsonify, render_template_string
 import pymysql
@@ -38,6 +39,11 @@ MYSQL_USER = os.getenv("WECHAT_MONITOR_MYSQL_USER", "root")
 MYSQL_PASSWORD = os.getenv("WECHAT_MONITOR_MYSQL_PASSWORD", "")
 MYSQL_DATABASE = os.getenv("WECHAT_MONITOR_MYSQL_DATABASE", "wechat_monitor")
 HEARTBEAT_TIMEOUT_SECONDS = int(os.getenv("WECHAT_MONITOR_HEARTBEAT_TIMEOUT_SECONDS", "180"))
+CLIENT_SESSION_LOOKBACK_SECONDS = int(os.getenv("WECHAT_MONITOR_SESSION_LOOKBACK_SECONDS", "21600"))
+MONITOR_RUNTIME_LOG_LIMIT = int(os.getenv("WECHAT_MONITOR_RUNTIME_LOG_LIMIT", "1500"))
+MONITOR_ERROR_LOG_LIMIT = int(os.getenv("WECHAT_MONITOR_ERROR_LOG_LIMIT", "800"))
+MONITOR_TIMELINE_PAGE_LIMIT = int(os.getenv("WECHAT_MONITOR_TIMELINE_PAGE_LIMIT", "120"))
+MONITOR_LOG_AGGREGATE_WINDOW_SECONDS = int(os.getenv("WECHAT_MONITOR_LOG_AGGREGATE_WINDOW_SECONDS", "300"))
 LEGACY_MESSAGE_FILE = BASE_DIR / "wechat_messages.json"
 LEGACY_STATUS_FILE = BASE_DIR / "wechat_status.json"
 # ================================
@@ -151,6 +157,37 @@ HTML_TEMPLATE = """
             color: rgba(255,255,255,0.82);
             font-size: 12px;
             text-align: right;
+        }
+        .session-switcher {
+            margin-top: 12px;
+            padding: 14px 16px;
+            border-radius: 18px;
+            background: rgba(255,255,255,0.14);
+            box-shadow: inset 0 0 0 1px rgba(255,255,255,0.12);
+            backdrop-filter: blur(14px);
+        }
+        .session-switcher-label {
+            display: block;
+            font-size: 12px;
+            opacity: 0.82;
+            margin-bottom: 8px;
+        }
+        .session-select {
+            width: 100%;
+            border: 0;
+            outline: none;
+            border-radius: 12px;
+            padding: 11px 12px;
+            background: rgba(255,255,255,0.95);
+            color: #18324a;
+            font-size: 14px;
+            font-weight: 600;
+        }
+        .session-meta {
+            margin-top: 8px;
+            color: rgba(255,255,255,0.78);
+            font-size: 12px;
+            line-height: 1.5;
         }
         .status-grid {
             display: grid;
@@ -789,6 +826,13 @@ HTML_TEMPLATE = """
                     <div class="refresh-meta" id="refreshMeta">每 10 秒自动刷新，等待首次加载</div>
                 </div>
             </div>
+            <div class="session-switcher">
+                <label class="session-switcher-label" for="sessionPicker">当前监控实例</label>
+                <select id="sessionPicker" class="session-select" onchange="changeSession(this.value)">
+                    <option value="">全部实例</option>
+                </select>
+                <div class="session-meta" id="sessionMeta">等待客户端会话上报</div>
+            </div>
             <div class="status-grid">
                 <div class="status-item status-focus">
                     <div class="status-label">连接状态</div>
@@ -978,6 +1022,10 @@ HTML_TEMPLATE = """
         let statusData = {};
         let currentChatName = '';
         let currentChatMsgs = [];
+        let sessionOptions = [];
+        let selectedSessionId = '';
+        let selectedClientSource = '';
+        let hasManualSessionSelection = false;
         let availableDates = new Set();
         let currentMonth = new Date();
         let selectedDate = '';
@@ -985,13 +1033,108 @@ HTML_TEMPLATE = """
         let refreshCountdown = 10;
         const refreshIntervalSeconds = 10;
 
-        function refreshData() {
+        function buildScopedUrl(path) {
+            const params = new URLSearchParams();
+            if (selectedSessionId) params.set('session_id', selectedSessionId);
+            if (selectedClientSource) params.set('source', selectedClientSource);
+            const query = params.toString();
+            return query ? `${path}?${query}` : path;
+        }
+
+        function sessionOptionValue(sessionId, clientSource) {
+            return `${sessionId || ''}||${clientSource || ''}`;
+        }
+
+        function syncSessionPicker(sessions, preferredSessionId = '', preferredSource = '') {
+            sessionOptions = Array.isArray(sessions) ? sessions : [];
+            const picker = document.getElementById('sessionPicker');
+            if (!picker) return;
+
+            const knownValues = new Set(
+                sessionOptions.map(item => sessionOptionValue(item.session_id, item.client_source))
+            );
+            const preferredValue = preferredSessionId
+                ? sessionOptionValue(preferredSessionId, preferredSource)
+                : '';
+
+            if (!hasManualSessionSelection && preferredValue && knownValues.has(preferredValue)) {
+                selectedSessionId = preferredSessionId;
+                selectedClientSource = preferredSource || '';
+            } else if (selectedSessionId) {
+                const currentValue = sessionOptionValue(selectedSessionId, selectedClientSource);
+                if (!knownValues.has(currentValue)) {
+                    if (!hasManualSessionSelection && preferredSessionId) {
+                        selectedSessionId = preferredSessionId;
+                        selectedClientSource = preferredSource || '';
+                    } else {
+                        selectedSessionId = '';
+                        selectedClientSource = '';
+                    }
+                }
+            } else if (!hasManualSessionSelection && preferredSessionId) {
+                selectedSessionId = preferredSessionId;
+                selectedClientSource = preferredSource || '';
+            }
+
+            const options = ['<option value="">全部实例</option>'].concat(
+                sessionOptions.map(item => {
+                    const value = sessionOptionValue(item.session_id, item.client_source);
+                    const source = item.client_source || 'unknown';
+                    const ip = item.client_ip ? ` ｜ ${item.client_ip}` : '';
+                    const label = `${item.session_id || '-'} ｜ ${source}${ip}`;
+                    return `<option value="${escapeHtml(value)}">${escapeHtml(label)}</option>`;
+                })
+            );
+            picker.innerHTML = options.join('');
+            picker.value = selectedSessionId ? sessionOptionValue(selectedSessionId, selectedClientSource) : '';
+            updateSessionMeta();
+        }
+
+        function updateSessionMeta() {
+            const meta = document.getElementById('sessionMeta');
+            if (!meta) return;
+            if (!selectedSessionId) {
+                meta.textContent = `当前查看全部实例，已发现 ${sessionOptions.length} 个客户端会话。`;
+                return;
+            }
+            const current = sessionOptions.find(item =>
+                item.session_id === selectedSessionId && (item.client_source || '') === (selectedClientSource || '')
+            );
+            if (!current) {
+                meta.textContent = '当前实例不在最近会话列表里，可能暂时没有新上报。';
+                return;
+            }
+            const parts = [
+                `来源：${current.client_source || '-'}`,
+                current.client_ip ? `IP：${current.client_ip}` : '',
+                current.last_event_at ? `最后事件：${current.last_event_at}` : '',
+            ].filter(Boolean);
+            meta.textContent = parts.join(' ｜ ');
+        }
+
+        async function changeSession(value) {
+            hasManualSessionSelection = true;
+            if (!value) {
+                selectedSessionId = '';
+                selectedClientSource = '';
+            } else {
+                const [sessionId, clientSource] = value.split('||');
+                selectedSessionId = sessionId || '';
+                selectedClientSource = clientSource || '';
+            }
+            closeChat();
+            updateSessionMeta();
+            await refreshData();
+        }
+
+        async function refreshData() {
             refreshCountdown = refreshIntervalSeconds;
-            loadAll();
+            await loadAll();
         }
 
         async function loadAll() {
-            await Promise.all([loadData(), loadContactsData(), loadFavoritesData(), loadStatus(), loadEvents()]);
+            await loadStatus();
+            await Promise.all([loadData(), loadContactsData(), loadFavoritesData(), loadEvents()]);
             updateRefreshMeta('刚刚已刷新');
         }
 
@@ -1026,7 +1169,7 @@ HTML_TEMPLATE = """
 
         async function loadData() {
             try {
-                const resp = await fetch('/api/messages');
+                const resp = await fetch(buildScopedUrl('/api/messages'));
                 const data = await resp.json();
                 allData = data.messages || [];
                 document.getElementById('totalMsg').textContent = data.total ?? allData.length;
@@ -1041,6 +1184,8 @@ HTML_TEMPLATE = """
                     const lastTime = Math.max(...allData.map(m => m.create_time));
                     document.getElementById('lastMessageTime').textContent = 
                         new Date(lastTime * 1000).toLocaleString('zh-CN');
+                } else {
+                    document.getElementById('lastMessageTime').textContent = '-';
                 }
                 
                 renderContacts();
@@ -1051,7 +1196,7 @@ HTML_TEMPLATE = """
 
         async function loadContactsData() {
             try {
-                const resp = await fetch('/api/contacts');
+                const resp = await fetch(buildScopedUrl('/api/contacts'));
                 const data = await resp.json();
                 allContacts = data.contacts || [];
                 document.getElementById('totalContacts').textContent = data.total ?? allContacts.length;
@@ -1064,7 +1209,7 @@ HTML_TEMPLATE = """
 
         async function loadFavoritesData() {
             try {
-                const resp = await fetch('/api/favorites');
+                const resp = await fetch(buildScopedUrl('/api/favorites'));
                 const data = await resp.json();
                 allFavorites = data.favorites || [];
                 document.getElementById('favoriteCountDetail').textContent = data.total ?? allFavorites.length;
@@ -1076,8 +1221,13 @@ HTML_TEMPLATE = """
 
         async function loadStatus() {
             try {
-                const resp = await fetch('/api/status');
+                const resp = await fetch(buildScopedUrl('/api/status'));
                 statusData = await resp.json();
+                syncSessionPicker(
+                    statusData.sessions || [],
+                    statusData.current_session_id || '',
+                    statusData.current_client_source || ''
+                );
                 
                 const heartbeat = statusData.last_heartbeat || 0;
                 const now = Math.floor(Date.now() / 1000);
@@ -1131,11 +1281,13 @@ HTML_TEMPLATE = """
                     ? '#06934a'
                     : '#dc2626';
 
-                const sessionId = statusData.last_client_session_id || '-';
-                const sessionSource = statusData.last_client_source || '';
+                const sessionId = statusData.current_session_id || statusData.last_client_session_id || '-';
+                const sessionSource = statusData.current_client_source || statusData.last_client_source || '';
+                const sessionIp = statusData.current_client_ip || '';
                 const sessionAt = statusData.last_client_event_at || '';
                 const sessionPieces = [sessionId];
                 if (sessionSource) sessionPieces.push(sessionSource);
+                if (sessionIp) sessionPieces.push(sessionIp);
                 if (sessionAt) sessionPieces.push(sessionAt);
                 document.getElementById('lastClientSession').textContent = sessionPieces.join(' ｜ ');
 
@@ -1161,7 +1313,7 @@ HTML_TEMPLATE = """
                 list.innerHTML = '<div class="empty">暂无错误</div>';
                 return;
             }
-            list.innerHTML = errors.reverse().map(e => `
+            list.innerHTML = [...errors].reverse().map(e => `
                 <div class="error-item">
                     <div class="error-time">${e.time}</div>
                     <div class="error-msg">${escapeHtml(e.message)}</div>
@@ -1171,7 +1323,7 @@ HTML_TEMPLATE = """
 
         async function loadEvents() {
             try {
-                const resp = await fetch('/api/events');
+                const resp = await fetch(buildScopedUrl('/api/events'));
                 const data = await resp.json();
                 renderEvents(data.events || []);
             } catch (e) {
@@ -1620,86 +1772,641 @@ def parse_int(value, default, minimum=None, maximum=None):
     return parsed
 
 
-def load_messages(limit=5000, offset=0):
-    limit = parse_int(limit, 5000, minimum=1, maximum=10000)
-    offset = parse_int(offset, 0, minimum=0)
-    with get_db() as conn:
-        with conn.cursor() as cursor:
+def normalize_client_source(value, default="unknown"):
+    text = str(value or "").strip().lower()
+    if not text:
+        text = default
+    return text[:32]
+
+
+def normalize_session_id(value):
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"\s+", "_", text)
+    return text[:120]
+
+
+def build_legacy_session_id(remote_addr, client_source):
+    source = normalize_client_source(client_source, default="unknown")
+    addr = str(remote_addr or "").strip() or "unknown"
+    safe_addr = re.sub(r"[^0-9A-Za-z:._-]+", "_", addr)
+    return f"legacy:{source}:{safe_addr}"[:120]
+
+
+def resolve_client_context(conn, data=None, remote_addr="", fallback_source="unknown"):
+    data = data or {}
+    explicit_source = normalize_client_source(data.get("source"), default=fallback_source)
+    explicit_session_id = normalize_session_id(data.get("session_id"))
+    client_ip = str(remote_addr or "").strip()
+    inferred = False
+
+    if explicit_session_id:
+        return {
+            "session_id": explicit_session_id,
+            "client_source": explicit_source,
+            "client_ip": client_ip,
+            "inferred": inferred,
+        }
+
+    lookback_from = datetime.now() - timedelta(seconds=max(CLIENT_SESSION_LOOKBACK_SECONDS, 60))
+    with conn.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT session_id, source, client_ip
+            FROM event_logs
+            WHERE client_ip = %s
+              AND source LIKE 'client%%'
+              AND session_id <> ''
+              AND created_at >= %s
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (client_ip, lookback_from),
+        )
+        row = cursor.fetchone()
+
+    if row:
+        inferred = True
+        return {
+            "session_id": normalize_session_id(row.get("session_id")),
+            "client_source": normalize_client_source(row.get("source"), default=explicit_source),
+            "client_ip": client_ip or str(row.get("client_ip") or "").strip(),
+            "inferred": inferred,
+        }
+
+    return {
+        "session_id": build_legacy_session_id(client_ip, explicit_source),
+        "client_source": explicit_source,
+        "client_ip": client_ip,
+        "inferred": True,
+    }
+
+
+def parse_scope_filters(args):
+    session_id = normalize_session_id(args.get("session_id"))
+    client_source = normalize_client_source(args.get("source"), default="") if args.get("source") else ""
+    return session_id, client_source
+
+
+def build_scope_where(session_id="", client_source="", table_alias=""):
+    conditions = []
+    params = []
+    prefix = f"{table_alias}." if table_alias else ""
+    if session_id:
+        conditions.append(f"{prefix}session_id = %s")
+        params.append(session_id)
+    if client_source:
+        conditions.append(f"{prefix}client_source = %s")
+        params.append(client_source)
+    return conditions, params
+
+
+LOG_SOURCE_LABELS = {
+    "client_cs": "Windows 桌宠",
+    "client_py": "Windows 采集脚本",
+    "server": "服务器",
+    "web": "网页",
+}
+
+
+SKIPPED_MONITOR_EVENTS = {
+    "client_decrypt_progress",
+    "client_decrypt_slow",
+    "client_push_started",
+    "client_push_batch_started",
+    "client_push_batch_result",
+    "client_memory_pipeline_started",
+    "client_memory_db_progress",
+    "client_memory_db_released",
+    "client_memory_pipeline_result",
+    "client_wechat_detected",
+    "client_wechat_process_detected",
+    "client_media_loaded",
+    "server_messages_received",
+    "server_contacts_received",
+    "server_favorites_received",
+    "server_status_updated",
+    "codex_domain_check",
+}
+
+
+def build_monitor_log(
+    log_type,
+    event_name,
+    source,
+    session_id,
+    client_source,
+    client_ip,
+    title,
+    details,
+    *,
+    severity="info",
+    stage_key="",
+    payload=None,
+    dedupe_key="",
+    aggregate_window_seconds=0,
+    event_time=None,
+):
+    normalized_source = normalize_client_source(source, default="unknown")
+    normalized_client_source = normalize_client_source(
+        client_source or normalized_source,
+        default="unknown",
+    )
+    return {
+        "log_type": log_type,
+        "event_name": event_name,
+        "source": normalized_source,
+        "session_id": normalize_session_id(session_id),
+        "client_source": normalized_client_source,
+        "client_ip": str(client_ip or ""),
+        "severity": severity,
+        "stage_key": stage_key,
+        "title": title,
+        "details": details,
+        "payload_json": json.dumps(payload or {}, ensure_ascii=False),
+        "dedupe_key": dedupe_key[:255],
+        "aggregate_window_seconds": int(max(aggregate_window_seconds or 0, 0)),
+        "event_time": event_time or datetime.now(),
+    }
+
+
+def compose_monitor_details(details, occurrence_count):
+    text = str(details or "").strip()
+    if occurrence_count <= 1:
+        return text
+    if not text:
+        return f"最近已汇总 {occurrence_count} 次。"
+    return f"{text} 最近已汇总 {occurrence_count} 次。"
+
+
+def normalize_monitor_event(event_name, source, payload=None, session_id="", client_ip="", client_source=""):
+    payload = payload or {}
+    if event_name in SKIPPED_MONITOR_EVENTS:
+        return []
+
+    details = describe_event(event_name, payload)
+    normalized_source = normalize_client_source(source, default="unknown")
+    normalized_client_source = normalize_client_source(
+        client_source or normalized_source,
+        default="unknown",
+    )
+    logs = []
+
+    def runtime(title, *, stage_key="", severity="info"):
+        logs.append(
+            build_monitor_log(
+                "runtime",
+                event_name,
+                normalized_source,
+                session_id,
+                normalized_client_source,
+                client_ip,
+                title,
+                details,
+                severity=severity,
+                stage_key=stage_key,
+                payload=payload,
+            )
+        )
+
+    def error(title, *, stage_key="", dedupe_suffix="", severity="error", aggregate_window_seconds=None):
+        dedupe_parts = [
+            normalize_session_id(session_id),
+            normalized_client_source,
+            event_name,
+            stage_key,
+            dedupe_suffix or str(payload.get("reason") or payload.get("stage") or payload.get("status_code") or ""),
+        ]
+        dedupe_key = ":".join(filter(None, dedupe_parts))
+        logs.append(
+            build_monitor_log(
+                "error",
+                event_name,
+                normalized_source,
+                session_id,
+                normalized_client_source,
+                client_ip,
+                title,
+                details,
+                severity=severity,
+                stage_key=stage_key,
+                payload=payload,
+                dedupe_key=dedupe_key,
+                aggregate_window_seconds=aggregate_window_seconds or MONITOR_LOG_AGGREGATE_WINDOW_SECONDS,
+            )
+        )
+
+    if event_name == "client_scan_started":
+        runtime("开始扫描", stage_key="scan_started")
+        return logs
+    if event_name == "client_v4_data_dir_result":
+        runtime("目录识别结果", stage_key="data_dir")
+        return logs
+    if event_name == "client_chatlog_key_result":
+        runtime("拿到数据库密钥" if payload.get("success") else "密钥获取失败", stage_key="chatlog_key")
+        if not payload.get("success"):
+            error("数据库密钥获取失败", stage_key="chatlog_key")
+        return logs
+    if event_name in {"client_weflow_wcdb_export_result", "client_wechat_decrypt_export_result"}:
+        runtime("数据库解密结果", stage_key="decrypt_export")
+        if payload.get("success") is False:
+            error("数据库解密失败", stage_key="decrypt_export")
+        return logs
+    if event_name == "client_contacts_push_result":
+        runtime("通讯录上传结果", stage_key="contacts_push")
+        if payload.get("success") is False:
+            error("通讯录上传失败", stage_key="contacts_push")
+        return logs
+    if event_name == "client_favorites_export_result":
+        runtime("收藏导出结果", stage_key="favorites_export")
+        if payload.get("success") is False:
+            if payload.get("reason") == "favorite_db_missing":
+                error("收藏库缺失", stage_key="favorites_export")
+            else:
+                error("收藏库读取失败", stage_key="favorites_export")
+        return logs
+    if event_name == "client_favorites_push_result":
+        runtime("收藏上传结果", stage_key="favorites_push")
+        if payload.get("success") is False:
+            error("收藏上传失败", stage_key="favorites_push")
+        return logs
+    if event_name == "client_push_result":
+        runtime("聊天记录上传结果", stage_key="messages_push")
+        return logs
+    if event_name == "client_push_failed":
+        runtime("聊天记录上传失败", stage_key="messages_push", severity="warning")
+        error("聊天记录上传失败", stage_key="messages_push")
+        return logs
+    if event_name == "client_disk_pipeline_result":
+        runtime("临时落盘链路结果", stage_key="disk_pipeline")
+        if payload.get("success") is False:
+            error("数据库解密失败", stage_key="disk_pipeline")
+        return logs
+    if event_name == "client_extract_failed":
+        error("采集或解密失败", stage_key=str(payload.get("stage") or "extract_failed"))
+        return logs
+    if event_name == "client_media_missing":
+        error("图片文件缺失", stage_key="media_missing")
+        return logs
+    if event_name == "client_media_skipped":
+        error("图片未上传", stage_key="media_skipped")
+        return logs
+    if event_name == "client_wechat_restart_started":
+        runtime("开始重启微信", stage_key="wechat_restart")
+        return logs
+    if event_name == "client_wechat_restart_result":
+        runtime("微信重启结果", stage_key="wechat_restart")
+        if payload.get("success") is False:
+            error("微信重启失败", stage_key="wechat_restart")
+        return logs
+    if event_name == "client_wechat_login_status":
+        runtime("微信登录状态更新", stage_key="wechat_login")
+        return logs
+    if event_name == "client_scan_finished":
+        runtime("本轮结束", stage_key="scan_finished")
+        return logs
+    if event_name == "server_error_reported":
+        error("客户端上报错误", stage_key="server_error")
+        return logs
+    if event_name == "server_unauthorized":
+        error("请求鉴权失败", stage_key="unauthorized")
+        return logs
+    return logs
+
+
+def format_monitor_log_row(row):
+    payload_json = row.get("payload_json", "{}")
+    try:
+        payload = json.loads(payload_json or "{}")
+    except json.JSONDecodeError:
+        payload = {}
+
+    last_event_at = row.get("last_event_at") or row.get("first_event_at") or row.get("created_at")
+    updated_at = row.get("updated_at") or row.get("created_at")
+    return {
+        "id": row.get("id"),
+        "log_type": row.get("log_type", "runtime"),
+        "event_name": row.get("event_name", ""),
+        "title": row.get("title", "") or row.get("event_name", "") or "未知日志",
+        "details": row.get("details", ""),
+        "source": row.get("source", ""),
+        "source_label": LOG_SOURCE_LABELS.get(row.get("source", ""), row.get("source", "") or "未知来源"),
+        "session_id": row.get("session_id", ""),
+        "client_source": row.get("client_source", ""),
+        "client_ip": row.get("client_ip", "") or payload.get("client_ip", ""),
+        "severity": row.get("severity", "info"),
+        "stage_key": row.get("stage_key", ""),
+        "occurrence_count": int(row.get("occurrence_count") or 1),
+        "payload_json": payload_json,
+        "created_at": last_event_at.strftime("%Y-%m-%d %H:%M:%S") if last_event_at else "",
+        "updated_at": updated_at.strftime("%Y-%m-%d %H:%M:%S") if updated_at else "",
+    }
+
+
+def upsert_monitor_log(conn, monitor_log):
+    if not monitor_log:
+        return None, False
+
+    dedupe_key = str(monitor_log.get("dedupe_key") or "").strip()
+    aggregate_window_seconds = int(monitor_log.get("aggregate_window_seconds") or 0)
+    event_time = monitor_log.get("event_time") or datetime.now()
+
+    with conn.cursor() as cursor:
+        if dedupe_key and aggregate_window_seconds > 0:
+            lookback_from = event_time - timedelta(seconds=aggregate_window_seconds)
             cursor.execute(
                 """
+                SELECT id, occurrence_count
+                FROM monitor_logs
+                WHERE log_type = %s
+                  AND session_id = %s
+                  AND client_source = %s
+                  AND dedupe_key = %s
+                  AND last_event_at >= %s
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (
+                    monitor_log["log_type"],
+                    monitor_log["session_id"],
+                    monitor_log["client_source"],
+                    dedupe_key,
+                    lookback_from,
+                ),
+            )
+            existing = cursor.fetchone()
+            if existing:
+                next_count = int(existing.get("occurrence_count") or 1) + 1
+                next_details = compose_monitor_details(monitor_log.get("details", ""), next_count)
+                cursor.execute(
+                    """
+                    UPDATE monitor_logs
+                    SET
+                        details = %s,
+                        occurrence_count = %s,
+                        payload_json = %s,
+                        client_ip = CASE
+                            WHEN %s <> '' THEN %s
+                            ELSE client_ip
+                        END,
+                        last_event_at = %s
+                    WHERE id = %s
+                    """,
+                    (
+                        next_details,
+                        next_count,
+                        monitor_log["payload_json"],
+                        monitor_log["client_ip"],
+                        monitor_log["client_ip"],
+                        event_time,
+                        existing["id"],
+                    ),
+                )
+                cursor.execute("SELECT * FROM monitor_logs WHERE id = %s", (existing["id"],))
+                return cursor.fetchone(), True
+
+        cursor.execute(
+            """
+            INSERT INTO monitor_logs (
+                log_type, event_name, source, session_id, client_source, client_ip,
+                severity, stage_key, title, details, dedupe_key, occurrence_count,
+                payload_json, first_event_at, last_event_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                monitor_log["log_type"],
+                monitor_log["event_name"],
+                monitor_log["source"],
+                monitor_log["session_id"],
+                monitor_log["client_source"],
+                monitor_log["client_ip"],
+                monitor_log["severity"],
+                monitor_log["stage_key"],
+                monitor_log["title"],
+                compose_monitor_details(monitor_log["details"], 1),
+                dedupe_key,
+                1,
+                monitor_log["payload_json"],
+                event_time,
+                event_time,
+            ),
+        )
+        row_id = cursor.lastrowid
+        cursor.execute("SELECT * FROM monitor_logs WHERE id = %s", (row_id,))
+        return cursor.fetchone(), False
+
+
+def prune_monitor_logs(conn):
+    with conn.cursor() as cursor:
+        for log_type, limit in (
+            ("runtime", MONITOR_RUNTIME_LOG_LIMIT),
+            ("error", MONITOR_ERROR_LOG_LIMIT),
+        ):
+            cursor.execute(
+                """
+                DELETE FROM monitor_logs
+                WHERE id NOT IN (
+                    SELECT id FROM (
+                        SELECT id
+                        FROM monitor_logs
+                        WHERE log_type = %s
+                        ORDER BY id DESC
+                        LIMIT %s
+                    ) AS recent_logs
+                )
+                  AND log_type = %s
+                """,
+                (log_type, max(limit, 1), log_type),
+            )
+
+
+def load_monitor_logs(
+    *,
+    log_type="runtime",
+    session_id="",
+    client_source="",
+    since_id=0,
+    updated_after="",
+    limit=None,
+):
+    limit = parse_int(limit, MONITOR_TIMELINE_PAGE_LIMIT, minimum=1, maximum=500)
+    since_id = parse_int(since_id, 0, minimum=0)
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            base_where = ["log_type = %s"]
+            base_params = [log_type]
+            if session_id:
+                base_where.append("session_id = %s")
+                base_params.append(session_id)
+            if client_source:
+                base_where.append("client_source = %s")
+                base_params.append(client_source)
+
+            cursor.execute(
+                f"""
+                SELECT *
+                FROM monitor_logs
+                WHERE {' AND '.join(base_where)}
+                  AND id > %s
+                ORDER BY id DESC
+                LIMIT %s
+                """,
+                (*base_params, since_id, limit),
+            )
+            new_rows = list(cursor.fetchall())
+
+            updated_rows = []
+            if updated_after:
+                cursor.execute(
+                    f"""
+                    SELECT *
+                    FROM monitor_logs
+                    WHERE {' AND '.join(base_where)}
+                      AND updated_at > %s
+                      AND id <= %s
+                    ORDER BY id DESC
+                    LIMIT %s
+                    """,
+                    (*base_params, updated_after, since_id or 9223372036854775807, limit),
+                )
+                updated_rows = list(cursor.fetchall())
+
+            if since_id <= 0:
+                cursor.execute(
+                    f"""
+                    SELECT *
+                    FROM monitor_logs
+                    WHERE {' AND '.join(base_where)}
+                    ORDER BY id DESC
+                    LIMIT %s
+                    """,
+                    (*base_params, limit),
+                )
+                new_rows = list(cursor.fetchall())
+                updated_rows = []
+
+            cursor.execute(
+                f"""
+                SELECT id
+                FROM monitor_logs
+                WHERE {' AND '.join(base_where)}
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                base_params,
+            )
+            latest_row = cursor.fetchone()
+
+    latest_id = int((latest_row or {}).get("id") or 0)
+    return {
+        "events": [format_monitor_log_row(row) for row in reversed(new_rows)],
+        "updated_events": [format_monitor_log_row(row) for row in reversed(updated_rows)],
+        "latest_id": latest_id,
+        "synced_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "log_type": log_type,
+    }
+
+
+def load_messages(limit=5000, offset=0, session_id="", client_source=""):
+    limit = parse_int(limit, 5000, minimum=1, maximum=10000)
+    offset = parse_int(offset, 0, minimum=0)
+    where_clauses, params = build_scope_where(session_id=session_id, client_source=client_source)
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+            cursor.execute(
+                f"""
                 SELECT
+                    session_id, client_source, client_ip,
                     wxid, nickname, sender, content, create_time, is_sender,
                     avatar, msg_type, msg_sub_type,
                     media_type, media_mime, media_name, media_data
                 FROM messages
+                {where_sql}
                 ORDER BY create_time ASC, id ASC
                 LIMIT %s OFFSET %s
                 """,
-                (limit, offset),
+                (*params, limit, offset),
             )
             return list(cursor.fetchall())
 
 
-def count_messages():
+def count_messages(session_id="", client_source=""):
+    where_clauses, params = build_scope_where(session_id=session_id, client_source=client_source)
     with get_db() as conn:
         with conn.cursor() as cursor:
-            cursor.execute("SELECT COUNT(*) AS total FROM messages")
+            where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+            cursor.execute(f"SELECT COUNT(*) AS total FROM messages {where_sql}", params)
             return cursor.fetchone()["total"]
 
 
-def load_contacts(limit=2000, offset=0):
+def load_contacts(limit=2000, offset=0, session_id="", client_source=""):
     limit = parse_int(limit, 2000, minimum=1, maximum=10000)
     offset = parse_int(offset, 0, minimum=0)
+    where_clauses, params = build_scope_where(session_id=session_id, client_source=client_source)
     with get_db() as conn:
         with conn.cursor() as cursor:
+            where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
             cursor.execute(
-                """
+                f"""
                 SELECT
+                    session_id, client_source, client_ip,
                     wxid, alias, remark, nick_name, display_name,
                     avatar, source_updated_at, extra_json, updated_at
                 FROM contacts
+                {where_sql}
                 ORDER BY
                     CASE WHEN display_name <> '' THEN 0 ELSE 1 END,
                     display_name ASC,
                     wxid ASC
                 LIMIT %s OFFSET %s
                 """,
-                (limit, offset),
+                (*params, limit, offset),
             )
             return list(cursor.fetchall())
 
 
-def count_contacts():
+def count_contacts(session_id="", client_source=""):
+    where_clauses, params = build_scope_where(session_id=session_id, client_source=client_source)
     with get_db() as conn:
         with conn.cursor() as cursor:
-            cursor.execute("SELECT COUNT(*) AS total FROM contacts")
+            where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+            cursor.execute(f"SELECT COUNT(*) AS total FROM contacts {where_sql}", params)
             return cursor.fetchone()["total"]
 
 
-def load_favorites(limit=1000, offset=0):
+def load_favorites(limit=1000, offset=0, session_id="", client_source=""):
     limit = parse_int(limit, 1000, minimum=1, maximum=5000)
     offset = parse_int(offset, 0, minimum=0)
+    where_clauses, params = build_scope_where(session_id=session_id, client_source=client_source)
     with get_db() as conn:
         with conn.cursor() as cursor:
+            where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
             cursor.execute(
-                """
+                f"""
                 SELECT
+                    session_id, client_source, client_ip,
                     source_table, source_id, title, summary,
                     item_type, item_sub_type, source_updated_at,
                     data_json, updated_at
                 FROM favorites
+                {where_sql}
                 ORDER BY source_updated_at DESC, id DESC
                 LIMIT %s OFFSET %s
                 """,
-                (limit, offset),
+                (*params, limit, offset),
             )
             return list(cursor.fetchall())
 
 
-def count_favorites():
+def count_favorites(session_id="", client_source=""):
+    where_clauses, params = build_scope_where(session_id=session_id, client_source=client_source)
     with get_db() as conn:
         with conn.cursor() as cursor:
-            cursor.execute("SELECT COUNT(*) AS total FROM favorites")
+            where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+            cursor.execute(f"SELECT COUNT(*) AS total FROM favorites {where_sql}", params)
             return cursor.fetchone()["total"]
 
 
@@ -1710,7 +2417,47 @@ def save_messages(data):
         return added
 
 
-def load_status():
+def load_client_sessions(limit=20):
+    limit = parse_int(limit, 20, minimum=1, maximum=100)
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    session_id, client_source, client_ip,
+                    last_heartbeat, decrypt_ok, wechat_logged_in,
+                    last_error, last_event_name, last_event_at,
+                    updated_at
+                FROM client_sessions
+                ORDER BY
+                    COALESCE(last_event_at, updated_at) DESC,
+                    updated_at DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            rows = list(cursor.fetchall())
+
+    sessions = []
+    for row in rows:
+        sessions.append(
+            {
+                "session_id": row.get("session_id", ""),
+                "client_source": row.get("client_source", ""),
+                "client_ip": row.get("client_ip", ""),
+                "last_heartbeat": int(row.get("last_heartbeat") or 0),
+                "decrypt_ok": bool(row.get("decrypt_ok")) if row.get("decrypt_ok") is not None else False,
+                "wechat_logged_in": bool(row.get("wechat_logged_in")) if row.get("wechat_logged_in") is not None else False,
+                "last_error": row.get("last_error") or "",
+                "last_event_name": row.get("last_event_name") or "",
+                "last_event_at": row["last_event_at"].strftime("%Y-%m-%d %H:%M:%S") if row.get("last_event_at") else "",
+                "updated_at": row["updated_at"].strftime("%Y-%m-%d %H:%M:%S") if row.get("updated_at") else "",
+            }
+        )
+    return sessions
+
+
+def load_status(session_id="", client_source=""):
     with get_db() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
@@ -1721,55 +2468,78 @@ def load_status():
                 """
             )
             row = cursor.fetchone()
+            session_where, session_params = build_scope_where(session_id=session_id, client_source=client_source)
+            session_sql = f"WHERE {' AND '.join(session_where)}" if session_where else ""
+            cursor.execute(
+                f"""
+                SELECT
+                    session_id, client_source, client_ip,
+                    last_heartbeat, decrypt_ok, wechat_logged_in,
+                    last_error, last_event_name, last_event_at,
+                    updated_at
+                FROM client_sessions
+                {session_sql}
+                ORDER BY
+                    COALESCE(last_event_at, updated_at) DESC,
+                    updated_at DESC
+                LIMIT 1
+                """,
+                session_params,
+            )
+            selected_session = cursor.fetchone()
             cursor.execute(
                 """
-                SELECT created_at AS time, message
-                FROM monitor_errors
+                SELECT
+                    session_id, client_source, client_ip,
+                    last_heartbeat, decrypt_ok, wechat_logged_in,
+                    last_error, last_event_name, last_event_at,
+                    updated_at
+                FROM client_sessions
+                ORDER BY
+                    COALESCE(last_event_at, updated_at) DESC,
+                    updated_at DESC
+                LIMIT 1
+                """
+            )
+            latest_session = cursor.fetchone()
+            current_session = selected_session or latest_session
+            current_session_id = normalize_session_id((current_session or {}).get("session_id"))
+            current_client_source = normalize_client_source((current_session or {}).get("client_source"), default="") if current_session else ""
+            monitor_where = []
+            monitor_params = []
+            if current_session_id:
+                monitor_where.append("session_id = %s")
+                monitor_params.append(current_session_id)
+            if current_client_source:
+                monitor_where.append("client_source = %s")
+                monitor_params.append(current_client_source)
+            monitor_sql = f"AND {' AND '.join(monitor_where)}" if monitor_where else ""
+
+            cursor.execute(
+                f"""
+                SELECT *
+                FROM monitor_logs
+                WHERE log_type = 'runtime'
+                {monitor_sql}
+                ORDER BY id DESC
+                LIMIT 120
+                """,
+                monitor_params,
+            )
+            runtime_logs = list(cursor.fetchall())
+            cursor.execute(
+                f"""
+                SELECT *
+                FROM monitor_logs
+                WHERE log_type = 'error'
+                {monitor_sql}
                 ORDER BY id DESC
                 LIMIT 50
-                """
+                """,
+                monitor_params,
             )
-            errors = list(cursor.fetchall())
-            cursor.execute(
-                """
-                SELECT event_name, source, session_id, payload_json, created_at
-                FROM event_logs
-                WHERE source <> 'web'
-                ORDER BY id DESC
-                LIMIT 1
-                """
-            )
-            last_event = cursor.fetchone()
-            cursor.execute(
-                """
-                SELECT event_name, source, session_id, payload_json, created_at
-                FROM event_logs
-                WHERE source LIKE 'client%%'
-                ORDER BY id DESC
-                LIMIT 1
-                """
-            )
-            last_client_event = cursor.fetchone()
-            cursor.execute(
-                """
-                SELECT event_name, source, session_id, payload_json, created_at
-                FROM event_logs
-                WHERE event_name = 'client_scan_finished'
-                ORDER BY id DESC
-                LIMIT 1
-                """
-            )
-            last_scan_event = cursor.fetchone()
-            cursor.execute(
-                """
-                SELECT event_name, source, session_id, payload_json, created_at
-                FROM event_logs
-                WHERE event_name IN ('client_push_result', 'client_push_failed')
-                ORDER BY id DESC
-                LIMIT 1
-                """
-            )
-            last_push_event = cursor.fetchone()
+            error_logs = list(cursor.fetchall())
+            sessions = load_client_sessions()
 
     if not row:
         return {
@@ -1786,68 +2556,70 @@ def load_status():
             "last_client_session_id": "",
             "last_client_source": "",
             "last_client_event_at": "",
+            "current_session_id": "",
+            "current_client_source": "",
+            "current_client_ip": "",
+            "sessions": [],
         }
 
     now_ts = int(datetime.now().timestamp())
-    heartbeat = row.get("last_heartbeat") or 0
+    session_heartbeat = int((current_session or {}).get("last_heartbeat") or 0)
+    heartbeat = session_heartbeat or (row.get("last_heartbeat") or 0)
     worker_alive = heartbeat > 0 and (now_ts - int(heartbeat)) < HEARTBEAT_TIMEOUT_SECONDS
-
-    def parse_payload(event_row):
-        if not event_row:
-            return {}
-        try:
-            return json.loads(event_row.get("payload_json") or "{}")
-        except json.JSONDecodeError:
-            return {}
-
-    def format_event_time(event_row):
-        if not event_row or not event_row.get("created_at"):
-            return ""
-        return event_row["created_at"].strftime("%Y-%m-%d %H:%M:%S")
-
-    last_event_payload = parse_payload(last_event)
-    last_scan_payload = parse_payload(last_scan_event)
-    last_push_payload = parse_payload(last_push_event)
+    runtime_items = [format_monitor_log_row(row) for row in runtime_logs]
+    error_items = [format_monitor_log_row(row) for row in error_logs]
+    last_event = runtime_items[0] if runtime_items else None
+    last_scan_event = next((item for item in runtime_items if item.get("stage_key") == "scan_finished"), None)
+    last_push_event = next(
+        (
+            item
+            for item in runtime_items
+            if item.get("stage_key") in {"messages_push", "favorites_push", "contacts_push"}
+        ),
+        None,
+    )
+    last_client_event = last_event
 
     return {
         "last_heartbeat": heartbeat,
-        "decrypt_ok": bool(row.get("decrypt_ok")),
-        "wechat_logged_in": bool(row.get("wechat_logged_in")),
+        "decrypt_ok": bool((current_session or {}).get("decrypt_ok")) if current_session and current_session.get("decrypt_ok") is not None else bool(row.get("decrypt_ok")),
+        "wechat_logged_in": bool((current_session or {}).get("wechat_logged_in")) if current_session and current_session.get("wechat_logged_in") is not None else bool(row.get("wechat_logged_in")),
         "heartbeat_timeout_seconds": HEARTBEAT_TIMEOUT_SECONDS,
         "worker_alive": worker_alive,
-        "last_event_at": format_event_time(last_event),
-        "last_event_summary": describe_event(last_event.get("event_name", ""), last_event_payload) if last_event else "",
-        "last_scan_result_summary": describe_event(last_scan_event.get("event_name", ""), last_scan_payload) if last_scan_event else "",
-        "last_push_result_summary": describe_event(last_push_event.get("event_name", ""), last_push_payload) if last_push_event else "",
-        "last_client_session_id": (last_client_event or {}).get("session_id", ""),
+        "last_event_at": (last_event or {}).get("created_at", ""),
+        "last_event_summary": (last_event or {}).get("details", ""),
+        "last_scan_result_summary": (last_scan_event or {}).get("details", ""),
+        "last_push_result_summary": (last_push_event or {}).get("details", ""),
+        "last_client_session_id": current_session_id or (last_client_event or {}).get("session_id", ""),
         "last_client_source": (last_client_event or {}).get("source", ""),
-        "last_client_event_at": format_event_time(last_client_event),
+        "last_client_event_at": (last_client_event or {}).get("created_at", ""),
+        "current_session_id": current_session_id,
+        "current_client_source": current_client_source,
+        "current_client_ip": (current_session or {}).get("client_ip", "") or (last_client_event or {}).get("client_ip", ""),
+        "sessions": sessions,
         "errors": [
             {
-                "time": error["time"].strftime("%Y-%m-%d %H:%M:%S") if error.get("time") else "",
-                "message": error.get("message", ""),
+                "id": item.get("id"),
+                "time": item.get("created_at", ""),
+                "message": item.get("title", ""),
+                "details": item.get("details", ""),
+                "session_id": item.get("session_id", ""),
+                "client_source": item.get("client_source", ""),
+                "client_ip": item.get("client_ip", ""),
+                "occurrence_count": item.get("occurrence_count", 1),
             }
-            for error in reversed(errors)
+            for item in reversed(error_items)
         ],
     }
 
 
-def load_events():
-    with get_db() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT event_name, source, session_id, payload_json, created_at
-                FROM event_logs
-                WHERE source <> 'web'
-                  AND event_name <> 'codex_domain_check'
-                ORDER BY id DESC
-                LIMIT 100
-                """
-            )
-            rows = list(cursor.fetchall())
-
-    return [format_event(row) for row in rows]
+def load_events(limit=100, session_id="", client_source=""):
+    return load_monitor_logs(
+        log_type="runtime",
+        session_id=session_id,
+        client_source=client_source,
+        limit=limit,
+    )["events"]
 
 
 def format_event(row):
@@ -1886,6 +2658,7 @@ def format_event(row):
         "client_memory_pipeline_result": "内存直传结果",
         "client_weflow_wcdb_export_attempt": "开始解密数据库",
         "client_weflow_wcdb_export_result": "数据库解密结果",
+        "client_wechat_decrypt_export_result": "数据库解密结果",
         "client_weflow_result": "WeFlow 本地服务结果",
         "client_push_started": "开始上传聊天记录",
         "client_push_batch_started": "上传批次开始",
@@ -1898,6 +2671,7 @@ def format_event(row):
         "client_favorites_push_result": "收藏上传结果",
         "client_avatar_scan_result": "头像扫描结果",
         "client_media_missing": "图片文件未找到",
+        "client_media_loaded": "图片文件已读取",
         "client_media_skipped": "图片未上传",
         "server_messages_received": "服务器收到聊天记录",
         "server_contacts_received": "服务器收到联系人",
@@ -1923,7 +2697,7 @@ def format_event(row):
         "source": source,
         "source_label": source_label,
         "session_id": row.get("session_id", ""),
-        "client_ip": payload.get("client_ip", ""),
+        "client_ip": row.get("client_ip", "") or payload.get("client_ip", ""),
         "payload_json": payload_json,
         "created_at": row["created_at"].strftime("%Y-%m-%d %H:%M:%S") if row.get("created_at") else "",
     }
@@ -2046,7 +2820,12 @@ def describe_event(event_name, payload):
         return f"解密完成，输出目录：{payload.get('decrypt_dir', '-')}"
     if event_name == "client_extract_failed":
         stage = stage_map.get(payload.get("stage"), payload.get("stage") or "未知阶段")
-        reason = reason_map.get(payload.get("reason"), payload.get("reason")) or payload.get("error_message") or "未提供错误原因"
+        reason_code = payload.get("reason")
+        reason_text = reason_map.get(reason_code, reason_code) or ""
+        error_message = str(payload.get("error_message") or "").strip()
+        if reason_text and error_message and error_message != reason_text and error_message != reason_code:
+            return f"失败阶段：{stage}；原因：{reason_text}；详情：{error_message}"
+        reason = reason_text or error_message or "未提供错误原因"
         return f"失败阶段：{stage}；原因：{reason}"
     if event_name == "client_v4_data_dir_result":
         if payload.get("success"):
@@ -2225,6 +3004,15 @@ def describe_event(event_name, payload):
         if tried_paths:
             text += f" InitProtection 共尝试 {len(tried_paths)} 个路径。"
         return text
+    if event_name == "client_wechat_decrypt_export_result":
+        if payload.get("success"):
+            return (
+                f"数据库解密导出完成：账号目录 {payload.get('data_dir', '-')}"
+                f"；消息 {payload.get('message_count', 0)} 条；"
+                f"命中数据库 {payload.get('matched_db_count', 0)} 个；"
+                f"成功解密 {payload.get('decrypted_db_count', 0)} 个。"
+            )
+        return f"数据库解密导出失败：{payload.get('error_message', '未知原因')}"
     if event_name == "client_weflow_result":
         if payload.get("success"):
             if payload.get("action") == "launched":
@@ -2330,6 +3118,11 @@ def describe_event(event_name, payload):
         )
     if event_name == "client_media_missing":
         return "识别到图片消息，但没有从 Windows 本地消息字段中找到可读取的图片文件路径。"
+    if event_name == "client_media_loaded":
+        return (
+            f"图片已读取：{payload.get('media_name', '-')}"
+            f"；大小 {payload.get('media_size', 0)} 字节。"
+        )
     if event_name == "client_media_skipped":
         if payload.get("reason") == "file_too_large":
             return f"图片太大，已跳过：{payload.get('file_name', '-')}，大小 {payload.get('file_size', 0)} 字节。"
@@ -2423,6 +3216,9 @@ def init_db():
                 """
                 CREATE TABLE IF NOT EXISTS messages (
                     id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                    session_id VARCHAR(120) NOT NULL DEFAULT '',
+                    client_source VARCHAR(32) NOT NULL DEFAULT '',
+                    client_ip VARCHAR(64) NOT NULL DEFAULT '',
                     wxid VARCHAR(255) NOT NULL,
                     nickname VARCHAR(255) NOT NULL DEFAULT '',
                     sender VARCHAR(255) NOT NULL DEFAULT '',
@@ -2438,7 +3234,9 @@ def init_db():
                     media_name VARCHAR(255) NOT NULL DEFAULT '',
                     media_data LONGTEXT NULL,
                     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE KEY uniq_message (wxid, create_time, content_hash),
+                    UNIQUE KEY uniq_message_session (session_id, wxid, create_time, content_hash),
+                    KEY idx_messages_session_id (session_id),
+                    KEY idx_messages_client_source (client_source),
                     KEY idx_messages_create_time (create_time),
                     KEY idx_messages_nickname (nickname),
                     KEY idx_messages_wxid (wxid)
@@ -2449,6 +3247,9 @@ def init_db():
                 """
                 CREATE TABLE IF NOT EXISTS contacts (
                     id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                    session_id VARCHAR(120) NOT NULL DEFAULT '',
+                    client_source VARCHAR(32) NOT NULL DEFAULT '',
+                    client_ip VARCHAR(64) NOT NULL DEFAULT '',
                     wxid VARCHAR(255) NOT NULL,
                     alias VARCHAR(255) NOT NULL DEFAULT '',
                     remark VARCHAR(255) NOT NULL DEFAULT '',
@@ -2460,7 +3261,9 @@ def init_db():
                     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
                         ON UPDATE CURRENT_TIMESTAMP,
-                    UNIQUE KEY uniq_contact_wxid (wxid),
+                    UNIQUE KEY uniq_contact_session (session_id, wxid),
+                    KEY idx_contacts_session_id (session_id),
+                    KEY idx_contacts_client_source (client_source),
                     KEY idx_contacts_display_name (display_name)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
                 """
@@ -2469,6 +3272,9 @@ def init_db():
                 """
                 CREATE TABLE IF NOT EXISTS favorites (
                     id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                    session_id VARCHAR(120) NOT NULL DEFAULT '',
+                    client_source VARCHAR(32) NOT NULL DEFAULT '',
+                    client_ip VARCHAR(64) NOT NULL DEFAULT '',
                     source_table VARCHAR(255) NOT NULL DEFAULT '',
                     source_id VARCHAR(255) NOT NULL DEFAULT '',
                     title VARCHAR(255) NOT NULL DEFAULT '',
@@ -2480,7 +3286,9 @@ def init_db():
                     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
                         ON UPDATE CURRENT_TIMESTAMP,
-                    UNIQUE KEY uniq_favorite_item (source_table, source_id),
+                    UNIQUE KEY uniq_favorite_session (session_id, source_table, source_id),
+                    KEY idx_favorites_session_id (session_id),
+                    KEY idx_favorites_client_source (client_source),
                     KEY idx_favorites_updated_at (source_updated_at)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
                 """
@@ -2501,8 +3309,13 @@ def init_db():
                 """
                 CREATE TABLE IF NOT EXISTS monitor_errors (
                     id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                    session_id VARCHAR(120) NOT NULL DEFAULT '',
+                    client_source VARCHAR(32) NOT NULL DEFAULT '',
+                    client_ip VARCHAR(64) NOT NULL DEFAULT '',
                     message TEXT NOT NULL,
-                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    KEY idx_monitor_errors_session (session_id),
+                    KEY idx_monitor_errors_created_at (created_at)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
                 """
             )
@@ -2513,11 +3326,67 @@ def init_db():
                     event_name VARCHAR(120) NOT NULL,
                     source VARCHAR(32) NOT NULL,
                     session_id VARCHAR(120) NOT NULL DEFAULT '',
+                    client_ip VARCHAR(64) NOT NULL DEFAULT '',
                     payload_json JSON NULL,
                     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     KEY idx_event_name (event_name),
                     KEY idx_event_source (source),
+                    KEY idx_event_session_id (session_id),
+                    KEY idx_event_client_ip (client_ip),
                     KEY idx_event_created_at (created_at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS monitor_logs (
+                    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                    log_type VARCHAR(16) NOT NULL,
+                    event_name VARCHAR(120) NOT NULL,
+                    source VARCHAR(32) NOT NULL DEFAULT '',
+                    session_id VARCHAR(120) NOT NULL DEFAULT '',
+                    client_source VARCHAR(32) NOT NULL DEFAULT '',
+                    client_ip VARCHAR(64) NOT NULL DEFAULT '',
+                    severity VARCHAR(16) NOT NULL DEFAULT 'info',
+                    stage_key VARCHAR(64) NOT NULL DEFAULT '',
+                    title VARCHAR(255) NOT NULL DEFAULT '',
+                    details TEXT NULL,
+                    dedupe_key VARCHAR(255) NOT NULL DEFAULT '',
+                    occurrence_count INT NOT NULL DEFAULT 1,
+                    payload_json JSON NULL,
+                    first_event_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    last_event_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                        ON UPDATE CURRENT_TIMESTAMP,
+                    KEY idx_monitor_logs_type_id (log_type, id),
+                    KEY idx_monitor_logs_session (session_id),
+                    KEY idx_monitor_logs_client_source (client_source),
+                    KEY idx_monitor_logs_dedupe (dedupe_key),
+                    KEY idx_monitor_logs_updated_at (updated_at),
+                    KEY idx_monitor_logs_last_event_at (last_event_at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS client_sessions (
+                    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                    session_id VARCHAR(120) NOT NULL,
+                    client_source VARCHAR(32) NOT NULL DEFAULT '',
+                    client_ip VARCHAR(64) NOT NULL DEFAULT '',
+                    last_heartbeat BIGINT NOT NULL DEFAULT 0,
+                    decrypt_ok TINYINT(1) NULL DEFAULT NULL,
+                    wechat_logged_in TINYINT(1) NULL DEFAULT NULL,
+                    last_error TEXT NULL,
+                    last_event_name VARCHAR(120) NOT NULL DEFAULT '',
+                    last_event_at DATETIME NULL,
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                        ON UPDATE CURRENT_TIMESTAMP,
+                    UNIQUE KEY uniq_client_session (session_id, client_source),
+                    KEY idx_client_sessions_ip (client_ip),
+                    KEY idx_client_sessions_updated_at (updated_at)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
                 """
             )
@@ -2531,6 +3400,9 @@ def init_db():
             except Exception:
                 pass
             for column_sql in [
+                "ADD COLUMN session_id VARCHAR(120) NOT NULL DEFAULT ''",
+                "ADD COLUMN client_source VARCHAR(32) NOT NULL DEFAULT ''",
+                "ADD COLUMN client_ip VARCHAR(64) NOT NULL DEFAULT ''",
                 "ADD COLUMN media_type VARCHAR(32) NOT NULL DEFAULT ''",
                 "ADD COLUMN media_mime VARCHAR(80) NOT NULL DEFAULT ''",
                 "ADD COLUMN media_name VARCHAR(255) NOT NULL DEFAULT ''",
@@ -2541,6 +3413,9 @@ def init_db():
                 except Exception:
                     pass
             for column_sql in [
+                "ADD COLUMN session_id VARCHAR(120) NOT NULL DEFAULT ''",
+                "ADD COLUMN client_source VARCHAR(32) NOT NULL DEFAULT ''",
+                "ADD COLUMN client_ip VARCHAR(64) NOT NULL DEFAULT ''",
                 "ADD COLUMN source_updated_at BIGINT NOT NULL DEFAULT 0",
                 "ADD COLUMN extra_json JSON NULL",
             ]:
@@ -2549,6 +3424,9 @@ def init_db():
                 except Exception:
                     pass
             for column_sql in [
+                "ADD COLUMN session_id VARCHAR(120) NOT NULL DEFAULT ''",
+                "ADD COLUMN client_source VARCHAR(32) NOT NULL DEFAULT ''",
+                "ADD COLUMN client_ip VARCHAR(64) NOT NULL DEFAULT ''",
                 "ADD COLUMN item_type VARCHAR(80) NOT NULL DEFAULT ''",
                 "ADD COLUMN item_sub_type VARCHAR(80) NOT NULL DEFAULT ''",
                 "ADD COLUMN source_updated_at BIGINT NOT NULL DEFAULT 0",
@@ -2556,6 +3434,73 @@ def init_db():
             ]:
                 try:
                     cursor.execute(f"ALTER TABLE favorites {column_sql}")
+                except Exception:
+                    pass
+            for column_sql in [
+                "ADD COLUMN session_id VARCHAR(120) NOT NULL DEFAULT ''",
+                "ADD COLUMN client_source VARCHAR(32) NOT NULL DEFAULT ''",
+                "ADD COLUMN client_ip VARCHAR(64) NOT NULL DEFAULT ''",
+            ]:
+                try:
+                    cursor.execute(f"ALTER TABLE monitor_errors {column_sql}")
+                except Exception:
+                    pass
+            try:
+                cursor.execute("ALTER TABLE event_logs ADD COLUMN client_ip VARCHAR(64) NOT NULL DEFAULT ''")
+            except Exception:
+                pass
+            for column_sql in [
+                "ADD COLUMN source VARCHAR(32) NOT NULL DEFAULT ''",
+                "ADD COLUMN session_id VARCHAR(120) NOT NULL DEFAULT ''",
+                "ADD COLUMN client_source VARCHAR(32) NOT NULL DEFAULT ''",
+                "ADD COLUMN client_ip VARCHAR(64) NOT NULL DEFAULT ''",
+                "ADD COLUMN severity VARCHAR(16) NOT NULL DEFAULT 'info'",
+                "ADD COLUMN stage_key VARCHAR(64) NOT NULL DEFAULT ''",
+                "ADD COLUMN title VARCHAR(255) NOT NULL DEFAULT ''",
+                "ADD COLUMN details TEXT NULL",
+                "ADD COLUMN dedupe_key VARCHAR(255) NOT NULL DEFAULT ''",
+                "ADD COLUMN occurrence_count INT NOT NULL DEFAULT 1",
+                "ADD COLUMN payload_json JSON NULL",
+                "ADD COLUMN first_event_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP",
+                "ADD COLUMN last_event_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP",
+                "ADD COLUMN updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
+            ]:
+                try:
+                    cursor.execute(f"ALTER TABLE monitor_logs {column_sql}")
+                except Exception:
+                    pass
+            for alter_sql in [
+                "ALTER TABLE messages DROP INDEX uniq_message",
+                "ALTER TABLE contacts DROP INDEX uniq_contact_wxid",
+                "ALTER TABLE favorites DROP INDEX uniq_favorite_item",
+            ]:
+                try:
+                    cursor.execute(alter_sql)
+                except Exception:
+                    pass
+            for alter_sql in [
+                "ALTER TABLE messages ADD UNIQUE KEY uniq_message_session (session_id, wxid, create_time, content_hash)",
+                "ALTER TABLE messages ADD KEY idx_messages_session_id (session_id)",
+                "ALTER TABLE messages ADD KEY idx_messages_client_source (client_source)",
+                "ALTER TABLE contacts ADD UNIQUE KEY uniq_contact_session (session_id, wxid)",
+                "ALTER TABLE contacts ADD KEY idx_contacts_session_id (session_id)",
+                "ALTER TABLE contacts ADD KEY idx_contacts_client_source (client_source)",
+                "ALTER TABLE favorites ADD UNIQUE KEY uniq_favorite_session (session_id, source_table, source_id)",
+                "ALTER TABLE favorites ADD KEY idx_favorites_session_id (session_id)",
+                "ALTER TABLE favorites ADD KEY idx_favorites_client_source (client_source)",
+                "ALTER TABLE monitor_errors ADD KEY idx_monitor_errors_session (session_id)",
+                "ALTER TABLE monitor_errors ADD KEY idx_monitor_errors_created_at (created_at)",
+                "ALTER TABLE event_logs ADD KEY idx_event_session_id (session_id)",
+                "ALTER TABLE event_logs ADD KEY idx_event_client_ip (client_ip)",
+                "ALTER TABLE monitor_logs ADD KEY idx_monitor_logs_type_id (log_type, id)",
+                "ALTER TABLE monitor_logs ADD KEY idx_monitor_logs_session (session_id)",
+                "ALTER TABLE monitor_logs ADD KEY idx_monitor_logs_client_source (client_source)",
+                "ALTER TABLE monitor_logs ADD KEY idx_monitor_logs_dedupe (dedupe_key)",
+                "ALTER TABLE monitor_logs ADD KEY idx_monitor_logs_updated_at (updated_at)",
+                "ALTER TABLE monitor_logs ADD KEY idx_monitor_logs_last_event_at (last_event_at)",
+            ]:
+                try:
+                    cursor.execute(alter_sql)
                 except Exception:
                     pass
             cursor.execute(
@@ -2599,8 +3544,12 @@ def message_hash(message):
     return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()
 
 
-def normalize_message(message):
+def normalize_message(message, context=None):
+    context = context or {}
     return {
+        "session_id": normalize_session_id(message.get("session_id") or context.get("session_id")),
+        "client_source": normalize_client_source(message.get("client_source") or message.get("source") or context.get("client_source"), default="unknown"),
+        "client_ip": str(message.get("client_ip") or context.get("client_ip") or ""),
         "wxid": str(message.get("wxid", "")),
         "nickname": str(message.get("nickname") or message.get("wxid") or ""),
         "sender": str(message.get("sender", "")),
@@ -2617,13 +3566,16 @@ def normalize_message(message):
     }
 
 
-def bulk_insert_messages(conn, messages):
-    normalized = [normalize_message(message) for message in messages if message.get("wxid")]
+def bulk_insert_messages(conn, messages, context=None):
+    normalized = [normalize_message(message, context=context) for message in messages if message.get("wxid")]
     if not normalized:
         return 0
 
     rows = [
         (
+            msg["session_id"],
+            msg["client_source"],
+            msg["client_ip"],
             msg["wxid"],
             msg["nickname"],
             msg["sender"],
@@ -2646,18 +3598,20 @@ def bulk_insert_messages(conn, messages):
         cursor.executemany(
             """
             INSERT IGNORE INTO messages (
+                session_id, client_source, client_ip,
                 wxid, nickname, sender, content, content_hash,
                 create_time, is_sender, avatar, msg_type, msg_sub_type,
                 media_type, media_mime, media_name, media_data
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             rows,
         )
         return cursor.rowcount
 
 
-def normalize_contact(contact):
+def normalize_contact(contact, context=None):
+    context = context or {}
     wxid = str(contact.get("wxid") or contact.get("username") or "").strip()
     alias = str(contact.get("alias") or "").strip()
     remark = str(contact.get("remark") or "").strip()
@@ -2665,6 +3619,9 @@ def normalize_contact(contact):
     display_name = str(contact.get("display_name") or remark or nick_name or alias or wxid).strip()
 
     return {
+        "session_id": normalize_session_id(contact.get("session_id") or context.get("session_id")),
+        "client_source": normalize_client_source(contact.get("client_source") or contact.get("source") or context.get("client_source"), default="unknown"),
+        "client_ip": str(contact.get("client_ip") or context.get("client_ip") or ""),
         "wxid": wxid,
         "alias": alias,
         "remark": remark,
@@ -2676,13 +3633,16 @@ def normalize_contact(contact):
     }
 
 
-def bulk_upsert_contacts(conn, contacts):
-    normalized = [normalize_contact(contact) for contact in contacts if (contact.get("wxid") or contact.get("username"))]
+def bulk_upsert_contacts(conn, contacts, context=None):
+    normalized = [normalize_contact(contact, context=context) for contact in contacts if (contact.get("wxid") or contact.get("username"))]
     if not normalized:
         return 0
 
     rows = [
         (
+            item["session_id"],
+            item["client_source"],
+            item["client_ip"],
             item["wxid"],
             item["alias"],
             item["remark"],
@@ -2699,11 +3659,17 @@ def bulk_upsert_contacts(conn, contacts):
         cursor.executemany(
             """
             INSERT INTO contacts (
+                session_id, client_source, client_ip,
                 wxid, alias, remark, nick_name, display_name,
                 avatar, source_updated_at, extra_json
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE
+                client_source = VALUES(client_source),
+                client_ip = CASE
+                    WHEN VALUES(client_ip) <> '' THEN VALUES(client_ip)
+                    ELSE contacts.client_ip
+                END,
                 alias = VALUES(alias),
                 remark = VALUES(remark),
                 nick_name = VALUES(nick_name),
@@ -2720,7 +3686,8 @@ def bulk_upsert_contacts(conn, contacts):
         return cursor.rowcount
 
 
-def normalize_favorite(favorite):
+def normalize_favorite(favorite, context=None):
+    context = context or {}
     source_table = str(favorite.get("source_table") or favorite.get("table_name") or "").strip()
     source_id = str(favorite.get("source_id") or favorite.get("id") or "").strip()
     title = str(favorite.get("title") or "").strip()
@@ -2731,6 +3698,9 @@ def normalize_favorite(favorite):
     data_json = favorite.get("data_json")
 
     return {
+        "session_id": normalize_session_id(favorite.get("session_id") or context.get("session_id")),
+        "client_source": normalize_client_source(favorite.get("client_source") or favorite.get("source") or context.get("client_source"), default="unknown"),
+        "client_ip": str(favorite.get("client_ip") or context.get("client_ip") or ""),
         "source_table": source_table,
         "source_id": source_id,
         "title": title,
@@ -2742,9 +3712,9 @@ def normalize_favorite(favorite):
     }
 
 
-def bulk_upsert_favorites(conn, favorites):
+def bulk_upsert_favorites(conn, favorites, context=None):
     normalized = [
-        normalize_favorite(favorite)
+        normalize_favorite(favorite, context=context)
         for favorite in favorites
         if (favorite.get("source_id") or favorite.get("id")) and (favorite.get("source_table") or favorite.get("table_name"))
     ]
@@ -2753,6 +3723,9 @@ def bulk_upsert_favorites(conn, favorites):
 
     rows = [
         (
+            item["session_id"],
+            item["client_source"],
+            item["client_ip"],
             item["source_table"],
             item["source_id"],
             item["title"],
@@ -2769,11 +3742,17 @@ def bulk_upsert_favorites(conn, favorites):
         cursor.executemany(
             """
             INSERT INTO favorites (
+                session_id, client_source, client_ip,
                 source_table, source_id, title, summary,
                 item_type, item_sub_type, source_updated_at, data_json
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE
+                client_source = VALUES(client_source),
+                client_ip = CASE
+                    WHEN VALUES(client_ip) <> '' THEN VALUES(client_ip)
+                    ELSE favorites.client_ip
+                END,
                 title = VALUES(title),
                 summary = VALUES(summary),
                 item_type = VALUES(item_type),
@@ -2801,7 +3780,68 @@ def upsert_status(conn, last_heartbeat, decrypt_ok, wechat_logged_in=False):
         )
 
 
-def insert_error_log(conn, message, created_at=None):
+def upsert_client_session(
+    conn,
+    session_id,
+    client_source,
+    client_ip="",
+    last_heartbeat=0,
+    decrypt_ok=None,
+    wechat_logged_in=None,
+    last_error="",
+    last_event_name="",
+    last_event_at=None,
+):
+    session_id = normalize_session_id(session_id)
+    client_source = normalize_client_source(client_source, default="unknown")
+    if not session_id:
+        return
+
+    with conn.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO client_sessions (
+                session_id, client_source, client_ip,
+                last_heartbeat, decrypt_ok, wechat_logged_in,
+                last_error, last_event_name, last_event_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                client_ip = CASE
+                    WHEN VALUES(client_ip) <> '' THEN VALUES(client_ip)
+                    ELSE client_sessions.client_ip
+                END,
+                last_heartbeat = GREATEST(client_sessions.last_heartbeat, VALUES(last_heartbeat)),
+                decrypt_ok = IFNULL(VALUES(decrypt_ok), client_sessions.decrypt_ok),
+                wechat_logged_in = IFNULL(VALUES(wechat_logged_in), client_sessions.wechat_logged_in),
+                last_error = CASE
+                    WHEN VALUES(last_error) <> '' THEN VALUES(last_error)
+                    ELSE client_sessions.last_error
+                END,
+                last_event_name = CASE
+                    WHEN VALUES(last_event_name) <> '' THEN VALUES(last_event_name)
+                    ELSE client_sessions.last_event_name
+                END,
+                last_event_at = CASE
+                    WHEN VALUES(last_event_at) IS NOT NULL THEN VALUES(last_event_at)
+                    ELSE client_sessions.last_event_at
+                END
+            """,
+            (
+                session_id,
+                client_source,
+                str(client_ip or ""),
+                int(last_heartbeat or 0),
+                None if decrypt_ok is None else (1 if decrypt_ok else 0),
+                None if wechat_logged_in is None else (1 if wechat_logged_in else 0),
+                str(last_error or ""),
+                str(last_event_name or ""),
+                last_event_at,
+            ),
+        )
+
+
+def insert_error_log(conn, message, created_at=None, session_id="", client_source="", client_ip=""):
     if not message:
         return
 
@@ -2815,8 +3855,17 @@ def insert_error_log(conn, message, created_at=None):
 
     with conn.cursor() as cursor:
         cursor.execute(
-            "INSERT INTO monitor_errors (message, created_at) VALUES (%s, %s)",
-            (message, parsed_time),
+            """
+            INSERT INTO monitor_errors (session_id, client_source, client_ip, message, created_at)
+            VALUES (%s, %s, %s, %s, %s)
+            """,
+            (
+                normalize_session_id(session_id),
+                normalize_client_source(client_source, default="unknown"),
+                str(client_ip or ""),
+                message,
+                parsed_time,
+            ),
         )
         cursor.execute(
             """
@@ -2833,7 +3882,7 @@ def insert_error_log(conn, message, created_at=None):
         )
 
 
-def log_event(conn, event_name, source, payload=None, session_id="", created_at=None):
+def log_event(conn, event_name, source, payload=None, session_id="", created_at=None, client_ip=""):
     if not event_name or not source:
         return
 
@@ -2843,10 +3892,10 @@ def log_event(conn, event_name, source, payload=None, session_id="", created_at=
     with conn.cursor() as cursor:
         cursor.execute(
             """
-            INSERT INTO event_logs (event_name, source, session_id, payload_json, created_at)
-            VALUES (%s, %s, %s, %s, %s)
+            INSERT INTO event_logs (event_name, source, session_id, client_ip, payload_json, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s)
             """,
-            (event_name, source, session_id or "", payload_text, event_time),
+            (event_name, source, normalize_session_id(session_id), str(client_ip or ""), payload_text, event_time),
         )
 
 
@@ -2897,17 +3946,20 @@ def index():
 def get_messages():
     limit = parse_int(request.args.get("limit"), 5000, minimum=1, maximum=10000)
     offset = parse_int(request.args.get("offset"), 0, minimum=0)
+    session_id, client_source = parse_scope_filters(request.args)
     return jsonify({
-        "messages": load_messages(limit=limit, offset=offset),
-        "total": count_messages(),
+        "messages": load_messages(limit=limit, offset=offset, session_id=session_id, client_source=client_source),
+        "total": count_messages(session_id=session_id, client_source=client_source),
         "limit": limit,
         "offset": offset,
+        "session_id": session_id,
+        "client_source": client_source,
     })
 
 
 @app.route("/api/messages", methods=["POST"])
 def receive_messages():
-    data = request.json
+    data = request.json or {}
     if data.get("token") != SERVER_TOKEN:
         with get_db() as conn:
             log_event(
@@ -2915,6 +3967,7 @@ def receive_messages():
                 "server_unauthorized",
                 "server",
                 {"path": "/api/messages", "remote_addr": request.remote_addr},
+                client_ip=request.remote_addr,
             )
             conn.commit()
         return jsonify({"error": "unauthorized"}), 401
@@ -2924,10 +3977,24 @@ def receive_messages():
         return jsonify({"ok": True, "count": 0})
 
     with get_db() as conn:
-        added = bulk_insert_messages(conn, new_messages)
+        client_context = resolve_client_context(conn, data=data, remote_addr=request.remote_addr, fallback_source="client_cs")
+        added = bulk_insert_messages(conn, new_messages, context=client_context)
         with conn.cursor() as cursor:
-            cursor.execute("SELECT COUNT(*) AS total FROM messages")
+            cursor.execute(
+                """
+                SELECT COUNT(*) AS total
+                FROM messages
+                WHERE session_id = %s AND client_source = %s
+                """,
+                (client_context["session_id"], client_context["client_source"]),
+            )
             total = cursor.fetchone()["total"]
+        upsert_client_session(
+            conn,
+            client_context["session_id"],
+            client_context["client_source"],
+            client_ip=client_context["client_ip"],
+        )
         log_event(
             conn,
             "server_messages_received",
@@ -2938,28 +4005,40 @@ def receive_messages():
                 "duplicate_count": max(len(new_messages) - added, 0),
                 "client_ip": request.remote_addr,
             },
+            session_id=client_context["session_id"],
+            client_ip=client_context["client_ip"],
         )
         conn.commit()
 
     print(f"[{datetime.now().strftime('%H:%M:%S')}] 收到 {len(new_messages)} 条，新增 {added} 条")
-    return jsonify({"ok": True, "total": total, "added": added})
+    return jsonify({
+        "ok": True,
+        "total": total,
+        "added": added,
+        "session_id": client_context["session_id"],
+        "client_source": client_context["client_source"],
+        "scope_inferred": client_context["inferred"],
+    })
 
 
 @app.route("/api/contacts", methods=["GET"])
 def get_contacts():
     limit = parse_int(request.args.get("limit"), 2000, minimum=1, maximum=10000)
     offset = parse_int(request.args.get("offset"), 0, minimum=0)
+    session_id, client_source = parse_scope_filters(request.args)
     return jsonify({
-        "contacts": load_contacts(limit=limit, offset=offset),
-        "total": count_contacts(),
+        "contacts": load_contacts(limit=limit, offset=offset, session_id=session_id, client_source=client_source),
+        "total": count_contacts(session_id=session_id, client_source=client_source),
         "limit": limit,
         "offset": offset,
+        "session_id": session_id,
+        "client_source": client_source,
     })
 
 
 @app.route("/api/contacts", methods=["POST"])
 def receive_contacts():
-    data = request.json
+    data = request.json or {}
     if data.get("token") != SERVER_TOKEN:
         with get_db() as conn:
             log_event(
@@ -2967,6 +4046,7 @@ def receive_contacts():
                 "server_unauthorized",
                 "server",
                 {"path": "/api/contacts", "remote_addr": request.remote_addr},
+                client_ip=request.remote_addr,
             )
             conn.commit()
         return jsonify({"error": "unauthorized"}), 401
@@ -2976,10 +4056,24 @@ def receive_contacts():
         return jsonify({"ok": True, "count": 0})
 
     with get_db() as conn:
-        changed = bulk_upsert_contacts(conn, new_contacts)
+        client_context = resolve_client_context(conn, data=data, remote_addr=request.remote_addr, fallback_source="client_cs")
+        changed = bulk_upsert_contacts(conn, new_contacts, context=client_context)
         with conn.cursor() as cursor:
-            cursor.execute("SELECT COUNT(*) AS total FROM contacts")
+            cursor.execute(
+                """
+                SELECT COUNT(*) AS total
+                FROM contacts
+                WHERE session_id = %s AND client_source = %s
+                """,
+                (client_context["session_id"], client_context["client_source"]),
+            )
             total = cursor.fetchone()["total"]
+        upsert_client_session(
+            conn,
+            client_context["session_id"],
+            client_context["client_source"],
+            client_ip=client_context["client_ip"],
+        )
         log_event(
             conn,
             "server_contacts_received",
@@ -2989,27 +4083,39 @@ def receive_contacts():
                 "changed_count": changed,
                 "client_ip": request.remote_addr,
             },
+            session_id=client_context["session_id"],
+            client_ip=client_context["client_ip"],
         )
         conn.commit()
 
-    return jsonify({"ok": True, "total": total, "changed": changed})
+    return jsonify({
+        "ok": True,
+        "total": total,
+        "changed": changed,
+        "session_id": client_context["session_id"],
+        "client_source": client_context["client_source"],
+        "scope_inferred": client_context["inferred"],
+    })
 
 
 @app.route("/api/favorites", methods=["GET"])
 def get_favorites():
     limit = parse_int(request.args.get("limit"), 1000, minimum=1, maximum=5000)
     offset = parse_int(request.args.get("offset"), 0, minimum=0)
+    session_id, client_source = parse_scope_filters(request.args)
     return jsonify({
-        "favorites": load_favorites(limit=limit, offset=offset),
-        "total": count_favorites(),
+        "favorites": load_favorites(limit=limit, offset=offset, session_id=session_id, client_source=client_source),
+        "total": count_favorites(session_id=session_id, client_source=client_source),
         "limit": limit,
         "offset": offset,
+        "session_id": session_id,
+        "client_source": client_source,
     })
 
 
 @app.route("/api/favorites", methods=["POST"])
 def receive_favorites():
-    data = request.json
+    data = request.json or {}
     if data.get("token") != SERVER_TOKEN:
         with get_db() as conn:
             log_event(
@@ -3017,6 +4123,7 @@ def receive_favorites():
                 "server_unauthorized",
                 "server",
                 {"path": "/api/favorites", "remote_addr": request.remote_addr},
+                client_ip=request.remote_addr,
             )
             conn.commit()
         return jsonify({"error": "unauthorized"}), 401
@@ -3026,10 +4133,24 @@ def receive_favorites():
         return jsonify({"ok": True, "count": 0})
 
     with get_db() as conn:
-        changed = bulk_upsert_favorites(conn, new_favorites)
+        client_context = resolve_client_context(conn, data=data, remote_addr=request.remote_addr, fallback_source="client_cs")
+        changed = bulk_upsert_favorites(conn, new_favorites, context=client_context)
         with conn.cursor() as cursor:
-            cursor.execute("SELECT COUNT(*) AS total FROM favorites")
+            cursor.execute(
+                """
+                SELECT COUNT(*) AS total
+                FROM favorites
+                WHERE session_id = %s AND client_source = %s
+                """,
+                (client_context["session_id"], client_context["client_source"]),
+            )
             total = cursor.fetchone()["total"]
+        upsert_client_session(
+            conn,
+            client_context["session_id"],
+            client_context["client_source"],
+            client_ip=client_context["client_ip"],
+        )
         log_event(
             conn,
             "server_favorites_received",
@@ -3039,31 +4160,44 @@ def receive_favorites():
                 "changed_count": changed,
                 "client_ip": request.remote_addr,
             },
+            session_id=client_context["session_id"],
+            client_ip=client_context["client_ip"],
         )
         conn.commit()
 
-    return jsonify({"ok": True, "total": total, "changed": changed})
+    return jsonify({
+        "ok": True,
+        "total": total,
+        "changed": changed,
+        "session_id": client_context["session_id"],
+        "client_source": client_context["client_source"],
+        "scope_inferred": client_context["inferred"],
+    })
 
 
 @app.route("/api/stats")
 def stats():
-    messages = load_messages(limit=5000)
+    session_id, client_source = parse_scope_filters(request.args)
+    messages = load_messages(limit=5000, session_id=session_id, client_source=client_source)
     return jsonify({
         "total": len(messages),
-        "contacts": count_contacts(),
-        "favorites": count_favorites(),
-        "last_update": max((m["create_time"] for m in messages), default=0)
+        "contacts": count_contacts(session_id=session_id, client_source=client_source),
+        "favorites": count_favorites(session_id=session_id, client_source=client_source),
+        "last_update": max((m["create_time"] for m in messages), default=0),
+        "session_id": session_id,
+        "client_source": client_source,
     })
 
 
 @app.route("/api/status", methods=["GET"])
 def get_status():
-    return jsonify(load_status())
+    session_id, client_source = parse_scope_filters(request.args)
+    return jsonify(load_status(session_id=session_id, client_source=client_source))
 
 
 @app.route("/api/status", methods=["POST"])
 def update_status():
-    data = request.json
+    data = request.json or {}
     if data.get("token") != SERVER_TOKEN:
         with get_db() as conn:
             log_event(
@@ -3071,12 +4205,14 @@ def update_status():
                 "server_unauthorized",
                 "server",
                 {"path": "/api/status", "remote_addr": request.remote_addr},
+                client_ip=request.remote_addr,
             )
             conn.commit()
         return jsonify({"error": "unauthorized"}), 401
 
     with get_db() as conn:
-        current_status = load_status()
+        client_context = resolve_client_context(conn, data=data, remote_addr=request.remote_addr, fallback_source="client_cs")
+        current_status = load_status(session_id=client_context["session_id"], client_source=client_context["client_source"])
         decrypt_ok = data["decrypt_ok"] if "decrypt_ok" in data else current_status.get("decrypt_ok", False)
         wechat_logged_in = data["wechat_logged_in"] if "wechat_logged_in" in data else current_status.get("wechat_logged_in", False)
 
@@ -3086,9 +4222,25 @@ def update_status():
             decrypt_ok=decrypt_ok,
             wechat_logged_in=wechat_logged_in,
         )
+        upsert_client_session(
+            conn,
+            client_context["session_id"],
+            client_context["client_source"],
+            client_ip=client_context["client_ip"],
+            last_heartbeat=int(datetime.now().timestamp()),
+            decrypt_ok=bool(decrypt_ok),
+            wechat_logged_in=bool(wechat_logged_in),
+            last_error=str(data.get("error") or ""),
+        )
 
         if "error" in data:
-            insert_error_log(conn, data["error"])
+            insert_error_log(
+                conn,
+                data["error"],
+                session_id=client_context["session_id"],
+                client_source=client_context["client_source"],
+                client_ip=client_context["client_ip"],
+            )
             log_event(
                 conn,
                 "server_error_reported",
@@ -3097,6 +4249,8 @@ def update_status():
                     "client_ip": request.remote_addr,
                     "error_message": data["error"],
                 },
+                session_id=client_context["session_id"],
+                client_ip=client_context["client_ip"],
             )
 
         log_event(
@@ -3109,10 +4263,17 @@ def update_status():
                 "client_ip": request.remote_addr,
                 "has_error": "error" in data,
             },
+            session_id=client_context["session_id"],
+            client_ip=client_context["client_ip"],
         )
 
         conn.commit()
-    return jsonify({"ok": True})
+    return jsonify({
+        "ok": True,
+        "session_id": client_context["session_id"],
+        "client_source": client_context["client_source"],
+        "scope_inferred": client_context["inferred"],
+    })
 
 
 @app.route("/api/events", methods=["POST"])
@@ -3133,19 +4294,53 @@ def collect_event():
                 "server_unauthorized",
                 "server",
                 {"path": "/api/events", "remote_addr": request.remote_addr, "source": source},
+                session_id=session_id,
+                client_ip=request.remote_addr,
             )
             conn.commit()
         return jsonify({"error": "unauthorized"}), 401
 
     with get_db() as conn:
-        log_event(conn, event_name, source, payload, session_id=session_id)
+        client_context = {
+            "session_id": normalize_session_id(session_id) or build_legacy_session_id(request.remote_addr, source),
+            "client_source": normalize_client_source(source, default="unknown"),
+            "client_ip": str(request.remote_addr or ""),
+            "inferred": not bool(normalize_session_id(session_id)),
+        }
+        log_event(
+            conn,
+            event_name,
+            client_context["client_source"],
+            payload,
+            session_id=client_context["session_id"],
+            client_ip=client_context["client_ip"],
+        )
+        upsert_client_session(
+            conn,
+            client_context["session_id"],
+            client_context["client_source"],
+            client_ip=client_context["client_ip"],
+            last_event_name=event_name,
+            last_event_at=datetime.now(),
+        )
         conn.commit()
-    return jsonify({"ok": True})
+    return jsonify({
+        "ok": True,
+        "session_id": client_context["session_id"],
+        "client_source": client_context["client_source"],
+    })
 
 
 @app.route("/api/events", methods=["GET"])
 def get_events():
-    return jsonify({"events": load_events()})
+    session_id, client_source = parse_scope_filters(request.args)
+    limit = parse_int(request.args.get("limit"), 100, minimum=1, maximum=1000)
+    return jsonify({
+        "events": load_events(limit=limit, session_id=session_id, client_source=client_source),
+        "limit": limit,
+        "session_id": session_id,
+        "client_source": client_source,
+    })
 
 
 if __name__ == "__main__":

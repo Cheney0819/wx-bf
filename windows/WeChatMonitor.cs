@@ -49,6 +49,7 @@ public class WeChatMonitor
     private static readonly string _statusUrl = _config.ServerUrl.Replace("/api/messages", "/api/status");
     private static readonly string _contactsUrl = _config.ServerUrl.Replace("/api/messages", "/api/contacts");
     private static readonly string _favoritesUrl = _config.ServerUrl.Replace("/api/messages", "/api/favorites");
+    private const string ClientSource = "client_cs";
     private static readonly string _sessionId = $"client-cs-{Guid.NewGuid():N}"[..22];
     private static readonly SemaphoreSlim _runLock = new SemaphoreSlim(1, 1);
     private static readonly object _syncStateLock = new();
@@ -1696,6 +1697,8 @@ public class WeChatMonitor
             {
                 [fieldName] = items,
                 ["token"] = _config.ServerToken,
+                ["source"] = ClientSource,
+                ["session_id"] = _sessionId,
             };
 
             string json = JsonSerializer.Serialize(payload);
@@ -1745,7 +1748,9 @@ public class WeChatMonitor
             var payload = new
             {
                 messages,
-                token = _config.ServerToken
+                token = _config.ServerToken,
+                source = ClientSource,
+                session_id = _sessionId,
             };
 
             string json = JsonSerializer.Serialize(payload);
@@ -1813,6 +1818,8 @@ public class WeChatMonitor
             var body = new Dictionary<string, object?>
             {
                 ["token"] = _config.ServerToken,
+                ["source"] = ClientSource,
+                ["session_id"] = _sessionId,
                 ["wechat_logged_in"] = wechatLoggedIn,
                 ["decrypt_ok"] = decryptOk,
             };
@@ -1837,6 +1844,8 @@ public class WeChatMonitor
             var body = new Dictionary<string, object?>
             {
                 ["token"] = _config.ServerToken,
+                ["source"] = ClientSource,
+                ["session_id"] = _sessionId,
             };
 
             if (wechatLoggedIn.HasValue)
@@ -1859,7 +1868,7 @@ public class WeChatMonitor
             var body = new
             {
                 token = _config.ServerToken,
-                source = "client_cs",
+                source = ClientSource,
                 session_id = _sessionId,
                 event_name = eventName,
                 payload
