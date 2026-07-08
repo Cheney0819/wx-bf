@@ -287,7 +287,7 @@ def export_chatlog_json(
     contact_records = load_contact_records(decrypted_dir, log_fn=log_fn, event_fn=event_fn)
     contact_map = contact_records
     resource_md5_maps = load_resource_md5_map(decrypted_dir)
-    image_aes_key, image_xor_key = load_image_crypto_config(
+    image_aes_key, image_xor_key, image_key_map = load_image_crypto_config(
         source_data_dir,
         preferred_pid=preferred_pid,
         log_fn=log_fn,
@@ -295,6 +295,9 @@ def export_chatlog_json(
     )
     voice_context = build_voice_media_context(decrypted_dir, log_fn=log_fn)
     messages = []
+    readable_db_count = 0
+    readable_table_count = 0
+    skipped_db_errors = []
 
     message_dir = os.path.join(decrypted_dir, "message")
     if not os.path.isdir(message_dir):
@@ -311,95 +314,118 @@ def export_chatlog_json(
 
     try:
         for db_path in db_files:
-            with closing(sqlite3.connect(db_path)) as conn:
-                conn.row_factory = sqlite3.Row
-                sender_map = load_sender_map(conn)
-                hash_to_username = {
-                    hashlib.md5(username.encode()).hexdigest(): username
-                    for username in sender_map.values()
-                    if username
-                }
+            try:
+                with closing(sqlite3.connect(db_path)) as conn:
+                    conn.row_factory = sqlite3.Row
+                    sender_map = load_sender_map(conn)
+                    hash_to_username = {
+                        hashlib.md5(username.encode()).hexdigest(): username
+                        for username in sender_map.values()
+                        if username
+                    }
 
-                all_tables = [
-                    row[0]
-                    for row in conn.execute(
-                        "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'"
-                    )
-                ]
-
-                for table_name in all_tables:
-                    chat_username = hash_to_username.get(table_name[4:], f"unknown_{table_name[4:12]}")
-                    chat_display_name = display_name(contact_map, chat_username)
-                    is_group = chat_username.endswith("@chatroom") or chat_username.endswith("@openim")
-
-                    rows = conn.execute(
-                        f"SELECT local_id, local_type, create_time, real_sender_id, "
-                        f"message_content, WCDB_CT_message_content "
-                        f"FROM [{table_name}] ORDER BY create_time DESC LIMIT 1000"
-                    ).fetchall()
-
-                    for row in rows:
-                        local_id = int(row["local_id"] or 0)
-                        local_type = int(row["local_type"] or 0)
-                        create_time = int(row["create_time"] or 0)
-                        raw_content = row["message_content"]
-                        ct_flag = int(row["WCDB_CT_message_content"] or 0)
-                        content = get_content(raw_content, ct_flag)
-                        sender_username = sender_map.get(int(row["real_sender_id"] or 0), "")
-                        is_sender = not bool(sender_username)
-                        sender_name = "我" if is_sender else display_name(
-                            contact_map,
-                            sender_username if is_group else (sender_username or chat_username),
+                    all_tables = [
+                        row[0]
+                        for row in conn.execute(
+                            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'"
                         )
-                        media = None
-                        media_type = ""
-                        if local_type == 3:
-                            media_type = "image"
-                            media = try_load_image_media(
-                                source_data_dir=source_data_dir,
-                                chat_username=chat_username,
-                                local_id=local_id,
-                                create_time=create_time,
-                                resource_md5_maps=resource_md5_maps,
-                                image_aes_key=image_aes_key,
-                                image_xor_key=image_xor_key,
-                                log_fn=log_fn,
-                                event_fn=event_fn,
-                            )
-                        elif local_type == 34:
-                            media_type = "voice"
-                            media = try_load_voice_media(
-                                voice_context=voice_context,
-                                chat_username=chat_username,
-                                local_id=local_id,
-                                create_time=create_time,
-                                log_fn=log_fn,
-                                event_fn=event_fn,
-                            )
+                    ]
+                    readable_db_count += 1
 
-                        messages.append(
-                            {
-                                "wxid": chat_username,
-                                "content": friendly_content(local_type, content),
-                                "create_time": create_time,
-                                "is_sender": is_sender,
-                                "nickname": chat_display_name,
-                                "sender": sender_name,
-                                "avatar": (
-                                    contact_records.get(chat_username, {}).get("avatar", "")
-                                    if not is_sender
-                                    else ""
-                                ),
-                                "msg_type": local_type,
-                                "msg_sub_type": 0,
-                                "media_type": media_type,
-                                "media_mime": media["mime"] if media else "",
-                                "media_name": media["name"] if media else "",
-                                "media_data": media["data_b64"] if media else "",
-                            }
-                        )
+                    for table_name in all_tables:
+                        try:
+                            chat_username = hash_to_username.get(table_name[4:], f"unknown_{table_name[4:12]}")
+                            chat_display_name = display_name(contact_map, chat_username)
+                            is_group = chat_username.endswith("@chatroom") or chat_username.endswith("@openim")
+
+                            rows = conn.execute(
+                                f"SELECT local_id, local_type, create_time, real_sender_id, "
+                                f"message_content, WCDB_CT_message_content "
+                                f"FROM [{table_name}] ORDER BY create_time DESC LIMIT 1000"
+                            ).fetchall()
+                            readable_table_count += 1
+
+                            for row in rows:
+                                local_id = int(row["local_id"] or 0)
+                                local_type = int(row["local_type"] or 0)
+                                create_time = int(row["create_time"] or 0)
+                                raw_content = row["message_content"]
+                                ct_flag = int(row["WCDB_CT_message_content"] or 0)
+                                content = get_content(raw_content, ct_flag)
+                                sender_username = sender_map.get(int(row["real_sender_id"] or 0), "")
+                                is_sender = not bool(sender_username)
+                                sender_name = "我" if is_sender else display_name(
+                                    contact_map,
+                                    sender_username if is_group else (sender_username or chat_username),
+                                )
+                                media = None
+                                media_type = ""
+                                if local_type == 3:
+                                    media_type = "image"
+                                    media = try_load_image_media(
+                                        source_data_dir=source_data_dir,
+                                        chat_username=chat_username,
+                                        local_id=local_id,
+                                        create_time=create_time,
+                                        resource_md5_maps=resource_md5_maps,
+                                        image_aes_key=image_aes_key,
+                                        image_xor_key=image_xor_key,
+                                        image_key_map=image_key_map,
+                                        log_fn=log_fn,
+                                        event_fn=event_fn,
+                                    )
+                                elif local_type == 34:
+                                    media_type = "voice"
+                                    media = try_load_voice_media(
+                                        voice_context=voice_context,
+                                        chat_username=chat_username,
+                                        local_id=local_id,
+                                        create_time=create_time,
+                                        log_fn=log_fn,
+                                        event_fn=event_fn,
+                                    )
+
+                                messages.append(
+                                    {
+                                        "wxid": chat_username,
+                                        "content": friendly_content(local_type, content),
+                                        "create_time": create_time,
+                                        "is_sender": is_sender,
+                                        "nickname": chat_display_name,
+                                        "sender": sender_name,
+                                        "avatar": (
+                                            contact_records.get(chat_username, {}).get("avatar", "")
+                                            if not is_sender
+                                            else ""
+                                        ),
+                                        "msg_type": local_type,
+                                        "msg_sub_type": 0,
+                                        "media_type": media_type,
+                                        "media_mime": media["mime"] if media else "",
+                                        "media_name": media["name"] if media else "",
+                                        "media_data": media["data_b64"] if media else "",
+                                    }
+                                )
+                        except Exception as exc:
+                            skipped_db_errors.append(f"{os.path.basename(db_path)}::{table_name}: {exc}")
+                            if log_fn:
+                                log_fn(
+                                    f"[wechat-decrypt] 跳过损坏消息表: {os.path.basename(db_path)}::{table_name} ({exc})"
+                                )
+                            continue
+            except Exception as exc:
+                skipped_db_errors.append(f"{os.path.basename(db_path)}: {exc}")
+                if log_fn:
+                    log_fn(f"[wechat-decrypt] 跳过损坏消息库: {db_path} ({exc})")
+                continue
     finally:
         close_voice_media_context(voice_context)
+
+    if not messages and db_files and skipped_db_errors and readable_db_count == 0:
+        raise RuntimeError(skipped_db_errors[-1])
+
+    if not messages and db_files and skipped_db_errors and readable_table_count == 0:
+        raise RuntimeError(skipped_db_errors[-1])
 
     messages.sort(key=lambda item: item["create_time"])
     if len(messages) > max_messages:
@@ -914,6 +940,39 @@ def detect_v2_image_samples(source_data_dir: str):
     return samples
 
 
+def extract_image_sample_ciphertext(header: bytes):
+    if len(header) < 31 or header[:6] != V2_MAGIC_FULL:
+        return b""
+    return header[15:31]
+
+
+def collect_image_v2_patterns(v2_samples: list[tuple[str, bytes]], limit: int = 32):
+    patterns = {}
+    for index, (path, header) in enumerate(v2_samples[:256]):
+        ciphertext = extract_image_sample_ciphertext(header)
+        if not ciphertext:
+            continue
+
+        ct_hex = ciphertext.hex()
+        pattern = patterns.get(ct_hex)
+        if pattern is None:
+            pattern = {
+                "ct_hex": ct_hex,
+                "ciphertext": ciphertext,
+                "sample_path": path,
+                "count": 0,
+                "first_index": index,
+            }
+            patterns[ct_hex] = pattern
+        pattern["count"] += 1
+
+    ranked = sorted(
+        patterns.values(),
+        key=lambda item: (-int(item["count"]), int(item["first_index"])),
+    )
+    return ranked[:limit]
+
+
 def get_image_crypto_config_path():
     configured = (
         os.environ.get("WECHAT_IMAGE_CRYPTO_FILE")
@@ -946,8 +1005,76 @@ def load_saved_image_crypto_config():
     return {}
 
 
-def save_image_crypto_config(aes_key: str, xor_key: int, *, source: str = "", verified_sample: str = "", log_fn=None):
-    if not aes_key:
+def normalize_image_aes_key(aes_key):
+    text = str(aes_key or "").strip()
+    if not text:
+        return ""
+    normalized = text.encode("ascii", errors="ignore")[:16].decode("ascii", errors="ignore")
+    return normalized if len(normalized) == 16 else ""
+
+
+def normalize_image_key_map(raw_map):
+    normalized = {}
+    if not isinstance(raw_map, dict):
+        return normalized
+
+    for ct_hex, aes_key in raw_map.items():
+        ct = str(ct_hex or "").strip().lower()
+        if len(ct) != 32 or not all(char in "0123456789abcdef" for char in ct):
+            continue
+        key = normalize_image_aes_key(aes_key)
+        if key:
+            normalized[ct] = key
+    return normalized
+
+
+def merge_image_key_maps(*maps):
+    merged = {}
+    for raw_map in maps:
+        for ct_hex, aes_key in normalize_image_key_map(raw_map).items():
+            merged[ct_hex] = aes_key
+    return merged
+
+
+def solve_image_patterns_with_key(patterns, aes_key: str):
+    normalized_key = normalize_image_aes_key(aes_key)
+    if not normalized_key:
+        return {}
+
+    solved = {}
+    key_bytes = normalized_key.encode("ascii", errors="ignore")
+    for pattern in patterns:
+        fmt = try_image_aes_key(key_bytes, pattern["ciphertext"])
+        if fmt:
+            solved[pattern["ct_hex"]] = normalized_key
+    return solved
+
+
+def pick_primary_image_aes_key(patterns, image_key_map, fallback_key: str = ""):
+    normalized_map = normalize_image_key_map(image_key_map)
+    for pattern in patterns:
+        matched = normalized_map.get(pattern["ct_hex"])
+        if matched:
+            return matched
+
+    normalized_fallback = normalize_image_aes_key(fallback_key)
+    if normalized_fallback:
+        return normalized_fallback
+    return next(iter(normalized_map.values()), "")
+
+
+def save_image_crypto_config(
+    aes_key: str,
+    xor_key: int,
+    image_key_map=None,
+    *,
+    source: str = "",
+    verified_sample: str = "",
+    log_fn=None,
+):
+    normalized_map = normalize_image_key_map(image_key_map or {})
+    primary_key = pick_primary_image_aes_key([], normalized_map, fallback_key=aes_key)
+    if not primary_key and not normalized_map:
         return ""
 
     config_path = get_image_crypto_config_path()
@@ -955,11 +1082,15 @@ def save_image_crypto_config(aes_key: str, xor_key: int, *, source: str = "", ve
         return ""
 
     payload = {
-        "image_aes_key": aes_key,
+        "image_aes_key": primary_key,
         "image_xor_key": int(xor_key),
+        "image_keys": normalized_map,
+        "image_key_count": len(normalized_map),
         "updated_at": int(time.time()),
         "source": source,
     }
+    if normalized_map:
+        payload["primary_ct_hex"] = next(iter(normalized_map.keys()))
     if verified_sample:
         payload["verified_sample"] = verified_sample
 
@@ -979,26 +1110,72 @@ def save_image_crypto_config(aes_key: str, xor_key: int, *, source: str = "", ve
 
 
 def verify_image_aes_key(aes_key: str, ciphertext: bytes):
-    if not aes_key or not ciphertext:
+    normalized_key = normalize_image_aes_key(aes_key)
+    if not normalized_key or not ciphertext:
         return ""
-    return try_image_aes_key(aes_key.encode("ascii", errors="ignore")[:16], ciphertext)
+    return try_image_aes_key(normalized_key.encode("ascii", errors="ignore"), ciphertext)
 
 
-def verify_image_crypto_with_samples(v2_samples: list[tuple[str, bytes]], aes_key: str, xor_key: int):
-    if not aes_key:
-        return False, "", "", 0
+def resolve_image_aes_key_for_ciphertext(ciphertext: bytes, image_aes_key: str = "", image_key_map=None):
+    normalized_map = normalize_image_key_map(image_key_map or {})
+    ct_hex = ciphertext.hex().lower() if ciphertext else ""
+    if ct_hex and ct_hex in normalized_map:
+        return normalized_map[ct_hex], ct_hex
+    return normalize_image_aes_key(image_aes_key), ct_hex
 
-    for path, header in v2_samples[:8]:
-        if len(header) >= 31:
-            ciphertext = header[15:31]
-            if not verify_image_aes_key(aes_key, ciphertext):
+
+def verify_image_crypto_with_samples(
+    v2_samples: list[tuple[str, bytes]],
+    patterns,
+    image_aes_key: str,
+    image_key_map,
+    xor_key: int,
+):
+    normalized_map = merge_image_key_maps(image_key_map, solve_image_patterns_with_key(patterns, image_aes_key))
+    verified_sample = ""
+    verified_mime = ""
+    verified_size = 0
+    verified_count = 0
+    solved_patterns = set()
+
+    for path, header in v2_samples[:16]:
+        ciphertext = extract_image_sample_ciphertext(header)
+        if ciphertext:
+            aes_key, ct_hex = resolve_image_aes_key_for_ciphertext(
+                ciphertext,
+                image_aes_key=image_aes_key,
+                image_key_map=normalized_map,
+            )
+            if not aes_key or not verify_image_aes_key(aes_key, ciphertext):
                 continue
+            if ct_hex:
+                solved_patterns.add(ct_hex)
 
-        media = decode_image_dat_file(path, image_aes_key=aes_key, image_xor_key=xor_key)
-        if media:
-            return True, path, media.get("mime", ""), int(media.get("size", 0) or 0)
+        media = decode_image_dat_file(
+            path,
+            image_aes_key=image_aes_key,
+            image_xor_key=xor_key,
+            image_key_map=normalized_map,
+        )
+        if not media:
+            continue
 
-    return False, "", "", 0
+        verified_count += 1
+        if not verified_sample:
+            verified_sample = path
+            verified_mime = media.get("mime", "")
+            verified_size = int(media.get("size", 0) or 0)
+
+    return {
+        "success": verified_count > 0,
+        "verified_sample": verified_sample,
+        "verified_mime": verified_mime,
+        "verified_size": verified_size,
+        "verified_count": verified_count,
+        "solved_pattern_count": len(solved_patterns),
+        "total_pattern_count": len(patterns),
+        "image_key_map": normalized_map,
+    }
 
 
 def derive_image_xor_key(v2_samples: list[tuple[str, bytes]]):
@@ -1035,7 +1212,58 @@ def try_image_aes_key(key_bytes: bytes, ciphertext: bytes):
     return fmt if fmt != "bin" else ""
 
 
-def scan_memory_for_image_aes_key(ciphertext: bytes, preferred_pid: int = 0, log_fn=None):
+def iter_image_key_candidates(data: bytes):
+    seen = set()
+    for match in _IMAGE_KEY32_RE.finditer(data):
+        candidate = match.group()[:16]
+        if len(candidate) != 16 or candidate in seen:
+            continue
+        seen.add(candidate)
+        yield candidate
+
+    for match in _IMAGE_KEY16_RE.finditer(data):
+        candidate = match.group()
+        if len(candidate) != 16 or candidate in seen:
+            continue
+        seen.add(candidate)
+        yield candidate
+
+
+def scan_data_for_image_aes_keys(data: bytes, pending_patterns):
+    found = {}
+    remaining = list(pending_patterns.values())
+    if not remaining:
+        return found
+
+    for candidate in iter_image_key_candidates(data):
+        key_text = normalize_image_aes_key(candidate.decode("ascii", errors="ignore"))
+        if not key_text:
+            continue
+
+        still_pending = []
+        for pattern in remaining:
+            fmt = try_image_aes_key(candidate, pattern["ciphertext"])
+            if fmt:
+                found[pattern["ct_hex"]] = {
+                    "aes_key": key_text,
+                    "fmt": fmt,
+                }
+            else:
+                still_pending.append(pattern)
+
+        remaining = still_pending
+        if not remaining:
+            break
+
+    return found
+
+
+def scan_memory_for_image_aes_keys(patterns, preferred_pid: int = 0, log_fn=None):
+    pending_patterns = {pattern["ct_hex"]: pattern for pattern in patterns}
+    found_keys = {}
+    if not pending_patterns:
+        return found_keys
+
     pids = get_wechat_pids(preferred_pid)
 
     for pid, mem_kb, process_name in pids:
@@ -1054,49 +1282,37 @@ def scan_memory_for_image_aes_key(ciphertext: bytes, preferred_pid: int = 0, log
                 if not data:
                     continue
 
-                for match in _IMAGE_KEY32_RE.finditer(data):
-                    candidate = match.group()
-                    fmt = try_image_aes_key(candidate[:16], ciphertext)
-                    if fmt:
-                        key = candidate[:16].decode("ascii", errors="ignore")
+                matched = scan_data_for_image_aes_keys(data, pending_patterns)
+                if matched:
+                    for ct_hex, info in matched.items():
+                        found_keys[ct_hex] = info["aes_key"]
+                        pending_patterns.pop(ct_hex, None)
                         if log_fn:
                             log_fn(
                                 f"[wechat-decrypt] 命中图片 AES key pid={pid} ({process_name}) "
-                                f"fmt={fmt} len=16"
+                                f"fmt={info['fmt']} len=16 ct={ct_hex[:8]}..."
                             )
-                        return key
-
-                    fmt = try_image_aes_key(candidate, ciphertext)
-                    if fmt:
-                        key = candidate.decode("ascii", errors="ignore")
-                        if log_fn:
-                            log_fn(
-                                f"[wechat-decrypt] 命中图片 AES key pid={pid} ({process_name}) "
-                                f"fmt={fmt} len=32"
-                            )
-                        return key
-
-                for match in _IMAGE_KEY16_RE.finditer(data):
-                    candidate = match.group()
-                    fmt = try_image_aes_key(candidate, ciphertext)
-                    if fmt:
-                        key = candidate.decode("ascii", errors="ignore")
-                        if log_fn:
-                            log_fn(
-                                f"[wechat-decrypt] 命中图片 AES key pid={pid} ({process_name}) "
-                                f"fmt={fmt} len=16"
-                            )
-                        return key
+                    if not pending_patterns:
+                        return found_keys
 
                 if log_fn and (reg_idx + 1) % 200 == 0 and total_bytes > 0:
                     progress = scanned_bytes / total_bytes * 100
                     log_fn(
-                        f"[wechat-decrypt] 扫描图片 key PID={pid} 进度 {progress:.1f}%"
+                        f"[wechat-decrypt] 扫描图片 key PID={pid} 进度 {progress:.1f}% "
+                        f"(已命中 {len(found_keys)}/{len(found_keys) + len(pending_patterns)})"
                     )
         finally:
             kernel32.CloseHandle(handle)
 
-    return ""
+    return found_keys
+
+
+def scan_memory_for_image_aes_key(ciphertext: bytes, preferred_pid: int = 0, log_fn=None):
+    if not ciphertext:
+        return ""
+    patterns = [{"ct_hex": ciphertext.hex(), "ciphertext": ciphertext, "sample_path": "", "count": 1}]
+    found = scan_memory_for_image_aes_keys(patterns, preferred_pid=preferred_pid, log_fn=log_fn)
+    return found.get(ciphertext.hex(), "")
 
 
 def enum_rw_regions(handle):
@@ -1129,36 +1345,52 @@ def enum_readable_non_rw_regions(handle, rw_regions=None):
     ]
 
 
-def scan_regions_for_image_aes_key(handle, regions, ciphertext: bytes):
+def scan_regions_for_image_aes_keys(handle, regions, pending_patterns):
+    found_keys = {}
     for base, size in regions:
         data = read_mem(handle, base, size)
         if not data or len(data) < 16:
             continue
 
-        for match in _IMAGE_KEY32_RE.finditer(data):
-            candidate = match.group()
-            fmt = try_image_aes_key(candidate[:16], ciphertext)
-            if fmt:
-                return candidate[:16].decode("ascii", errors="ignore"), fmt
+        matched = scan_data_for_image_aes_keys(data, pending_patterns)
+        if matched:
+            for ct_hex, info in matched.items():
+                found_keys[ct_hex] = info
+                pending_patterns.pop(ct_hex, None)
+            if not pending_patterns:
+                break
 
-            fmt = try_image_aes_key(candidate, ciphertext)
-            if fmt:
-                return candidate.decode("ascii", errors="ignore"), fmt
-
-        for match in _IMAGE_KEY16_RE.finditer(data):
-            candidate = match.group()
-            fmt = try_image_aes_key(candidate, ciphertext)
-            if fmt:
-                return candidate.decode("ascii", errors="ignore"), fmt
-
-    return "", ""
+    return found_keys
 
 
-def quick_scan_memory_for_image_aes_key(ciphertext: bytes, preferred_pid: int = 0, log_fn=None):
+def scan_regions_for_image_aes_key(handle, regions, ciphertext: bytes):
+    if not ciphertext:
+        return "", ""
+    pending_patterns = {
+        ciphertext.hex(): {
+            "ct_hex": ciphertext.hex(),
+            "ciphertext": ciphertext,
+            "sample_path": "",
+            "count": 1,
+        }
+    }
+    matched = scan_regions_for_image_aes_keys(handle, regions, pending_patterns)
+    info = matched.get(ciphertext.hex())
+    if not info:
+        return "", ""
+    return info["aes_key"], info["fmt"]
+
+
+def quick_scan_memory_for_image_aes_keys(patterns, preferred_pid: int = 0, log_fn=None):
+    pending_patterns = {pattern["ct_hex"]: pattern for pattern in patterns}
+    found_keys = {}
+    if not pending_patterns:
+        return found_keys
+
     try:
         pids = get_wechat_pids(preferred_pid)
     except Exception:
-        return ""
+        return found_keys
 
     for pid, mem_kb, process_name in pids:
         handle = kernel32.OpenProcess(0x0010 | 0x0400, False, pid)
@@ -1167,28 +1399,75 @@ def quick_scan_memory_for_image_aes_key(ciphertext: bytes, preferred_pid: int = 
 
         try:
             rw_regions = enum_rw_regions(handle)
-            key, fmt = scan_regions_for_image_aes_key(handle, rw_regions, ciphertext)
-            if key:
-                if log_fn:
-                    log_fn(
-                        f"[wechat-decrypt] 监控命中图片 AES key pid={pid} ({process_name}) "
-                        f"fmt={fmt} rw_regions={len(rw_regions)} phase=rw"
-                    )
-                return key
+            matched = scan_regions_for_image_aes_keys(handle, rw_regions, pending_patterns)
+            if matched:
+                for ct_hex, info in matched.items():
+                    found_keys[ct_hex] = info["aes_key"]
+                    if log_fn:
+                        log_fn(
+                            f"[wechat-decrypt] 监控命中图片 AES key pid={pid} ({process_name}) "
+                            f"fmt={info['fmt']} rw_regions={len(rw_regions)} phase=rw ct={ct_hex[:8]}..."
+                        )
+                if not pending_patterns:
+                    return found_keys
 
             readable_non_rw_regions = enum_readable_non_rw_regions(handle, rw_regions=rw_regions)
-            key, fmt = scan_regions_for_image_aes_key(handle, readable_non_rw_regions, ciphertext)
-            if key:
-                if log_fn:
-                    log_fn(
-                        f"[wechat-decrypt] 监控命中图片 AES key pid={pid} ({process_name}) "
-                        f"fmt={fmt} rw_regions={len(rw_regions)} readable_non_rw_regions={len(readable_non_rw_regions)} phase=readable"
-                    )
-                return key
+            matched = scan_regions_for_image_aes_keys(handle, readable_non_rw_regions, pending_patterns)
+            if matched:
+                for ct_hex, info in matched.items():
+                    found_keys[ct_hex] = info["aes_key"]
+                    if log_fn:
+                        log_fn(
+                            f"[wechat-decrypt] 监控命中图片 AES key pid={pid} ({process_name}) "
+                            f"fmt={info['fmt']} rw_regions={len(rw_regions)} readable_non_rw_regions={len(readable_non_rw_regions)} "
+                            f"phase=readable ct={ct_hex[:8]}..."
+                        )
+                if not pending_patterns:
+                    return found_keys
         finally:
             kernel32.CloseHandle(handle)
 
-    return ""
+    return found_keys
+
+
+def quick_scan_memory_for_image_aes_key(ciphertext: bytes, preferred_pid: int = 0, log_fn=None):
+    if not ciphertext:
+        return ""
+    patterns = [{"ct_hex": ciphertext.hex(), "ciphertext": ciphertext, "sample_path": "", "count": 1}]
+    found = quick_scan_memory_for_image_aes_keys(patterns, preferred_pid=preferred_pid, log_fn=log_fn)
+    return found.get(ciphertext.hex(), "")
+
+
+def monitor_image_aes_keys(
+    patterns,
+    preferred_pid: int = 0,
+    timeout_seconds: int = IMAGE_KEY_MONITOR_TIMEOUT_SECONDS,
+    scan_interval_seconds: float = IMAGE_KEY_MONITOR_SCAN_INTERVAL_SECONDS,
+    log_fn=None,
+):
+    if not patterns or timeout_seconds <= 0:
+        return {}, 0, 0.0
+
+    started_at = time.time()
+    attempt_count = 0
+    found_keys = {}
+    pending_patterns = {pattern["ct_hex"]: pattern for pattern in patterns}
+    while (time.time() - started_at) < timeout_seconds:
+        attempt_count += 1
+        matched = quick_scan_memory_for_image_aes_keys(
+            list(pending_patterns.values()),
+            preferred_pid=preferred_pid,
+            log_fn=log_fn,
+        )
+        if matched:
+            found_keys.update(matched)
+            for ct_hex in matched:
+                pending_patterns.pop(ct_hex, None)
+            if not pending_patterns:
+                return found_keys, attempt_count, round(time.time() - started_at, 3)
+        time.sleep(scan_interval_seconds)
+
+    return found_keys, attempt_count, round(time.time() - started_at, 3)
 
 
 def monitor_image_aes_key(
@@ -1198,45 +1477,42 @@ def monitor_image_aes_key(
     scan_interval_seconds: float = IMAGE_KEY_MONITOR_SCAN_INTERVAL_SECONDS,
     log_fn=None,
 ):
-    if not ciphertext or timeout_seconds <= 0:
+    if not ciphertext:
         return "", 0, 0.0
-
-    started_at = time.time()
-    attempt_count = 0
-    while (time.time() - started_at) < timeout_seconds:
-        attempt_count += 1
-        key = quick_scan_memory_for_image_aes_key(
-            ciphertext,
-            preferred_pid=preferred_pid,
-            log_fn=log_fn,
-        )
-        if key:
-            return key, attempt_count, round(time.time() - started_at, 3)
-        time.sleep(scan_interval_seconds)
-
-    return "", attempt_count, round(time.time() - started_at, 3)
+    patterns = [{"ct_hex": ciphertext.hex(), "ciphertext": ciphertext, "sample_path": "", "count": 1}]
+    found, attempt_count, elapsed = monitor_image_aes_keys(
+        patterns,
+        preferred_pid=preferred_pid,
+        timeout_seconds=timeout_seconds,
+        scan_interval_seconds=scan_interval_seconds,
+        log_fn=log_fn,
+    )
+    return found.get(ciphertext.hex(), ""), attempt_count, elapsed
 
 
 def discover_image_crypto(source_data_dir: str, preferred_pid: int = 0, log_fn=None):
     v2_samples = detect_v2_image_samples(source_data_dir)
-    if not v2_samples:
-        return "", 0x88
+    patterns = collect_image_v2_patterns(v2_samples)
+    if not patterns:
+        return "", 0x88, {}
 
     xor_key = derive_image_xor_key(v2_samples)
-    ciphertext = v2_samples[0][1][15:31]
-    aes_key = scan_memory_for_image_aes_key(ciphertext, preferred_pid=preferred_pid, log_fn=log_fn)
+    image_key_map = scan_memory_for_image_aes_keys(patterns, preferred_pid=preferred_pid, log_fn=log_fn)
+    aes_key = pick_primary_image_aes_key(patterns, image_key_map)
 
     if log_fn:
-        if aes_key:
-            log_fn(f"[wechat-decrypt] 图片密钥已就绪，xor=0x{xor_key:02x}")
+        if image_key_map:
+            log_fn(
+                f"[wechat-decrypt] 图片密钥已就绪，xor=0x{xor_key:02x} patterns={len(image_key_map)}"
+            )
         else:
             log_fn("[wechat-decrypt] 未找到图片 AES key，V2 图片将无法解密")
 
-    return aes_key, xor_key
+    return aes_key, xor_key, image_key_map
 
 
 def load_image_crypto_config(source_data_dir: str = "", preferred_pid: int = 0, log_fn=None, event_fn=None):
-    aes_key = (os.environ.get("WECHAT_IMAGE_AES_KEY") or "").strip()
+    env_aes_key = normalize_image_aes_key(os.environ.get("WECHAT_IMAGE_AES_KEY") or "")
     xor_raw = (os.environ.get("WECHAT_IMAGE_XOR_KEY") or "0x88").strip()
     try:
         xor_key = int(xor_raw, 0)
@@ -1244,8 +1520,8 @@ def load_image_crypto_config(source_data_dir: str = "", preferred_pid: int = 0, 
         xor_key = 0x88
 
     v2_samples = detect_v2_image_samples(source_data_dir) if source_data_dir else []
-    sample_path = v2_samples[0][0] if v2_samples else ""
-    sample_ciphertext = v2_samples[0][1][15:31] if v2_samples and len(v2_samples[0][1]) >= 31 else b""
+    patterns = collect_image_v2_patterns(v2_samples)
+    sample_path = patterns[0]["sample_path"] if patterns else (v2_samples[0][0] if v2_samples else "")
     if v2_samples:
         xor_key = derive_image_xor_key(v2_samples)
 
@@ -1253,33 +1529,47 @@ def load_image_crypto_config(source_data_dir: str = "", preferred_pid: int = 0, 
     cache_valid = False
     cache_path = ""
     selected_source = ""
+    image_key_map = {}
+    primary_key = ""
 
-    if aes_key:
-        verified, verified_sample, _, verified_size = verify_image_crypto_with_samples(v2_samples, aes_key, xor_key)
-        if verified or not v2_samples:
+    if env_aes_key:
+        env_verify = verify_image_crypto_with_samples(v2_samples, patterns, env_aes_key, {}, xor_key)
+        image_key_map = env_verify["image_key_map"]
+        primary_key = pick_primary_image_aes_key(patterns, image_key_map, fallback_key=env_aes_key)
+        if env_verify["success"] or not patterns:
             emit_media_event(
                 event_fn,
                 "client_image_key_result",
                 {
                     "success": True,
                     "source": "environment",
-                    "verified": verified or not v2_samples,
+                    "verified": env_verify["success"] or not patterns,
                     "v2_sample_count": len(v2_samples),
+                    "v2_pattern_count": len(patterns),
                     "sample_file": sample_path,
-                    "verified_sample": verified_sample,
-                    "verified_size": verified_size,
-                    "aes_key_length": len(aes_key),
+                    "verified_sample": env_verify["verified_sample"],
+                    "verified_size": env_verify["verified_size"],
+                    "verified_count": env_verify["verified_count"],
+                    "aes_key_length": len(primary_key),
                     "image_xor_key": xor_key,
+                    "image_key_count": len(image_key_map),
+                    "solved_pattern_count": env_verify["solved_pattern_count"],
                 },
             )
-            return aes_key, xor_key
+            if not patterns or len(image_key_map) >= len(patterns):
+                return primary_key, xor_key, image_key_map
+            if log_fn:
+                log_fn(
+                    f"[wechat-decrypt] 环境变量图片 key 只覆盖了 {len(image_key_map)}/{len(patterns)} 个 pattern，继续补扫"
+                )
 
         if log_fn:
             log_fn("[wechat-decrypt] 环境变量里的图片 AES key 校验失败，准备重新扫描")
 
     saved = load_saved_image_crypto_config()
-    saved_aes_key = str(saved.get("image_aes_key") or "").strip()
-    if saved_aes_key:
+    saved_aes_key = normalize_image_aes_key(saved.get("image_aes_key") or "")
+    saved_key_map = normalize_image_key_map(saved.get("image_keys") or {})
+    if saved_aes_key or saved_key_map:
         cache_checked = True
         cache_path = str(saved.get("_config_path") or "")
         saved_xor = saved.get("image_xor_key")
@@ -1289,50 +1579,67 @@ def load_image_crypto_config(source_data_dir: str = "", preferred_pid: int = 0, 
             except Exception:
                 pass
 
-        cache_valid, verified_sample, _, verified_size = verify_image_crypto_with_samples(
+        cache_verify = verify_image_crypto_with_samples(
             v2_samples,
+            patterns,
             saved_aes_key,
+            saved_key_map,
             xor_key,
         )
-        if cache_valid or not v2_samples:
+        cache_valid = cache_verify["success"] or not patterns
+        image_key_map = cache_verify["image_key_map"]
+        primary_key = pick_primary_image_aes_key(patterns, image_key_map, fallback_key=saved_aes_key)
+        if cache_valid:
             emit_media_event(
                 event_fn,
                 "client_image_key_result",
                 {
                     "success": True,
                     "source": "local_cache",
-                    "verified": cache_valid or not v2_samples,
+                    "verified": True,
                     "cache_checked": True,
-                    "cache_valid": cache_valid or not v2_samples,
+                    "cache_valid": True,
                     "cache_path": cache_path,
                     "v2_sample_count": len(v2_samples),
+                    "v2_pattern_count": len(patterns),
                     "sample_file": sample_path,
-                    "verified_sample": verified_sample,
-                    "verified_size": verified_size,
-                    "aes_key_length": len(saved_aes_key),
+                    "verified_sample": cache_verify["verified_sample"],
+                    "verified_size": cache_verify["verified_size"],
+                    "verified_count": cache_verify["verified_count"],
+                    "aes_key_length": len(primary_key),
                     "image_xor_key": xor_key,
+                    "image_key_count": len(image_key_map),
+                    "solved_pattern_count": cache_verify["solved_pattern_count"],
                 },
             )
-            return saved_aes_key, xor_key
+            if not patterns or len(image_key_map) >= len(patterns):
+                return primary_key, xor_key, image_key_map
+            if log_fn:
+                log_fn(
+                    f"[wechat-decrypt] 图片缓存只覆盖了 {len(image_key_map)}/{len(patterns)} 个 pattern，继续补扫"
+                )
 
-        if log_fn:
+        if log_fn and not cache_valid:
             log_fn("[wechat-decrypt] 本地缓存的图片 AES key 校验失败，准备重新扫描")
 
-    if source_data_dir and v2_samples:
+    if source_data_dir and patterns:
+        pending_patterns = [pattern for pattern in patterns if pattern["ct_hex"] not in image_key_map]
         try:
-            discovered_key = scan_memory_for_image_aes_key(
-                sample_ciphertext,
+            discovered_key_map = scan_memory_for_image_aes_keys(
+                pending_patterns,
                 preferred_pid=preferred_pid,
                 log_fn=log_fn,
             )
         except Exception as exc:
-            discovered_key = ""
+            discovered_key_map = {}
             if log_fn:
                 log_fn(f"[wechat-decrypt] 一次性扫描图片 AES key 失败: {exc}")
         selected_source = "memory_scan"
         monitor_attempts = 0
         monitor_elapsed = 0.0
-        if not discovered_key:
+        image_key_map = merge_image_key_maps(image_key_map, discovered_key_map)
+
+        if len(image_key_map) < len(patterns):
             emit_media_event(
                 event_fn,
                 "client_image_key_monitor_started",
@@ -1340,32 +1647,39 @@ def load_image_crypto_config(source_data_dir: str = "", preferred_pid: int = 0, 
                     "timeout_seconds": IMAGE_KEY_MONITOR_TIMEOUT_SECONDS,
                     "scan_interval_seconds": IMAGE_KEY_MONITOR_SCAN_INTERVAL_SECONDS,
                     "v2_sample_count": len(v2_samples),
+                    "v2_pattern_count": len(patterns),
+                    "pending_pattern_count": max(len(patterns) - len(image_key_map), 0),
                     "sample_file": sample_path,
                 },
             )
-            discovered_key, monitor_attempts, monitor_elapsed = monitor_image_aes_key(
-                sample_ciphertext,
+            monitored_key_map, monitor_attempts, monitor_elapsed = monitor_image_aes_keys(
+                [pattern for pattern in patterns if pattern["ct_hex"] not in image_key_map],
                 preferred_pid=preferred_pid,
                 timeout_seconds=IMAGE_KEY_MONITOR_TIMEOUT_SECONDS,
                 scan_interval_seconds=IMAGE_KEY_MONITOR_SCAN_INTERVAL_SECONDS,
                 log_fn=log_fn,
             )
-            if discovered_key:
+            image_key_map = merge_image_key_maps(image_key_map, monitored_key_map)
+            if monitored_key_map:
                 selected_source = "monitor_scan"
 
-        if discovered_key:
-            verified, verified_sample, _, verified_size = verify_image_crypto_with_samples(
+        primary_key = pick_primary_image_aes_key(patterns, image_key_map, fallback_key=saved_aes_key or env_aes_key)
+        if primary_key or image_key_map:
+            verify_result = verify_image_crypto_with_samples(
                 v2_samples,
-                discovered_key,
+                patterns,
+                primary_key,
+                image_key_map,
                 xor_key,
             )
             saved_path = ""
-            if verified:
+            if verify_result["success"]:
                 saved_path = save_image_crypto_config(
-                    discovered_key,
+                    primary_key,
                     xor_key,
+                    image_key_map,
                     source=selected_source,
-                    verified_sample=verified_sample,
+                    verified_sample=verify_result["verified_sample"],
                     log_fn=log_fn,
                 )
 
@@ -1375,22 +1689,27 @@ def load_image_crypto_config(source_data_dir: str = "", preferred_pid: int = 0, 
                 {
                     "success": True,
                     "source": selected_source,
-                    "verified": verified,
+                    "verified": verify_result["success"],
                     "cache_checked": cache_checked,
                     "cache_valid": cache_valid,
                     "cache_path": cache_path,
                     "saved_path": saved_path,
                     "v2_sample_count": len(v2_samples),
+                    "v2_pattern_count": len(patterns),
                     "sample_file": sample_path,
-                    "verified_sample": verified_sample,
-                    "verified_size": verified_size,
-                    "aes_key_length": len(discovered_key),
+                    "verified_sample": verify_result["verified_sample"],
+                    "verified_size": verify_result["verified_size"],
+                    "verified_count": verify_result["verified_count"],
+                    "aes_key_length": len(primary_key),
                     "image_xor_key": xor_key,
+                    "image_key_count": len(image_key_map),
+                    "solved_pattern_count": verify_result["solved_pattern_count"],
+                    "pending_pattern_count": max(len(patterns) - len(image_key_map), 0),
                     "monitor_attempt_count": monitor_attempts,
                     "monitor_elapsed_seconds": monitor_elapsed,
                 },
             )
-            return discovered_key, xor_key
+            return primary_key, xor_key, image_key_map
 
         emit_media_event(
             event_fn,
@@ -1403,13 +1722,16 @@ def load_image_crypto_config(source_data_dir: str = "", preferred_pid: int = 0, 
                 "cache_valid": cache_valid,
                 "cache_path": cache_path,
                 "v2_sample_count": len(v2_samples),
+                "v2_pattern_count": len(patterns),
                 "sample_file": sample_path,
                 "image_xor_key": xor_key,
+                "image_key_count": len(image_key_map),
+                "pending_pattern_count": max(len(patterns) - len(image_key_map), 0),
                 "monitor_attempt_count": monitor_attempts,
                 "monitor_elapsed_seconds": monitor_elapsed,
             },
         )
-        return "", xor_key
+        return "", xor_key, image_key_map
 
     if source_data_dir:
         emit_media_event(
@@ -1422,11 +1744,12 @@ def load_image_crypto_config(source_data_dir: str = "", preferred_pid: int = 0, 
                 "cache_checked": cache_checked,
                 "cache_valid": cache_valid,
                 "cache_path": cache_path,
-                "v2_sample_count": 0,
+                "v2_sample_count": len(v2_samples),
+                "v2_pattern_count": len(patterns),
             },
         )
 
-    return "", xor_key
+    return "", xor_key, {}
 
 
 def extract_md5_from_packed_info(blob):
@@ -1516,6 +1839,7 @@ def try_load_image_media(
     resource_md5_maps: dict,
     image_aes_key: str,
     image_xor_key: int,
+    image_key_map: dict,
     log_fn=None,
     event_fn=None,
 ):
@@ -1566,6 +1890,7 @@ def try_load_image_media(
                 "existing_search_roots": existing_search_roots,
                 "recent_dat_samples": recent_dat_samples,
                 "has_image_aes_key": bool(image_aes_key),
+                "image_key_count": len(normalize_image_key_map(image_key_map)),
             },
         )
         return None
@@ -1587,12 +1912,25 @@ def try_load_image_media(
                 "existing_search_roots": existing_search_roots,
                 "recent_dat_samples": recent_dat_samples,
                 "has_image_aes_key": bool(image_aes_key),
+                "image_key_count": len(normalize_image_key_map(image_key_map)),
             },
         )
         return None
 
-    media = decode_image_dat_file(dat_path, image_aes_key=image_aes_key, image_xor_key=image_xor_key)
+    media = decode_image_dat_file(
+        dat_path,
+        image_aes_key=image_aes_key,
+        image_xor_key=image_xor_key,
+        image_key_map=image_key_map,
+    )
     if not media:
+        file_ct_hex = ""
+        if dat_file_is_v2(dat_path):
+            try:
+                with open(dat_path, "rb") as handle:
+                    file_ct_hex = extract_image_sample_ciphertext(handle.read(31)).hex()
+            except OSError:
+                file_ct_hex = ""
         emit_media_event(
             event_fn,
             "client_media_missing",
@@ -1607,6 +1945,9 @@ def try_load_image_media(
                 "v2_requires_aes_key": dat_file_is_v2(dat_path),
                 "has_image_aes_key": bool(image_aes_key),
                 "image_xor_key": image_xor_key,
+                "image_key_count": len(normalize_image_key_map(image_key_map)),
+                "file_ct_hex": file_ct_hex,
+                "matched_image_key": bool(file_ct_hex and normalize_image_key_map(image_key_map).get(file_ct_hex)),
                 "source_data_dir": source_data_dir,
                 "search_roots": trim_paths_for_event(search_roots, root_dir=source_data_dir, limit=6),
                 "existing_search_roots": existing_search_roots,
@@ -2096,7 +2437,7 @@ def detect_image_format(header_bytes: bytes):
     return "bin"
 
 
-def decrypt_v2_dat(data: bytes, image_aes_key: str, image_xor_key: int):
+def decrypt_v2_dat(data: bytes, image_aes_key: str, image_xor_key: int, image_key_map=None):
     if len(data) < 15:
         return None
 
@@ -2107,9 +2448,15 @@ def decrypt_v2_dat(data: bytes, image_aes_key: str, image_xor_key: int):
     if sig == V1_MAGIC_FULL:
         aes_key = b"cfcd208495d565ef"
     else:
-        if not image_aes_key:
+        ciphertext = data[15:31] if len(data) >= 31 else b""
+        resolved_key, _ = resolve_image_aes_key_for_ciphertext(
+            ciphertext,
+            image_aes_key=image_aes_key,
+            image_key_map=image_key_map,
+        )
+        if not resolved_key:
             return None
-        aes_key = image_aes_key.encode("ascii", errors="ignore")[:16]
+        aes_key = resolved_key.encode("ascii", errors="ignore")[:16]
         if len(aes_key) < 16:
             return None
 
@@ -2159,7 +2506,12 @@ def decrypt_legacy_dat(data: bytes):
     return None
 
 
-def decode_image_dat_file(dat_path: str, image_aes_key: str = "", image_xor_key: int = 0x88):
+def decode_image_dat_file(
+    dat_path: str,
+    image_aes_key: str = "",
+    image_xor_key: int = 0x88,
+    image_key_map=None,
+):
     try:
         with open(dat_path, "rb") as handle:
             data = handle.read(MAX_IMAGE_BYTES + 4096)
@@ -2170,7 +2522,12 @@ def decode_image_dat_file(dat_path: str, image_aes_key: str = "", image_xor_key:
         return None
 
     head6 = data[:6]
-    decoded = decrypt_v2_dat(data, image_aes_key=image_aes_key, image_xor_key=image_xor_key)
+    decoded = decrypt_v2_dat(
+        data,
+        image_aes_key=image_aes_key,
+        image_xor_key=image_xor_key,
+        image_key_map=image_key_map,
+    )
     if decoded is None and head6 not in (V2_MAGIC_FULL, V1_MAGIC_FULL):
         decoded = decrypt_legacy_dat(data)
     if decoded is None:
@@ -2238,25 +2595,30 @@ def load_contact_records(decrypted_dir: str, log_fn=None, event_fn=None):
 
     avatar_map = load_avatar_map(decrypted_dir, log_fn=log_fn, event_fn=event_fn)
     contacts = {}
-    with closing(sqlite3.connect(contact_path)) as conn:
-        conn.row_factory = sqlite3.Row
-        for row in conn.execute("SELECT username, alias, remark, nick_name FROM contact"):
-            username = str(row["username"] or "").strip()
-            if not username:
-                continue
-            alias = str(row["alias"] or "").strip()
-            remark = str(row["remark"] or "").strip()
-            nick_name = str(row["nick_name"] or "").strip()
-            contacts[username] = {
-                "wxid": username,
-                "alias": alias,
-                "remark": remark,
-                "nick_name": nick_name,
-                "display_name": remark or nick_name or alias or username,
-                "avatar": avatar_map.get(username, ""),
-                "source_updated_at": 0,
-                "extra_json": None,
-            }
+    try:
+        with closing(sqlite3.connect(contact_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            for row in conn.execute("SELECT username, alias, remark, nick_name FROM contact"):
+                username = str(row["username"] or "").strip()
+                if not username:
+                    continue
+                alias = str(row["alias"] or "").strip()
+                remark = str(row["remark"] or "").strip()
+                nick_name = str(row["nick_name"] or "").strip()
+                contacts[username] = {
+                    "wxid": username,
+                    "alias": alias,
+                    "remark": remark,
+                    "nick_name": nick_name,
+                    "display_name": remark or nick_name or alias or username,
+                    "avatar": avatar_map.get(username, ""),
+                    "source_updated_at": 0,
+                    "extra_json": None,
+                }
+    except Exception as exc:
+        if log_fn:
+            log_fn(f"[wechat-decrypt] 读取联系人数据库失败，降级为空联系人表: {contact_path} ({exc})")
+        return {}
     return contacts
 
 
