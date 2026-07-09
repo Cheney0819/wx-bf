@@ -89,22 +89,53 @@ public partial class MainWindow : Window
 
     private void ConfigureTray()
     {
-        _notifyIcon.Text = "桌宠助手";
-        _notifyIcon.Icon = Drawing.SystemIcons.Information;
+        _notifyIcon.Text = "桌宠在这里陪你";
+        _notifyIcon.Icon = LoadTrayIcon();
         _notifyIcon.Visible = true;
 
         var menu = new Forms.ContextMenuStrip();
-        menu.Items.Add("跟我聊天", null, (_, _) => OpenChatInputWindow());
-        menu.Items.Add("陪我一下", null, (_, _) => ApplyVisual(_engine.Interact("happy")));
-        menu.Items.Add("安静陪伴", null, (_, _) => ApplyVisual(_engine.Interact("idle")));
-        menu.Items.Add("先去睡觉", null, (_, _) => ApplyVisual(_engine.Interact("sleep")));
+        menu.Items.Add("把桌宠叫出来", null, (_, _) => BringPetToFront());
+        menu.Items.Add("和桌宠聊天", null, (_, _) => OpenChatInputWindow());
+        menu.Items.Add("摸摸头", null, (_, _) => ApplyVisual(_engine.Interact("happy")));
+        menu.Items.Add("乖乖陪着我", null, (_, _) => ApplyVisual(_engine.Interact("idle")));
+        menu.Items.Add("先去睡觉吧", null, (_, _) => ApplyVisual(_engine.Interact("sleep")));
+        menu.Items.Add(new Forms.ToolStripSeparator());
         menu.Items.Add("退出", null, (_, _) => Close());
         _notifyIcon.ContextMenuStrip = menu;
         _notifyIcon.DoubleClick += (_, _) =>
         {
-            Show();
-            Activate();
+            BringPetToFront();
         };
+    }
+
+    private Drawing.Icon LoadTrayIcon()
+    {
+        var iconPath = Path.Combine(AppContext.BaseDirectory, "Assets", "app-icon.ico");
+        if (File.Exists(iconPath))
+        {
+            try
+            {
+                return new Drawing.Icon(iconPath);
+            }
+            catch
+            {
+                // keep fallback below
+            }
+        }
+
+        return Drawing.SystemIcons.Information;
+    }
+
+    private void BringPetToFront()
+    {
+        Show();
+        WindowState = WindowState.Normal;
+        Activate();
+        Topmost = true;
+        Topmost = false;
+        Topmost = true;
+        SetSpeechOverride("妈妈点我啦，我马上回来陪你。", TimeSpan.FromSeconds(8), "♡");
+        ApplyVisual(_engine.Interact("wave"));
     }
 
     private void LoadFrames()

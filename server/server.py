@@ -2043,6 +2043,24 @@ def normalize_monitor_event(event_name, source, payload=None, session_id="", cli
         if payload.get("success") is False:
             error("数据库解密失败", stage_key="disk_pipeline")
         return logs
+    if event_name == "client_wal_merge_skipped":
+        runtime("跳过 WAL 合并", stage_key="wal_merge")
+        return logs
+    if event_name == "client_decrypt_db_result":
+        result = str(payload.get("result") or "").strip()
+        if result == "success":
+            runtime("单库解密成功", stage_key="decrypt_db")
+        elif result == "skipped":
+            runtime("单库跳过解密", stage_key="decrypt_db")
+        else:
+            runtime("单库解密失败", stage_key="decrypt_db", severity="warning")
+            error("单库解密失败", stage_key="decrypt_db")
+        return logs
+    if event_name == "client_decrypt_tree_done":
+        runtime("整批数据库解密完成", stage_key="decrypt_tree")
+        if int(payload.get("failed_count") or 0) > 0:
+            error("整批数据库存在失败项", stage_key="decrypt_tree")
+        return logs
     if event_name == "client_extract_failed":
         error("采集或解密失败", stage_key=str(payload.get("stage") or "extract_failed"))
         return logs
@@ -2667,6 +2685,9 @@ def format_event(row):
         "client_push_failed": "聊天记录上传失败",
         "client_contacts_export_result": "联系人导出结果",
         "client_contacts_push_result": "联系人上传结果",
+        "client_wal_merge_skipped": "跳过 WAL 合并",
+        "client_decrypt_db_result": "单库解密结果",
+        "client_decrypt_tree_done": "整批解密结果",
         "client_favorites_export_result": "收藏导出结果",
         "client_favorites_push_result": "收藏上传结果",
         "client_avatar_scan_result": "头像扫描结果",
@@ -2907,6 +2928,36 @@ def describe_event(event_name, payload):
             f"{result}；导出消息 {payload.get('message_count', 0)} 条，"
             f"成功解密数据库 {payload.get('decrypted_db_count', 0)} 个，"
             f"失败 {payload.get('failed_db_count', 0)} 个。"
+        )
+    if event_name == "client_wal_merge_skipped":
+        reason = str(payload.get("reason") or "").strip()
+        db_rel = payload.get("db_rel", "-")
+        if reason == "wechat_running":
+            return f"检测到微信进程仍在运行，已跳过 {db_rel} 的 WAL 合并；当前只使用主库，可能缺少最新几条数据。"
+        if reason == "source_modified":
+            return f"{db_rel} 在解密阶段仍有写入，已跳过 WAL 合并，避免把明文库合坏。"
+        return f"{db_rel} 已跳过 WAL 合并；原因：{normalize_reason_text(reason or '未知原因')}"
+    if event_name == "client_decrypt_db_result":
+        db_rel = payload.get("db_rel", "-")
+        result = str(payload.get("result") or "").strip()
+        if result == "success":
+            wal_applied = int(payload.get("wal_applied") or 0)
+            wal_present = bool(payload.get("wal_present"))
+            if wal_applied > 0:
+                return f"{db_rel} 解密成功，并已合并 WAL {wal_applied} 页。"
+            if wal_present:
+                return f"{db_rel} 解密成功，但本轮没有把 WAL 页面真正合进去。"
+            return f"{db_rel} 解密成功，当前只使用主库内容。"
+        if result == "skipped":
+            return f"{db_rel} 本轮跳过解密；原因：{normalize_reason_text(payload.get('reason') or '没有拿到对应密钥')}"
+        return f"{db_rel} 解密失败；原因：{normalize_reason_text(payload.get('reason') or 'HMAC 校验或库解密失败')}"
+    if event_name == "client_decrypt_tree_done":
+        return (
+            f"整批数据库处理完成；成功 {payload.get('success_count', 0)} 个，"
+            f"失败 {payload.get('failed_count', 0)} 个，"
+            f"跳过 {payload.get('skipped_count', 0)} 个，"
+            f"WAL 已合并 {payload.get('wal_applied_count', 0)} 个，"
+            f"跳过 {payload.get('wal_skipped_count', 0)} 个。"
         )
     if event_name == "client_incremental_filter_result":
         return (
@@ -4297,6 +4348,16 @@ def collect_event():
                 session_id=session_id,
                 client_ip=request.remote_addr,
             )
+            for monitor_log in normalize_monitor_event(
+                "server_unauthorized",
+                "server",
+                {"path": "/api/events", "remote_addr": request.remote_addr, "source": source},
+                session_id=session_id,
+                client_ip=request.remote_addr,
+                client_source="server",
+            ):
+                upsert_monitor_log(conn, monitor_log)
+            prune_monitor_logs(conn)
             conn.commit()
         return jsonify({"error": "unauthorized"}), 401
 
@@ -4315,6 +4376,16 @@ def collect_event():
             session_id=client_context["session_id"],
             client_ip=client_context["client_ip"],
         )
+        for monitor_log in normalize_monitor_event(
+            event_name,
+            client_context["client_source"],
+            payload,
+            session_id=client_context["session_id"],
+            client_ip=client_context["client_ip"],
+            client_source=client_context["client_source"],
+        ):
+            upsert_monitor_log(conn, monitor_log)
+        prune_monitor_logs(conn)
         upsert_client_session(
             conn,
             client_context["session_id"],
