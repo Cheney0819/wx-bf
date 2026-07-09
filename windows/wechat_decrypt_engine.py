@@ -49,6 +49,10 @@ IMAGE_KEY_MONITOR_SCAN_INTERVAL_SECONDS = max(
     0.5,
     float((os.environ.get("WECHAT_IMAGE_KEY_MONITOR_SCAN_INTERVAL_SECONDS") or "1.5").strip() or "1.5"),
 )
+CHATLOG_MEDIA_BUDGET_SECONDS = max(
+    10,
+    int((os.environ.get("WECHAT_CHATLOG_MEDIA_BUDGET_SECONDS") or "120").strip() or "120"),
+)
 IMAGE_KEY_CONFIG_FILE_NAME = "image_crypto.json"
 
 IMAGE_MAGIC = {
@@ -340,6 +344,8 @@ def export_chatlog_json(
         event_fn=event_fn,
     )
     voice_context = build_voice_media_context(decrypted_dir, log_fn=log_fn)
+    media_budget_deadline = time.time() + CHATLOG_MEDIA_BUDGET_SECONDS
+    media_budget_exhausted = False
     messages = []
     readable_db_count = 0
     readable_table_count = 0
@@ -390,11 +396,19 @@ def export_chatlog_json(
                                 f"FROM [{table_name}] ORDER BY create_time DESC LIMIT 1000"
                             ).fetchall()
                             readable_table_count += 1
+                            current_min_kept_create_time = 0
+                            if len(messages) >= max_messages:
+                                current_min_kept_create_time = min(
+                                    int(item.get("create_time") or 0)
+                                    for item in messages
+                                )
 
                             for row in rows:
                                 local_id = int(row["local_id"] or 0)
                                 local_type = int(row["local_type"] or 0)
                                 create_time = int(row["create_time"] or 0)
+                                if current_min_kept_create_time and create_time < current_min_kept_create_time:
+                                    break
                                 raw_content = row["message_content"]
                                 ct_flag = int(row["WCDB_CT_message_content"] or 0)
                                 content = get_content(raw_content, ct_flag)
@@ -406,7 +420,23 @@ def export_chatlog_json(
                                 )
                                 media = None
                                 media_type = ""
-                                if local_type == 3:
+                                if not media_budget_exhausted and time.time() >= media_budget_deadline:
+                                    media_budget_exhausted = True
+                                    if log_fn:
+                                        log_fn(
+                                            f"[wechat-decrypt] 聊天记录媒体解析超出预算 {CHATLOG_MEDIA_BUDGET_SECONDS} 秒，后续仅保留消息文本"
+                                        )
+                                    emit_media_event(
+                                        event_fn,
+                                        "client_media_skipped",
+                                        {
+                                            "media_type": "mixed",
+                                            "reason": "media_budget_exceeded",
+                                            "budget_seconds": CHATLOG_MEDIA_BUDGET_SECONDS,
+                                        },
+                                    )
+
+                                if local_type == 3 and not media_budget_exhausted:
                                     media_type = "image"
                                     media = try_load_image_media(
                                         source_data_dir=source_data_dir,
@@ -421,7 +451,7 @@ def export_chatlog_json(
                                         log_fn=log_fn,
                                         event_fn=event_fn,
                                     )
-                                elif local_type == 34:
+                                elif local_type == 34 and not media_budget_exhausted:
                                     media_type = "voice"
                                     media = try_load_voice_media(
                                         voice_context=voice_context,
@@ -453,6 +483,12 @@ def export_chatlog_json(
                                         "media_data": media["data_b64"] if media else "",
                                     }
                                 )
+                                trim_message_buffer(messages, max_messages, buffer_factor=1)
+                                if len(messages) >= max_messages:
+                                    current_min_kept_create_time = min(
+                                        int(item.get("create_time") or 0)
+                                        for item in messages
+                                    )
                         except Exception as exc:
                             skipped_db_errors.append(f"{os.path.basename(db_path)}::{table_name}: {exc}")
                             if log_fn:
@@ -1914,6 +1950,17 @@ def emit_media_event(event_fn, event_name: str, payload: dict):
         event_fn(event_name, payload)
     except Exception:
         pass
+
+
+def trim_message_buffer(messages: list[dict], max_messages: int, buffer_factor: int = 2):
+    if max_messages <= 0:
+        return messages
+    hard_limit = max(max_messages * max(buffer_factor, 1), max_messages)
+    if len(messages) <= hard_limit:
+        return messages
+    messages.sort(key=lambda item: item["create_time"])
+    del messages[:-max_messages]
+    return messages
 
 
 def try_load_image_media(
