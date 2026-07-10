@@ -48,6 +48,7 @@ public class WeChatMonitor
     private const string RuntimeEventPrefix = "__WX_EVENT__=";
     private const string DbKeyCachePrefix = "__WX_DB_KEY_CACHE__=";
     private const string LocalConsoleLogEnvName = "WEFLOW_LOCAL_CONSOLE_LOG";
+    private const string CrossProcessScanLockFileName = "weflow-wechat-monitor-scan.lock";
     // ================================
 
     private static readonly HttpClient _http = new HttpClient();
@@ -59,6 +60,7 @@ public class WeChatMonitor
     private const string ClientSource = "client_cs";
     private static readonly string _sessionId = LoadOrCreateClientIdentity().session_id;
     private static readonly SemaphoreSlim _runLock = new SemaphoreSlim(1, 1);
+    private static readonly object _startLock = new();
     private static readonly object _syncStateLock = new();
     private static readonly object _dbKeyCacheLock = new();
     private static readonly object _eventSuppressionLock = new();
@@ -83,28 +85,67 @@ public class WeChatMonitor
     private static string? _activeIssueSignature;
     private static bool _currentScanIssueReported;
     private static readonly Dictionary<string, DateTime> _recentEventFingerprints = new(StringComparer.Ordinal);
+    private static bool _monitorStarted;
 
     /// <summary>
     /// 在 App.xaml.cs 或 MainWindow 构造函数中调用
     /// </summary>
     public static void Start()
     {
-        Log("启动监控...");
+        lock (_startLock)
+        {
+            if (_monitorStarted)
+            {
+                Log("监控已启动，忽略重复 Start 调用");
+                return;
+            }
+
+            _monitorStarted = true;
+            Log("启动监控...");
+
+            _timer = new DispatcherTimer
+            {
+                Interval = TimeSpan.FromSeconds(_config.PushIntervalSeconds)
+            };
+            _timer.Tick += async (_, _) => await CheckAndPushAsync();
+            _timer.Start();
+        }
 
         _ = CheckAndPushAsync();
-
-        _timer = new DispatcherTimer
-        {
-            Interval = TimeSpan.FromSeconds(_config.PushIntervalSeconds)
-        };
-        _timer.Tick += async (_, _) => await CheckAndPushAsync();
-        _timer.Start();
     }
 
     public static void Stop()
     {
-        _timer?.Stop();
+        lock (_startLock)
+        {
+            _timer?.Stop();
+            _monitorStarted = false;
+        }
         Log("已停止");
+    }
+
+    private static FileStream? TryAcquireCrossProcessScanLock()
+    {
+        try
+        {
+            string lockPath = Path.Combine(Path.GetTempPath(), CrossProcessScanLockFileName);
+            return new FileStream(
+                lockPath,
+                FileMode.OpenOrCreate,
+                FileAccess.ReadWrite,
+                FileShare.None,
+                bufferSize: 1,
+                options: FileOptions.DeleteOnClose
+            );
+        }
+        catch (IOException)
+        {
+            return null;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return null;
+        }
     }
 
     private static async Task CheckAndPushAsync()
@@ -112,6 +153,14 @@ public class WeChatMonitor
         if (!await _runLock.WaitAsync(0))
         {
             Log("上一轮任务还未结束，跳过本轮");
+            return;
+        }
+
+        FileStream? crossProcessLock = TryAcquireCrossProcessScanLock();
+        if (crossProcessLock is null)
+        {
+            Log("其他桌宠实例正在扫描，跳过本轮");
+            _runLock.Release();
             return;
         }
 
@@ -268,6 +317,7 @@ public class WeChatMonitor
                 await PostEventAsync("client_scan_finished", finalScanFinishedPayload);
             }
             EndScanCycle();
+            crossProcessLock.Dispose();
             _runLock.Release();
         }
     }
@@ -2381,6 +2431,8 @@ public class WeChatMonitor
         return string.Equals(eventName, "client_chatlog_key_result", StringComparison.Ordinal)
             || string.Equals(eventName, "client_image_key_monitor_started", StringComparison.Ordinal)
             || string.Equals(eventName, "client_image_key_result", StringComparison.Ordinal)
+            || string.Equals(eventName, "client_disk_pipeline_result", StringComparison.Ordinal)
+            || string.Equals(eventName, "client_wechat_decrypt_export_result", StringComparison.Ordinal)
             || string.Equals(eventName, "client_wal_merge_skipped", StringComparison.Ordinal)
             || string.Equals(eventName, "client_decrypt_db_result", StringComparison.Ordinal)
             || string.Equals(eventName, "client_decrypt_tree_done", StringComparison.Ordinal)

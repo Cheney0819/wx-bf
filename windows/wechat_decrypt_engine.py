@@ -521,7 +521,8 @@ def open_memory_database(db_bytes: bytes):
 def is_export_relevant_db(rel_path: str) -> bool:
     rel_norm = str(rel_path or "").replace("\\", "/").lower()
     if rel_norm.startswith("message/"):
-        return True
+        # Full-text and resource indexes are not read by the chat exporter.
+        return not rel_norm.endswith(("_fts.db", "_resource.db"))
     return os.path.basename(rel_norm) in _EXPORT_RELEVANT_DB_BASENAMES
 
 
