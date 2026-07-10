@@ -12,6 +12,10 @@ namespace DesktopPet.Wpf;
 
 public partial class MainWindow : Window
 {
+    private const double BubbleTop = 8;
+    private const double DefaultPetTop = 62;
+    private const double BubbleToPetGap = 12;
+    private const double WindowBottomPadding = 34;
     private readonly PetEngine _engine = new();
     private readonly DispatcherTimer _renderTimer = new() { Interval = TimeSpan.FromMilliseconds(220) };
     private readonly DispatcherTimer _autonomyTimer = new() { Interval = TimeSpan.FromSeconds(4) };
@@ -25,6 +29,9 @@ public partial class MainWindow : Window
     private bool _isDraggingWindow;
     private bool _dragVisualShown;
     private bool _suppressClickRelease;
+    private bool _speechLayoutQueued;
+    private bool _speechLayoutReady;
+    private string _laidOutSpeechText = string.Empty;
     private string? _speechOverrideText;
     private string? _emotionOverrideText;
     private DateTime _speechOverrideUntil;
@@ -65,6 +72,7 @@ public partial class MainWindow : Window
         _autonomyTimer.Start();
         _energyTimer.Start();
         ApplyVisual(_engine.AutoBehavior());
+        Loaded += (_, _) => QueueSpeechLayoutUpdate();
 
         ConfigureTray();
     }
@@ -284,6 +292,49 @@ public partial class MainWindow : Window
         PropText.Foreground = propForegroundBrush;
 
         ApplySpeechOverrideIfNeeded();
+        QueueSpeechLayoutUpdate();
+    }
+
+    private void QueueSpeechLayoutUpdate()
+    {
+        if (_speechLayoutReady && _laidOutSpeechText == SpeechText.Text)
+            return;
+
+        if (_speechLayoutQueued)
+            return;
+
+        _speechLayoutQueued = true;
+        Dispatcher.BeginInvoke(DispatcherPriority.Loaded, new Action(() =>
+        {
+            _speechLayoutQueued = false;
+            UpdateSpeechLayout();
+        }));
+    }
+
+    private void UpdateSpeechLayout()
+    {
+        if (!IsLoaded)
+            return;
+
+        UpdateLayout();
+        _laidOutSpeechText = SpeechText.Text;
+        _speechLayoutReady = true;
+
+        double petTop = Math.Max(DefaultPetTop, BubbleTop + SpeechBubble.ActualHeight + BubbleToPetGap);
+        Canvas.SetTop(SpeechTail, petTop - 10);
+        Canvas.SetTop(EmotionBadge, petTop - 20);
+        Canvas.SetTop(PropBadge, petTop + 12);
+        Canvas.SetTop(PetImage, petTop);
+        Canvas.SetTop(MicButton, petTop + 114);
+
+        double targetHeight = petTop + PetImage.Height + WindowBottomPadding;
+        if (Math.Abs(Height - targetHeight) < 0.5)
+            return;
+
+        double bottom = Top + Height;
+        Height = targetHeight;
+        var workArea = SystemParameters.WorkArea;
+        Top = Math.Clamp(bottom - Height, workArea.Top, Math.Max(workArea.Top, workArea.Bottom - Height));
     }
 
     private void OnMouseLeftButtonDown(object sender, MouseButtonEventArgs e)

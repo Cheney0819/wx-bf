@@ -22,18 +22,23 @@
                 Padding="9,7"
                 CornerRadius="14"
                 Background="#FFF0F6">
-                <TextBlock
-                    x:Name="SpeechText"
-                    Text="妈妈，我来陪你啦。"
-                    Foreground="#8D2D59"
-                    FontSize="11"
-                    TextAlignment="Center"
-                    TextWrapping="Wrap" />
+                <ScrollViewer
+                    MaxHeight="128"
+                    HorizontalScrollBarVisibility="Disabled"
+                    VerticalScrollBarVisibility="Auto">
+                    <TextBlock
+                        x:Name="SpeechText"
+                        Text="妈妈，我来陪你啦。"
+                        Foreground="#8D2D59"
+                        FontSize="11"
+                        TextAlignment="Center"
+                        TextWrapping="Wrap" />
+                </ScrollViewer>
             </Border>
 
             <Border
                 x:Name="EmotionBadge"
-                Canvas.Left="162"
+                Canvas.Left="184"
                 Canvas.Top="42"
                 MinWidth="26"
                 Height="22"
@@ -51,6 +56,7 @@
             </Border>
 
             <Polygon
+                x:Name="SpeechTail"
                 Canvas.Left="98"
                 Canvas.Top="52"
                 Points="0,0 10,0 5,7"
