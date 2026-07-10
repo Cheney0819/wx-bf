@@ -2189,7 +2189,9 @@ public class WeChatMonitor
         return string.Equals(eventName, "client_extract_failed", StringComparison.Ordinal)
             || string.Equals(eventName, "client_chatlog_key_result", StringComparison.Ordinal)
             || string.Equals(eventName, "client_disk_pipeline_result", StringComparison.Ordinal)
-            || string.Equals(eventName, "client_wechat_decrypt_export_result", StringComparison.Ordinal);
+            || string.Equals(eventName, "client_wechat_decrypt_export_result", StringComparison.Ordinal)
+            || string.Equals(eventName, "client_wal_merge_skipped", StringComparison.Ordinal)
+            || string.Equals(eventName, "client_decrypt_tree_done", StringComparison.Ordinal);
     }
 
     private static DecryptRunResult WithWeChatVersion(DecryptRunResult result, string? candidateVersion)

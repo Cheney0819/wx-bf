@@ -15,6 +15,7 @@ import time
 import gc
 from base64 import b64encode
 from contextlib import closing
+from pathlib import Path
 
 from Crypto.Cipher import AES
 
@@ -53,6 +54,7 @@ CHATLOG_MEDIA_BUDGET_SECONDS = max(
     10,
     int((os.environ.get("WECHAT_CHATLOG_MEDIA_BUDGET_SECONDS") or "120").strip() or "120"),
 )
+DATABASE_SNAPSHOT_MAX_ATTEMPTS = 3
 IMAGE_KEY_CONFIG_FILE_NAME = "image_crypto.json"
 
 IMAGE_MAGIC = {
@@ -209,94 +211,270 @@ def decrypt_database_tree(db_dir: str, out_dir: str, keys: dict, log_fn=None, ev
     total_bytes = 0
     wal_applied = 0
     wal_skipped = 0
+    integrity_failed = 0
+    required_integrity_failed = 0
 
-    db_files = []
-    for root, _, files in os.walk(db_dir):
-        for name in files:
-            if not name.endswith(".db") or name.endswith("-wal") or name.endswith("-shm"):
+    with tempfile.TemporaryDirectory(prefix="wx-db-snapshot-") as snapshot_dir:
+        snapshot_result = create_stable_database_snapshot(
+            db_dir,
+            keys,
+            snapshot_dir,
+            max_attempts=DATABASE_SNAPSHOT_MAX_ATTEMPTS,
+            log_fn=log_fn,
+            event_fn=event_fn,
+        )
+        if not snapshot_result["success"]:
+            failure_reason = snapshot_result["reason"]
+            _emit(event_fn, "client_extract_failed", {
+                "stage": "database_snapshot",
+                "reason": failure_reason,
+                "error_message": "微信数据库持续写入，未取得一致快照",
+                "snapshot_attempts": snapshot_result["attempts"],
+            })
+            result = {
+                "success": False,
+                "success_count": 0,
+                "failed_count": 1,
+                "skipped_count": 0,
+                "wal_applied_count": 0,
+                "wal_skipped_count": snapshot_result["modified_db_count"],
+                "integrity_failed_count": 0,
+                "snapshot_attempts": snapshot_result["attempts"],
+                "failure_reason": failure_reason,
+                "total_bytes": 0,
+                "duration_seconds": round(time.time() - started_at, 3),
+            }
+            _emit(event_fn, "client_decrypt_tree_done", result)
+            return result
+
+        db_files = collect_snapshot_database_files(snapshot_dir)
+        for rel, path, size in db_files:
+            key_info = keys.get(rel)
+            if not key_info:
+                skipped += 1
+                _emit(event_fn, "client_decrypt_db_result", {
+                    "db_rel": rel, "db_size_bytes": size,
+                    "result": "skipped", "reason": "no_key",
+                })
                 continue
-            path = os.path.join(root, name)
-            rel = os.path.relpath(path, db_dir)
-            db_files.append((rel, path, os.path.getsize(path)))
 
-    db_files.sort(key=lambda item: item[2])
-
-    for rel, path, size in db_files:
-        if not is_export_relevant_db(rel):
-            skipped += 1
-            _emit(event_fn, "client_decrypt_db_result", {
-                "db_rel": rel, "db_size_bytes": size,
-                "result": "skipped", "reason": "not_required_for_export",
-            })
-            continue
-
-        key_info = keys.get(rel)
-        if not key_info:
-            skipped += 1
-            _emit(event_fn, "client_decrypt_db_result", {
-                "db_rel": rel, "db_size_bytes": size,
-                "result": "skipped", "reason": "no_key",
-            })
-            continue
-
-        out_path = os.path.join(out_dir, rel)
-        enc_key = bytes.fromhex(str(key_info["enc_key"]))
-        ok = decrypt_database(path, out_path, enc_key)
-        if ok:
-            wal_result = None
-            if wechat_running:
-                wal_skipped += 1
+            out_path = os.path.join(out_dir, rel)
+            enc_key = bytes.fromhex(str(key_info["enc_key"]))
+            ok = decrypt_database(path, out_path, enc_key)
+            if not ok:
+                failed += 1
                 if log_fn:
-                    log_fn(f"[wechat-decrypt] 跳过 WAL 合并（微信进程中）: {rel}")
+                    log_fn(f"[wechat-decrypt] 解密失败: {rel}")
+                _emit(event_fn, "client_decrypt_db_result", {
+                    "db_rel": rel, "db_size_bytes": size,
+                    "result": "failed", "reason": "hmac_or_decrypt",
+                })
+                continue
+
+            wal_result = apply_encrypted_wal_to_decrypted_db(path, out_path, enc_key, log_fn=log_fn)
+            if wal_result.get("applied", 0) > 0:
+                wal_applied += 1
+            elif wal_result.get("present"):
+                wal_skipped += 1
                 _emit(event_fn, "client_wal_merge_skipped", {
                     "db_rel": rel,
-                    "reason": "wechat_running",
+                    "reason": wal_result.get("reason") or "wal_not_applied",
+                    "snapshot_attempts": snapshot_result["attempts"],
                 })
-            else:
-                wal_result = apply_encrypted_wal_to_decrypted_db(path, out_path, enc_key, log_fn=log_fn)
-                if wal_result and wal_result.get("applied", 0) > 0:
-                    wal_applied += 1
-                else:
-                    wal_skipped += 1
+
+            valid, validation_reason = validate_decrypted_database(out_path)
+            if not valid:
+                failed += 1
+                integrity_failed += 1
+                if is_required_chatlog_database(rel):
+                    required_integrity_failed += 1
+                try:
+                    os.remove(out_path)
+                except OSError:
+                    pass
+                if log_fn:
+                    log_fn(f"[wechat-decrypt] 明文库校验失败: {rel} ({validation_reason})")
+                _emit(event_fn, "client_decrypt_db_result", {
+                    "db_rel": rel,
+                    "db_size_bytes": size,
+                    "result": "failed",
+                    "reason": "sqlite_integrity_check_failed",
+                    "validation_reason": validation_reason,
+                    "wal_applied": wal_result.get("applied", 0),
+                    "wal_present": wal_result.get("present", False),
+                })
+                continue
+
             success += 1
             total_bytes += size
             if log_fn:
                 log_fn(f"[wechat-decrypt] 解密成功: {rel}")
             _emit(event_fn, "client_decrypt_db_result", {
-                "db_rel": rel, "db_size_bytes": size,
+                "db_rel": rel,
+                "db_size_bytes": size,
                 "result": "success",
-                "wal_applied": wal_result.get("applied", 0) if wal_result else 0,
-                "wal_present": wal_result.get("present", False) if wal_result else False,
+                "wal_applied": wal_result.get("applied", 0),
+                "wal_present": wal_result.get("present", False),
+                "wal_committed_frames": wal_result.get("committed_frames", 0),
+                "snapshot_attempts": snapshot_result["attempts"],
+                "integrity_checked": True,
             })
-        else:
-            failed += 1
-            if log_fn:
-                log_fn(f"[wechat-decrypt] 解密失败: {rel}")
-            _emit(event_fn, "client_decrypt_db_result", {
-                "db_rel": rel, "db_size_bytes": size,
-                "result": "failed", "reason": "hmac_or_decrypt",
-            })
-
-        for suffix in ("-shm", "-wal"):
-            residual = out_path + suffix
-            if os.path.exists(residual):
-                try:
-                    os.remove(residual)
-                except OSError:
-                    pass
 
     result = {
-        "success": success > 0,
+        "success": success > 0 and required_integrity_failed == 0,
         "success_count": success,
         "failed_count": failed,
         "skipped_count": skipped,
         "wal_applied_count": wal_applied,
         "wal_skipped_count": wal_skipped,
+        "integrity_failed_count": integrity_failed,
+        "required_integrity_failed_count": required_integrity_failed,
+        "snapshot_attempts": snapshot_result["attempts"],
         "total_bytes": total_bytes,
         "duration_seconds": round(time.time() - started_at, 3),
     }
     _emit(event_fn, "client_decrypt_tree_done", result)
     return result
+
+
+def collect_snapshot_source_database_files(db_dir: str, keys: dict):
+    files = []
+    for root, _, names in os.walk(db_dir):
+        for name in names:
+            if not name.endswith(".db") or name.endswith(("-wal", "-shm")):
+                continue
+            path = os.path.join(root, name)
+            rel = os.path.relpath(path, db_dir)
+            if not is_export_relevant_db(rel) or rel not in keys:
+                continue
+            files.append((rel, path))
+    return sorted(files, key=lambda item: item[0].lower())
+
+
+def is_required_chatlog_database(rel_path: str) -> bool:
+    rel_norm = str(rel_path or "").replace("\\", "/").lower()
+    return bool(re.fullmatch(r"message/message_\d+\.db", rel_norm))
+
+
+def collect_snapshot_database_files(snapshot_dir: str):
+    files = []
+    for root, _, names in os.walk(snapshot_dir):
+        for name in names:
+            if not name.endswith(".db") or name.endswith(("-wal", "-shm")):
+                continue
+            path = os.path.join(root, name)
+            rel = os.path.relpath(path, snapshot_dir)
+            files.append((rel, path, os.path.getsize(path)))
+    return sorted(files, key=lambda item: item[2])
+
+
+def snapshot_file_signature(path: str):
+    try:
+        stat = os.stat(path)
+        return stat.st_size, stat.st_mtime_ns
+    except OSError:
+        return None
+
+
+def reset_snapshot_directory(snapshot_dir: str):
+    shutil.rmtree(snapshot_dir, ignore_errors=True)
+    os.makedirs(snapshot_dir, exist_ok=True)
+
+
+def create_stable_database_snapshot(
+    db_dir: str,
+    keys: dict,
+    snapshot_dir: str,
+    max_attempts: int = DATABASE_SNAPSHOT_MAX_ATTEMPTS,
+    log_fn=None,
+    event_fn=None,
+):
+    db_files = collect_snapshot_source_database_files(db_dir, keys)
+    if not db_files:
+        return {
+            "success": False,
+            "reason": "snapshot_candidates_missing",
+            "attempts": 0,
+            "modified_db_count": 0,
+        }
+
+    max_attempts = max(1, max_attempts)
+    for attempt in range(1, max_attempts + 1):
+        reset_snapshot_directory(snapshot_dir)
+        before = {}
+        for rel, source_path in db_files:
+            for suffix in ("", "-wal", "-shm"):
+                before[(rel, suffix)] = snapshot_file_signature(source_path + suffix)
+
+        changed_rels = set()
+        try:
+            for rel, source_path in db_files:
+                for suffix in ("", "-wal", "-shm"):
+                    source_file = source_path + suffix
+                    signature = before[(rel, suffix)]
+                    if signature is None:
+                        continue
+                    snapshot_file = os.path.join(snapshot_dir, rel) + suffix
+                    os.makedirs(os.path.dirname(snapshot_file), exist_ok=True)
+                    shutil.copyfile(source_file, snapshot_file)
+                    copied_signature = snapshot_file_signature(snapshot_file)
+                    if copied_signature is None or copied_signature[0] != signature[0]:
+                        changed_rels.add(rel)
+        except OSError:
+            changed_rels.update(rel for rel, _ in db_files)
+
+        for rel, source_path in db_files:
+            for suffix in ("", "-wal", "-shm"):
+                if before[(rel, suffix)] != snapshot_file_signature(source_path + suffix):
+                    changed_rels.add(rel)
+
+        if not changed_rels:
+            if log_fn:
+                log_fn(
+                    f"[wechat-decrypt] 已获取稳定数据库快照: {len(db_files)} 个库，尝试 {attempt}/{max_attempts}"
+                )
+            return {
+                "success": True,
+                "reason": "snapshot_stable",
+                "attempts": attempt,
+                "modified_db_count": 0,
+            }
+
+        for rel in sorted(changed_rels)[:12]:
+            _emit(event_fn, "client_wal_merge_skipped", {
+                "db_rel": rel,
+                "reason": "source_modified",
+                "snapshot_attempt": attempt,
+                "snapshot_attempt_total": max_attempts,
+            })
+        if log_fn:
+            log_fn(
+                f"[wechat-decrypt] 数据库快照不稳定，准备重试 {attempt}/{max_attempts}: "
+                f"{', '.join(sorted(changed_rels)[:3])}"
+            )
+        if attempt < max_attempts:
+            time.sleep(0.2)
+
+    return {
+        "success": False,
+        "reason": "source_modified",
+        "attempts": max_attempts,
+        "modified_db_count": len(changed_rels),
+    }
+
+
+def validate_decrypted_database(db_path: str):
+    try:
+        db_uri = Path(db_path).resolve().as_uri() + "?mode=ro"
+        with closing(sqlite3.connect(db_uri, uri=True)) as conn:
+            quick_check = conn.execute("PRAGMA quick_check(1)").fetchone()
+            quick_check_value = str(quick_check[0] if quick_check else "").strip().lower()
+            if quick_check_value != "ok":
+                return False, f"quick_check:{quick_check_value or 'empty'}"
+            conn.execute("SELECT name FROM sqlite_master LIMIT 1").fetchone()
+    except Exception as exc:
+        return False, f"sqlite_open_failed:{exc}"
+    return True, "ok"
 
 
 def decrypt_database_to_bytes(db_path: str, enc_key: bytes):
@@ -973,18 +1151,48 @@ def apply_encrypted_wal_to_decrypted_db(db_path: str, out_path: str, enc_key: by
                     "reason": f"wal_page_size_unsupported:{wal_page_size}",
                 }
 
-            applied = 0
+            frame_size = 24 + wal_page_size
+            total_frames = 0
+            committed_frames = 0
+            committed_end_offset = 32
+            committed_db_pages = 0
+            while True:
+                frame_header = handle.read(24)
+                if not frame_header or len(frame_header) < 24:
+                    break
+                handle.seek(wal_page_size, os.SEEK_CUR)
+                if handle.tell() > os.path.getsize(wal_path):
+                    break
+
+                total_frames += 1
+                db_size_after_commit = struct.unpack(">I", frame_header[4:8])[0]
+                if db_size_after_commit > 0:
+                    committed_frames = total_frames
+                    committed_end_offset = 32 + total_frames * frame_size
+                    committed_db_pages = db_size_after_commit
+
+            if committed_frames == 0:
+                return {
+                    "applied": 0,
+                    "wal_path": wal_path,
+                    "present": True,
+                    "reason": "wal_no_committed_frames",
+                    "frame_count": total_frames,
+                    "committed_frames": 0,
+                }
+
+        applied = 0
+        with open(wal_path, "rb") as handle:
+            handle.seek(32)
             with open(out_path, "r+b") as fout:
-                while True:
+                for _ in range(committed_frames):
                     frame_header = handle.read(24)
-                    if not frame_header:
-                        break
                     if len(frame_header) < 24:
-                        break
+                        raise RuntimeError("wal_frame_header_truncated")
 
                     page_data = handle.read(wal_page_size)
                     if len(page_data) < wal_page_size:
-                        break
+                        raise RuntimeError("wal_frame_data_truncated")
 
                     page_number = struct.unpack(">I", frame_header[:4])[0]
                     if page_number <= 0:
@@ -994,10 +1202,24 @@ def apply_encrypted_wal_to_decrypted_db(db_path: str, out_path: str, enc_key: by
                     fout.seek((page_number - 1) * PAGE_SZ)
                     fout.write(decrypted_page)
                     applied += 1
+                if committed_db_pages > 0:
+                    fout.truncate(committed_db_pages * PAGE_SZ)
 
             if log_fn and applied > 0:
-                log_fn(f"[wechat-decrypt] 已合并 WAL 页面: {os.path.basename(wal_path)} -> {applied} 页")
-            return {"applied": applied, "wal_path": wal_path, "present": True, "reason": "wal_applied"}
+                log_fn(
+                    f"[wechat-decrypt] 已合并 WAL 页面: {os.path.basename(wal_path)} -> {applied} 页 "
+                    f"(已提交帧 {committed_frames}/{total_frames})"
+                )
+            return {
+                "applied": applied,
+                "wal_path": wal_path,
+                "present": True,
+                "reason": "wal_applied",
+                "frame_count": total_frames,
+                "committed_frames": committed_frames,
+                "uncommitted_frames": max(total_frames - committed_frames, 0),
+                "commit_end_offset": committed_end_offset,
+            }
     except Exception as exc:
         if log_fn:
             log_fn(f"[wechat-decrypt] 合并 WAL 失败: {wal_path} ({exc})")
