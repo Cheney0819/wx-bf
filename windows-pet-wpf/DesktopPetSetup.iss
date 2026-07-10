@@ -1,5 +1,5 @@
 #define MyAppName "桌宠"
-#define MyAppVersion "1.0.2"
+#define MyAppVersion "1.0.3"
 #define MyAppPublisher "Junjiee"
 
 [Setup]
@@ -23,7 +23,7 @@ WizardImageFile=Assets\installer-wizard.png
 WizardSmallImageFile=Assets\installer-wizard-small.png
 UninstallDisplayIcon={app}\DesktopPet.Wpf.exe
 ArchitecturesInstallIn64BitMode=x64compatible
-VersionInfoVersion=1.0.2.0
+VersionInfoVersion=1.0.3.0
 VersionInfoTextVersion={#MyAppVersion}
 
 [Languages]
@@ -46,3 +46,29 @@ Filename: "{app}\DesktopPet.Wpf.exe"; Description: "立即启动桌宠"; Flags: 
 
 [UninstallRun]
 Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -File ""{app}\uninstall.ps1"" -InstallDir ""{app}"""; Flags: runhidden waituntilterminated skipifdoesntexist
+
+[Code]
+procedure StopProcessTree(const ImageName: String);
+var
+  ResultCode: Integer;
+begin
+  Exec(
+    ExpandConstant('{sys}\taskkill.exe'),
+    '/F /T /IM "' + ImageName + '"',
+    '',
+    SW_HIDE,
+    ewWaitUntilTerminated,
+    ResultCode
+  );
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep <> ssInstall then
+    Exit;
+
+  { A previous installation can keep the bundled decryptor locked during an upgrade. }
+  StopProcessTree('DesktopPet.Wpf.exe');
+  StopProcessTree('wx_decrypt.exe');
+  Sleep(800);
+end;

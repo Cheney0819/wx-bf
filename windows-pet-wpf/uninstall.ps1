@@ -40,6 +40,8 @@ $legacyProgramShortcut = Join-Path $programsDir "Desktop Pet.lnk"
 
 Write-Step "关闭桌宠后台进程"
 Stop-ProcessTreeByName "DesktopPet.Wpf.exe"
+Stop-ProcessTreeByName "wx_decrypt.exe"
+Stop-ProcessTreeByName "ffmpeg.exe"
 Start-Sleep -Milliseconds 800
 
 Write-Step "删除快捷方式和开机自启"
