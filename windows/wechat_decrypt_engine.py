@@ -895,12 +895,15 @@ def collect_db_files(db_dir: str):
             if not name.endswith(".db") or name.endswith("-wal") or name.endswith("-shm"):
                 continue
             path = os.path.join(root, name)
+            rel = os.path.relpath(path, db_dir)
+            # Keep key discovery aligned with the databases we actually export.
+            if not is_export_relevant_db(rel):
+                continue
             size = os.path.getsize(path)
             if size < PAGE_SZ:
                 continue
             with open(path, "rb") as handle:
                 page1 = handle.read(PAGE_SZ)
-            rel = os.path.relpath(path, db_dir)
             salt = page1[:SALT_SZ].hex()
             db_files.append((rel, path, size, salt, page1))
             salt_to_dbs.setdefault(salt, []).append(rel)
