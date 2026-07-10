@@ -27,7 +27,7 @@ public class WeChatMonitor
     private const int DEFAULT_PUSH_INTERVAL_SECONDS = 60;
     private const string DECRYPT_EXE_NAME = "wx_decrypt.exe";
     private const int EXISTING_PROCESS_QUICK_TRY_SECONDS = 30;
-    private const int EXISTING_PROCESS_KEY_SCAN_TIMEOUT_SECONDS = 120;
+    private const int EXISTING_PROCESS_KEY_SCAN_TIMEOUT_SECONDS = 180;
     private const int DECRYPT_SOFT_TIMEOUT_SECONDS = 180;
     private const int DECRYPT_HARD_TIMEOUT_SECONDS = 600;
     private const int DECRYPT_PROGRESS_EVENT_INTERVAL_SECONDS = 30;
