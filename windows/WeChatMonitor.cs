@@ -15,6 +15,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 using System.Windows.Threading;
 
@@ -35,6 +36,8 @@ public class WeChatMonitor
     private const int MAX_IMAGE_BYTES = 5 * 1024 * 1024;
     private const int HTTP_RETRY_MAX_ATTEMPTS = 3;
     private const int HTTP_RETRY_BASE_DELAY_MS = 1500;
+    private const int EVENT_HTTP_TIMEOUT_MS = 5000;
+    private const int RUNTIME_EVENT_QUEUE_CAPACITY = 128;
     private const string CHATLOG_EXPORT_FILE_NAME = "chatlog_export.json";
     private const string CONTACT_EXPORT_FILE_NAME = "contact_export.json";
     private const string FAVORITE_EXPORT_FILE_NAME = "favorite_export.json";
@@ -61,6 +64,14 @@ public class WeChatMonitor
     private static readonly object _eventSuppressionLock = new();
     private static readonly object _recentEventLock = new();
     private static readonly bool _enableLocalConsoleLog = IsLocalConsoleLogEnabled();
+    private static readonly Channel<RuntimeProcessEvent> _runtimeEventQueue =
+        Channel.CreateBounded<RuntimeProcessEvent>(new BoundedChannelOptions(RUNTIME_EVENT_QUEUE_CAPACITY)
+        {
+            SingleReader = true,
+            SingleWriter = false,
+            FullMode = BoundedChannelFullMode.Wait
+        });
+    private static readonly Task _runtimeEventPublisherTask = PublishRuntimeEventsAsync();
     private static long _requestSequence = 0;
 
     private static DispatcherTimer _timer;
@@ -498,7 +509,11 @@ public class WeChatMonitor
                 processRunning,
                 decryptDir,
                 "",
-                $"解密超过硬超时（{activeHardTimeoutSeconds} 秒），已终止"
+                $"解密超过硬超时（{activeHardTimeoutSeconds} 秒），已终止",
+                AttemptKind: attemptOptions.AttemptKind,
+                HardTimedOut: true,
+                EffectiveHardTimeoutSeconds: activeHardTimeoutSeconds,
+                KeyMaterialConfirmed: outputState.HasConfirmedKeyMaterial
             );
         }
 
@@ -582,6 +597,13 @@ public class WeChatMonitor
         if (decryptResult.Success)
             return false;
 
+        if (decryptResult.HardTimedOut)
+        {
+            return string.Equals(decryptResult.AttemptKind, "existing_process_quick_try", StringComparison.Ordinal)
+                && decryptResult.EffectiveHardTimeoutSeconds == EXISTING_PROCESS_QUICK_TRY_SECONDS
+                && !decryptResult.KeyMaterialConfirmed;
+        }
+
         string error = (decryptResult.ErrorMessage ?? string.Empty).Trim();
         if (string.IsNullOrWhiteSpace(error))
             return false;
@@ -589,19 +611,14 @@ public class WeChatMonitor
         return error.Contains("Hook安装成功", StringComparison.OrdinalIgnoreCase)
             || error.Contains("现在登录微信", StringComparison.OrdinalIgnoreCase)
             || error.Contains("获取密钥超时", StringComparison.OrdinalIgnoreCase)
-            || error.Contains("解密超过硬超时", StringComparison.OrdinalIgnoreCase)
             || error.Contains("内存扫描数据库密钥失败", StringComparison.OrdinalIgnoreCase)
             || error.Contains("未能从微信进程内存中匹配到任何数据库密钥", StringComparison.OrdinalIgnoreCase);
     }
 
     private static async Task<WeChatRestartResult> RestartWeChatAndWaitForNewProcessAsync(WeChatProcessSnapshot currentWeChatProcess)
     {
-        var currentProcesses = GetWeChatProcessesSnapshot();
-        var oldPidSet = currentProcesses.Select(item => item.ProcessId).ToHashSet();
-        string executablePath = currentProcesses
-            .Select(item => item.ExecutablePath)
-            .FirstOrDefault(path => !string.IsNullOrWhiteSpace(path))
-            ?? currentWeChatProcess.ExecutablePath;
+        var oldPidSet = new HashSet<int> { currentWeChatProcess.ProcessId };
+        string executablePath = currentWeChatProcess.ExecutablePath;
 
         foreach (int pid in oldPidSet)
         {
@@ -988,7 +1005,7 @@ public class WeChatMonitor
             if (runtimeEvent is not null)
             {
                 outputState.ApplyRuntimeEvent(runtimeEvent);
-                await PostEventAsync(runtimeEvent.EventName, runtimeEvent.Payload);
+                QueueRuntimeEvent(runtimeEvent);
             }
         }
     }
@@ -1053,6 +1070,7 @@ public class WeChatMonitor
                 cmd.CommandText = $@"
                     SELECT
                         StrTalker as wxid,
+                        {SqlColumn(columns, "LocalId", "local_id", "0")},
                         StrContent as content,
                         CreateTime as create_time,
                         IsSender as is_sender,
@@ -1089,6 +1107,7 @@ public class WeChatMonitor
                     messages.Add(new WeChatMessage
                     {
                         wxid = reader["wxid"]?.ToString() ?? "",
+                        local_id = ToLong(reader["local_id"]),
                         content = string.IsNullOrWhiteSpace(content)
                             ? (isImage ? "[图片]" : "")
                             : (content.Length > 500 ? content[..500] : content),
@@ -1161,6 +1180,7 @@ public class WeChatMonitor
                 messages.Add(new WeChatMessage
                 {
                     wxid = ReadJsonString(item, "wxid"),
+                    local_id = ReadJsonInt64(item, "local_id"),
                     content = ReadJsonString(item, "content"),
                     create_time = ReadJsonInt64(item, "create_time"),
                     is_sender = ReadJsonBool(item, "is_sender"),
@@ -1324,6 +1344,13 @@ public class WeChatMonitor
         if (value == null || value == DBNull.Value)
             return 0;
         return int.TryParse(value.ToString(), out var result) ? result : 0;
+    }
+
+    private static long ToLong(object? value)
+    {
+        if (value == null || value == DBNull.Value)
+            return 0;
+        return long.TryParse(value.ToString(), out var result) ? result : 0;
     }
 
     private static string ReadDbString(object? value)
@@ -1587,7 +1614,8 @@ public class WeChatMonitor
         foreach (var message in messages.OrderBy(m => m.create_time))
         {
             string key = GetMessageKey(message);
-            if (existing.Contains(key))
+            string legacyKey = GetLegacyMessageKey(message);
+            if (existing.Contains(key) || existing.Contains(legacyKey))
             {
                 skippedCount++;
                 continue;
@@ -1623,6 +1651,25 @@ public class WeChatMonitor
     }
 
     private static string GetMessageKey(WeChatMessage message)
+    {
+        string raw = string.Join(
+            "\u001f",
+            message.wxid ?? "",
+            message.local_id.ToString(),
+            message.create_time.ToString(),
+            message.is_sender ? "1" : "0",
+            message.sender ?? "",
+            message.content ?? "",
+            message.msg_type.ToString(),
+            message.msg_sub_type.ToString(),
+            message.media_type ?? "",
+            message.media_name ?? ""
+        );
+        using var sha = SHA256.Create();
+        return Convert.ToHexString(sha.ComputeHash(Encoding.UTF8.GetBytes(raw)));
+    }
+
+    private static string GetLegacyMessageKey(WeChatMessage message)
     {
         string raw = string.Join(
             "\u001f",
@@ -2092,7 +2139,13 @@ public class WeChatMonitor
                 ["payload"] = payloadElement
             };
 
-            var resp = await PostJsonWithRetryAsync(_eventsUrl, body, $"event_{eventName}", maxAttempts: 1);
+            var resp = await PostJsonWithRetryAsync(
+                _eventsUrl,
+                body,
+                $"event_{eventName}",
+                maxAttempts: 1,
+                requestTimeoutMs: EVENT_HTTP_TIMEOUT_MS
+            );
             if (!resp.Success)
                 Log($"运行日志上报失败: {eventName}: {resp.StatusCode} {resp.ErrorMessage}");
         }
@@ -2100,6 +2153,43 @@ public class WeChatMonitor
         {
             Log($"运行日志上报失败: {eventName}: {ex.Message}");
         }
+    }
+
+    private static void QueueRuntimeEvent(RuntimeProcessEvent runtimeEvent)
+    {
+        if (_runtimeEventPublisherTask.IsFaulted)
+        {
+            Log("运行日志后台发布器异常，跳过本次子进程事件");
+            return;
+        }
+
+        if (_runtimeEventQueue.Writer.TryWrite(runtimeEvent))
+            return;
+
+        if (IsCriticalRuntimeEvent(runtimeEvent.EventName))
+        {
+            Log($"运行日志队列已满，关键事件改为直接上报: {runtimeEvent.EventName}");
+            _ = PostEventAsync(runtimeEvent.EventName, runtimeEvent.Payload);
+            return;
+        }
+
+        Log($"运行日志队列已满，已丢弃低优先级事件: {runtimeEvent.EventName}");
+    }
+
+    private static async Task PublishRuntimeEventsAsync()
+    {
+        await foreach (RuntimeProcessEvent runtimeEvent in _runtimeEventQueue.Reader.ReadAllAsync())
+        {
+            await PostEventAsync(runtimeEvent.EventName, runtimeEvent.Payload);
+        }
+    }
+
+    private static bool IsCriticalRuntimeEvent(string eventName)
+    {
+        return string.Equals(eventName, "client_extract_failed", StringComparison.Ordinal)
+            || string.Equals(eventName, "client_chatlog_key_result", StringComparison.Ordinal)
+            || string.Equals(eventName, "client_disk_pipeline_result", StringComparison.Ordinal)
+            || string.Equals(eventName, "client_wechat_decrypt_export_result", StringComparison.Ordinal);
     }
 
     private static DecryptRunResult WithWeChatVersion(DecryptRunResult result, string? candidateVersion)
@@ -2371,7 +2461,8 @@ public class WeChatMonitor
         object body,
         string operationName,
         int maxAttempts = HTTP_RETRY_MAX_ATTEMPTS,
-        int baseDelayMs = HTTP_RETRY_BASE_DELAY_MS
+        int baseDelayMs = HTTP_RETRY_BASE_DELAY_MS,
+        int requestTimeoutMs = 0
     )
     {
         string json = JsonSerializer.Serialize(body);
@@ -2383,7 +2474,12 @@ public class WeChatMonitor
             try
             {
                 using var content = new StringContent(json, Encoding.UTF8, "application/json");
-                using var response = await _http.PostAsync(url, content);
+                using var timeoutCts = requestTimeoutMs > 0
+                    ? new CancellationTokenSource(requestTimeoutMs)
+                    : null;
+                using var response = timeoutCts is null
+                    ? await _http.PostAsync(url, content)
+                    : await _http.PostAsync(url, content, timeoutCts.Token);
                 string responseText = await response.Content.ReadAsStringAsync();
                 int statusCode = (int)response.StatusCode;
 
@@ -2452,6 +2548,8 @@ public class WeChatMonitor
 public class WeChatMessage
 {
     public string wxid { get; set; } = "";
+    [JsonIgnore]
+    public long local_id { get; set; }
     public string content { get; set; } = "";
     public long create_time { get; set; }
     public bool is_sender { get; set; }
@@ -2505,7 +2603,11 @@ internal sealed record DecryptRunResult(
     string ProcessResult = "",
     int MessageCount = 0,
     int AddedCount = 0,
-    string WeChatVersion = ""
+    string WeChatVersion = "",
+    string AttemptKind = "",
+    bool HardTimedOut = false,
+    int EffectiveHardTimeoutSeconds = 0,
+    bool KeyMaterialConfirmed = false
 );
 
 internal sealed record DecryptAttemptOptions(string AttemptKind, int SoftTimeoutSeconds, int HardTimeoutSeconds);

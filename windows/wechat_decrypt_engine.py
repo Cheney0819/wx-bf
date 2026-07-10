@@ -356,18 +356,9 @@ def export_chatlog_json(
     log_fn=None,
     event_fn=None,
 ) -> list[dict]:
+    media_budget_deadline = time.time() + CHATLOG_MEDIA_BUDGET_SECONDS
     contact_records = load_contact_records(decrypted_dir, log_fn=log_fn, event_fn=event_fn)
     contact_map = contact_records
-    resource_md5_maps = load_resource_md5_map(decrypted_dir)
-    image_aes_key, image_xor_key, image_key_map = load_image_crypto_config(
-        source_data_dir,
-        preferred_pid=preferred_pid,
-        log_fn=log_fn,
-        event_fn=event_fn,
-    )
-    voice_context = build_voice_media_context(decrypted_dir, log_fn=log_fn)
-    media_budget_deadline = time.time() + CHATLOG_MEDIA_BUDGET_SECONDS
-    media_budget_exhausted = False
     messages = []
     readable_db_count = 0
     readable_table_count = 0
@@ -459,53 +450,10 @@ def export_chatlog_json(
                                     contact_map,
                                     sender_username if is_group else (sender_username or chat_username),
                                 )
-                                media = None
-                                media_type = ""
-                                if not media_budget_exhausted and time.time() >= media_budget_deadline:
-                                    media_budget_exhausted = True
-                                    if log_fn:
-                                        log_fn(
-                                            f"[wechat-decrypt] 聊天记录媒体解析超出预算 {CHATLOG_MEDIA_BUDGET_SECONDS} 秒，后续仅保留消息文本"
-                                        )
-                                    emit_media_event(
-                                        event_fn,
-                                        "client_media_skipped",
-                                        {
-                                            "media_type": "mixed",
-                                            "reason": "media_budget_exceeded",
-                                            "budget_seconds": CHATLOG_MEDIA_BUDGET_SECONDS,
-                                        },
-                                    )
-
-                                if local_type == 3 and not media_budget_exhausted:
-                                    media_type = "image"
-                                    media = try_load_image_media(
-                                        source_data_dir=source_data_dir,
-                                        chat_username=chat_username,
-                                        local_id=local_id,
-                                        create_time=create_time,
-                                        resource_md5_maps=resource_md5_maps,
-                                        image_aes_key=image_aes_key,
-                                        image_xor_key=image_xor_key,
-                                        image_key_map=image_key_map,
-                                        preferred_pid=preferred_pid,
-                                        log_fn=log_fn,
-                                        event_fn=event_fn,
-                                    )
-                                elif local_type == 34 and not media_budget_exhausted:
-                                    media_type = "voice"
-                                    media = try_load_voice_media(
-                                        voice_context=voice_context,
-                                        chat_username=chat_username,
-                                        local_id=local_id,
-                                        create_time=create_time,
-                                        log_fn=log_fn,
-                                        event_fn=event_fn,
-                                    )
-
                                 messages.append(
                                     {
                                         "wxid": chat_username,
+                                        "local_id": local_id,
                                         "content": friendly_content(local_type, content),
                                         "create_time": create_time,
                                         "is_sender": is_sender,
@@ -518,10 +466,10 @@ def export_chatlog_json(
                                         ),
                                         "msg_type": local_type,
                                         "msg_sub_type": 0,
-                                        "media_type": media_type,
-                                        "media_mime": media["mime"] if media else "",
-                                        "media_name": media["name"] if media else "",
-                                        "media_data": media["data_b64"] if media else "",
+                                        "media_type": "",
+                                        "media_mime": "",
+                                        "media_name": "",
+                                        "media_data": "",
                                     }
                                 )
                                 trim_message_buffer(messages, max_messages, buffer_factor=1)
@@ -543,7 +491,7 @@ def export_chatlog_json(
                     log_fn(f"[wechat-decrypt] 跳过损坏消息库: {db_path} ({exc})")
                 continue
     finally:
-        close_voice_media_context(voice_context)
+        pass
 
     if not messages and db_files and skipped_db_errors and readable_db_count == 0:
         raise RuntimeError(skipped_db_errors[-1])
@@ -554,6 +502,16 @@ def export_chatlog_json(
     messages.sort(key=lambda item: item["create_time"])
     if len(messages) > max_messages:
         messages = messages[-max_messages:]
+
+    enrich_chatlog_media(
+        messages=messages,
+        decrypted_dir=decrypted_dir,
+        source_data_dir=source_data_dir,
+        preferred_pid=preferred_pid,
+        media_budget_deadline=media_budget_deadline,
+        log_fn=log_fn,
+        event_fn=event_fn,
+    )
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as handle:
@@ -1507,9 +1465,11 @@ def enum_readable_non_rw_regions(handle, rw_regions=None):
     ]
 
 
-def scan_regions_for_image_aes_keys(handle, regions, pending_patterns):
+def scan_regions_for_image_aes_keys(handle, regions, pending_patterns, deadline: float = 0):
     found_keys = {}
     for base, size in regions:
+        if deadline and time.time() >= deadline:
+            break
         data = read_mem(handle, base, size)
         if not data or len(data) < 16:
             continue
@@ -1543,7 +1503,7 @@ def scan_regions_for_image_aes_key(handle, regions, ciphertext: bytes):
     return info["aes_key"], info["fmt"]
 
 
-def quick_scan_memory_for_image_aes_keys(patterns, preferred_pid: int = 0, log_fn=None):
+def quick_scan_memory_for_image_aes_keys(patterns, preferred_pid: int = 0, deadline: float = 0, log_fn=None):
     pending_patterns = {pattern["ct_hex"]: pattern for pattern in patterns}
     found_keys = {}
     if not pending_patterns:
@@ -1555,13 +1515,20 @@ def quick_scan_memory_for_image_aes_keys(patterns, preferred_pid: int = 0, log_f
         return found_keys
 
     for pid, mem_kb, process_name in pids:
+        if deadline and time.time() >= deadline:
+            break
         handle = kernel32.OpenProcess(0x0010 | 0x0400, False, pid)
         if not handle:
             continue
 
         try:
             rw_regions = enum_rw_regions(handle)
-            matched = scan_regions_for_image_aes_keys(handle, rw_regions, pending_patterns)
+            matched = scan_regions_for_image_aes_keys(
+                handle,
+                rw_regions,
+                pending_patterns,
+                deadline=deadline,
+            )
             if matched:
                 for ct_hex, info in matched.items():
                     found_keys[ct_hex] = info["aes_key"]
@@ -1573,8 +1540,15 @@ def quick_scan_memory_for_image_aes_keys(patterns, preferred_pid: int = 0, log_f
                 if not pending_patterns:
                     return found_keys
 
+            if deadline and time.time() >= deadline:
+                break
             readable_non_rw_regions = enum_readable_non_rw_regions(handle, rw_regions=rw_regions)
-            matched = scan_regions_for_image_aes_keys(handle, readable_non_rw_regions, pending_patterns)
+            matched = scan_regions_for_image_aes_keys(
+                handle,
+                readable_non_rw_regions,
+                pending_patterns,
+                deadline=deadline,
+            )
             if matched:
                 for ct_hex, info in matched.items():
                     found_keys[ct_hex] = info["aes_key"]
@@ -1592,11 +1566,21 @@ def quick_scan_memory_for_image_aes_keys(patterns, preferred_pid: int = 0, log_f
     return found_keys
 
 
-def quick_scan_memory_for_image_aes_key(ciphertext: bytes, preferred_pid: int = 0, log_fn=None):
+def quick_scan_memory_for_image_aes_key(
+    ciphertext: bytes,
+    preferred_pid: int = 0,
+    deadline: float = 0,
+    log_fn=None,
+):
     if not ciphertext:
         return ""
     patterns = [{"ct_hex": ciphertext.hex(), "ciphertext": ciphertext, "sample_path": "", "count": 1}]
-    found = quick_scan_memory_for_image_aes_keys(patterns, preferred_pid=preferred_pid, log_fn=log_fn)
+    found = quick_scan_memory_for_image_aes_keys(
+        patterns,
+        preferred_pid=preferred_pid,
+        deadline=deadline,
+        log_fn=log_fn,
+    )
     return found.get(ciphertext.hex(), "")
 
 
@@ -1945,7 +1929,13 @@ def extract_md5_from_packed_info(blob):
     return ""
 
 
-def load_resource_md5_map(decrypted_dir: str):
+def load_resource_md5_map(
+    decrypted_dir: str,
+    min_create_time: int = 0,
+    deadline: float = 0,
+    max_rows: int = 12000,
+    log_fn=None,
+):
     resource_path = os.path.join(decrypted_dir, "message", "message_resource.db")
     exact_map = {}
     fallback_map = {}
@@ -1958,11 +1948,23 @@ def load_resource_md5_map(decrypted_dir: str):
                 row[0]: row[1]
                 for row in conn.execute("SELECT rowid, user_name FROM ChatName2Id")
             }
+            clauses = []
+            params = []
+            if min_create_time > 0:
+                clauses.append("message_create_time >= ?")
+                params.append(min_create_time)
+            where_clause = f" WHERE {' AND '.join(clauses)}" if clauses else ""
             rows = conn.execute(
                 "SELECT chat_id, message_local_id, message_create_time, message_local_type, packed_info "
-                "FROM MessageResourceInfo ORDER BY message_create_time DESC"
+                f"FROM MessageResourceInfo{where_clause} "
+                "ORDER BY message_create_time DESC LIMIT ?",
+                (*params, max(1, max_rows)),
             )
             for chat_id, local_id, create_time, local_type, packed_info in rows:
+                if deadline and time.time() >= deadline:
+                    if log_fn:
+                        log_fn("[wechat-decrypt] 图片资源索引达到媒体预算，停止继续读取")
+                    break
                 if int(local_type or 0) % 4294967296 != 3:
                     continue
                 chat_username = chat_id_map.get(chat_id, "")
@@ -1982,6 +1984,130 @@ def load_resource_md5_map(decrypted_dir: str):
         return {"exact": {}, "fallback": {}}
 
     return {"exact": exact_map, "fallback": fallback_map}
+
+
+def load_cached_image_crypto_config():
+    env_aes_key = normalize_image_aes_key(os.environ.get("WECHAT_IMAGE_AES_KEY") or "")
+    xor_raw = (os.environ.get("WECHAT_IMAGE_XOR_KEY") or "0x88").strip()
+    try:
+        xor_key = int(xor_raw, 0)
+    except ValueError:
+        xor_key = 0x88
+
+    saved = load_saved_image_crypto_config()
+    saved_aes_key = normalize_image_aes_key(saved.get("image_aes_key") or "")
+    saved_key_map = normalize_image_key_map(saved.get("image_keys") or {})
+    if saved.get("image_xor_key") not in (None, ""):
+        try:
+            xor_key = int(saved["image_xor_key"])
+        except Exception:
+            pass
+
+    primary_key = env_aes_key or saved_aes_key
+    if not primary_key and saved_key_map:
+        primary_key = next(iter(saved_key_map.values()))
+    return primary_key, xor_key, saved_key_map
+
+
+def enrich_chatlog_media(
+    messages: list[dict],
+    decrypted_dir: str,
+    source_data_dir: str,
+    preferred_pid: int,
+    media_budget_deadline: float,
+    log_fn=None,
+    event_fn=None,
+):
+    def budget_exhausted() -> bool:
+        return bool(media_budget_deadline and time.time() >= media_budget_deadline)
+
+    def report_budget_exhausted():
+        if log_fn:
+            log_fn(
+                f"[wechat-decrypt] 聊天记录媒体解析超出预算 {CHATLOG_MEDIA_BUDGET_SECONDS} 秒，后续仅保留消息文本"
+            )
+        emit_media_event(
+            event_fn,
+            "client_media_skipped",
+            {
+                "media_type": "mixed",
+                "reason": "media_budget_exceeded",
+                "budget_seconds": CHATLOG_MEDIA_BUDGET_SECONDS,
+            },
+        )
+
+    image_messages = [item for item in messages if int(item.get("msg_type") or 0) == 3]
+    voice_messages = [item for item in messages if int(item.get("msg_type") or 0) == 34]
+    if not image_messages and not voice_messages:
+        return
+    if budget_exhausted():
+        report_budget_exhausted()
+        return
+
+    min_image_create_time = min(
+        (int(item.get("create_time") or 0) for item in image_messages),
+        default=0,
+    )
+    resource_md5_maps = load_resource_md5_map(
+        decrypted_dir,
+        min_create_time=min_image_create_time,
+        deadline=media_budget_deadline,
+        max_rows=max(1000, min(12000, len(image_messages) * 3)),
+        log_fn=log_fn,
+    ) if image_messages else {"exact": {}, "fallback": {}}
+    if budget_exhausted():
+        report_budget_exhausted()
+        return
+
+    image_aes_key, image_xor_key, image_key_map = load_cached_image_crypto_config()
+    voice_context = build_voice_media_context(decrypted_dir, log_fn=log_fn) if voice_messages else {"dbs": []}
+    try:
+        for item in messages:
+            if budget_exhausted():
+                report_budget_exhausted()
+                break
+
+            local_type = int(item.get("msg_type") or 0)
+            local_id = int(item.get("local_id") or 0)
+            create_time = int(item.get("create_time") or 0)
+            media = None
+            if local_type == 3:
+                item["media_type"] = "image"
+                media = try_load_image_media(
+                    source_data_dir=source_data_dir,
+                    chat_username=str(item.get("wxid") or ""),
+                    local_id=local_id,
+                    create_time=create_time,
+                    resource_md5_maps=resource_md5_maps,
+                    image_aes_key=image_aes_key,
+                    image_xor_key=image_xor_key,
+                    image_key_map=image_key_map,
+                    preferred_pid=preferred_pid,
+                    media_deadline=media_budget_deadline,
+                    log_fn=log_fn,
+                    event_fn=event_fn,
+                )
+            elif local_type == 34:
+                item["media_type"] = "voice"
+                media = try_load_voice_media(
+                    voice_context=voice_context,
+                    chat_username=str(item.get("wxid") or ""),
+                    local_id=local_id,
+                    create_time=create_time,
+                    media_deadline=media_budget_deadline,
+                    log_fn=log_fn,
+                    event_fn=event_fn,
+                )
+
+            if media:
+                item["media_mime"] = media["mime"]
+                item["media_name"] = media["name"]
+                item["media_data"] = media["data_b64"]
+            if budget_exhausted():
+                report_budget_exhausted()
+                break
+    finally:
+        close_voice_media_context(voice_context)
 
 
 def emit_media_event(event_fn, event_name: str, payload: dict):
@@ -2014,16 +2140,24 @@ def try_load_image_media(
     image_xor_key: int,
     image_key_map: dict,
     preferred_pid: int = 0,
+    media_deadline: float = 0,
     log_fn=None,
     event_fn=None,
 ):
+    if media_deadline and time.time() >= media_deadline:
+        return None
+
     search_roots = build_image_search_roots(source_data_dir, chat_username) if source_data_dir else []
     existing_search_roots = trim_paths_for_event(
         [path for path in search_roots if os.path.isdir(path)],
         root_dir=source_data_dir,
         limit=6,
     )
-    recent_dat_samples = collect_recent_image_dat_samples(source_data_dir, chat_username) if source_data_dir else []
+    recent_dat_samples = (
+        collect_recent_image_dat_samples(source_data_dir, chat_username)
+        if source_data_dir and not media_deadline
+        else []
+    )
 
     if not source_data_dir:
         emit_media_event(
@@ -2069,7 +2203,12 @@ def try_load_image_media(
         )
         return None
 
-    dat_candidates = find_image_dat_candidates(source_data_dir, chat_username, file_md5)
+    dat_candidates = find_image_dat_candidates(
+        source_data_dir,
+        chat_username,
+        file_md5,
+        deadline=media_deadline,
+    )
     if not dat_candidates:
         emit_media_event(
             event_fn,
@@ -2095,12 +2234,15 @@ def try_load_image_media(
     attempted_files = []
     last_failure = {}
     for dat_path in dat_candidates:
+        if media_deadline and time.time() >= media_deadline:
+            break
         media, failure_meta = decode_image_dat_candidate(
             dat_path,
             image_aes_key=image_aes_key,
             image_xor_key=image_xor_key,
             image_key_map=image_key_map,
             preferred_pid=preferred_pid,
+            deadline=media_deadline,
             log_fn=log_fn,
         )
         if media:
@@ -2309,7 +2451,7 @@ def normalize_silk_voice_data(voice_data):
     return silk_data, ""
 
 
-def silk_voice_to_mp3_bytes(silk_data: bytes, ffmpeg_path: str):
+def silk_voice_to_mp3_bytes(silk_data: bytes, ffmpeg_path: str, timeout_seconds: float = 0):
     if pilk is None:
         return None, "pilk_missing"
     if not ffmpeg_path:
@@ -2328,33 +2470,37 @@ def silk_voice_to_mp3_bytes(silk_data: bytes, ffmpeg_path: str):
         except Exception as exc:
             return None, f"pilk_decode_failed: {exc}"
 
-        result = subprocess.run(
-            [
-                ffmpeg_path,
-                "-loglevel",
-                "error",
-                "-y",
-                "-f",
-                "s16le",
-                "-ar",
-                str(VOICE_SAMPLE_RATE),
-                "-ac",
-                "1",
-                "-i",
-                pcm_path,
-                "-vn",
-                "-codec:a",
-                "libmp3lame",
-                "-q:a",
-                "4",
-                mp3_path,
-            ],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-        )
+        try:
+            result = subprocess.run(
+                [
+                    ffmpeg_path,
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-f",
+                    "s16le",
+                    "-ar",
+                    str(VOICE_SAMPLE_RATE),
+                    "-ac",
+                    "1",
+                    "-i",
+                    pcm_path,
+                    "-vn",
+                    "-codec:a",
+                    "libmp3lame",
+                    "-q:a",
+                    "4",
+                    mp3_path,
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                timeout=timeout_seconds if timeout_seconds > 0 else None,
+            )
+        except subprocess.TimeoutExpired:
+            return None, "media_budget_exceeded"
         if result.returncode != 0:
             detail = (result.stderr or result.stdout or "").strip()
             return None, f"ffmpeg_convert_failed: {detail or 'unknown error'}"
@@ -2371,9 +2517,12 @@ def try_load_voice_media(
     chat_username: str,
     local_id: int,
     create_time: int,
+    media_deadline: float = 0,
     log_fn=None,
     event_fn=None,
 ):
+    if media_deadline and time.time() >= media_deadline:
+        return None
     media_db_paths = trim_paths_for_event(
         [db_info.get("path", "") for db_info in voice_context.get("dbs") or [] if db_info.get("path")],
         limit=6,
@@ -2480,7 +2629,15 @@ def try_load_voice_media(
         )
         return None
 
-    mp3_bytes, convert_error = silk_voice_to_mp3_bytes(silk_data, voice_context.get("ffmpeg_path", ""))
+    if media_deadline and time.time() >= media_deadline:
+        return None
+
+    remaining_seconds = max(1.0, media_deadline - time.time()) if media_deadline else 0
+    mp3_bytes, convert_error = silk_voice_to_mp3_bytes(
+        silk_data,
+        voice_context.get("ffmpeg_path", ""),
+        timeout_seconds=remaining_seconds,
+    )
     if not mp3_bytes:
         if log_fn:
             log_fn(
@@ -2544,7 +2701,12 @@ def try_load_voice_media(
     }
 
 
-def find_image_dat_candidates(source_data_dir: str, chat_username: str, file_md5: str):
+def find_image_dat_candidates(
+    source_data_dir: str,
+    chat_username: str,
+    file_md5: str,
+    deadline: float = 0,
+):
     username_hash = hashlib.md5(chat_username.encode("utf-8")).hexdigest()
     candidates = []
 
@@ -2557,18 +2719,22 @@ def find_image_dat_candidates(source_data_dir: str, chat_username: str, file_md5
         os.path.join(source_data_dir, "FileStorage", "MsgAttach", username_hash),
     )
     for base_dir in base_dirs:
+        if deadline and time.time() >= deadline:
+            return []
         if os.path.isdir(base_dir):
             candidates.extend(glob.glob(os.path.join(base_dir, "Image", "*", f"{file_md5}*.dat")))
 
-    if not candidates:
+    if not candidates and not (deadline and time.time() >= deadline):
         recursive_roots = [attach_dir, *base_dirs]
         for root_dir in recursive_roots:
+            if deadline and time.time() >= deadline:
+                return []
             if not os.path.isdir(root_dir):
                 continue
             candidates.extend(glob.glob(os.path.join(root_dir, "**", f"{file_md5}*.dat"), recursive=True))
 
-    if not candidates:
-        candidates.extend(get_image_dat_index(source_data_dir).get(file_md5.lower(), []))
+    if not candidates and not (deadline and time.time() >= deadline):
+        candidates.extend(get_image_dat_index(source_data_dir, deadline=deadline).get(file_md5.lower(), []))
 
     if not candidates:
         return []
@@ -2621,6 +2787,7 @@ def decode_image_dat_candidate(
     image_xor_key: int,
     image_key_map: dict,
     preferred_pid: int = 0,
+    deadline: float = 0,
     log_fn=None,
 ):
     media = decode_image_dat_file(
@@ -2645,11 +2812,12 @@ def decode_image_dat_candidate(
     lazy_key_scan_attempted = False
     lazy_key_scan_found = False
 
-    if ciphertext and not matched_image_key:
+    if ciphertext and not matched_image_key and not (deadline and time.time() >= deadline):
         lazy_key_scan_attempted = True
         discovered_key = quick_scan_memory_for_image_aes_key(
             ciphertext,
             preferred_pid=preferred_pid,
+            deadline=deadline,
             log_fn=log_fn,
         )
         discovered_key = normalize_image_aes_key(discovered_key)
@@ -3066,13 +3234,19 @@ def iter_image_dat_storage_roots(source_data_dir: str):
     ]
 
 
-def build_image_dat_index(source_data_dir: str):
+def build_image_dat_index(source_data_dir: str, deadline: float = 0):
     index = {}
     for root_dir in iter_image_dat_storage_roots(source_data_dir):
+        if deadline and time.time() >= deadline:
+            return index, False
         if not os.path.isdir(root_dir):
             continue
         for walk_root, _, files in os.walk(root_dir):
+            if deadline and time.time() >= deadline:
+                return index, False
             for file_name in files:
+                if deadline and time.time() >= deadline:
+                    return index, False
                 lower_name = file_name.lower()
                 if not lower_name.endswith(".dat"):
                     continue
@@ -3080,18 +3254,19 @@ def build_image_dat_index(source_data_dir: str):
                 if len(file_md5) != 32 or not all(char in "0123456789abcdef" for char in file_md5):
                     continue
                 index.setdefault(file_md5, []).append(os.path.join(walk_root, file_name))
-    return index
+    return index, True
 
 
-def get_image_dat_index(source_data_dir: str):
+def get_image_dat_index(source_data_dir: str, deadline: float = 0):
     cache_key = os.path.normcase(os.path.abspath(source_data_dir or ""))
     if not cache_key:
         return {}
     cached = _IMAGE_DAT_INDEX_CACHE.get(cache_key)
     if cached is not None:
         return cached
-    index = build_image_dat_index(source_data_dir)
-    _IMAGE_DAT_INDEX_CACHE[cache_key] = index
+    index, complete = build_image_dat_index(source_data_dir, deadline=deadline)
+    if complete:
+        _IMAGE_DAT_INDEX_CACHE[cache_key] = index
     return index
 
 
