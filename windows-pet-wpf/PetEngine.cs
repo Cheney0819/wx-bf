@@ -7,6 +7,7 @@ public sealed class PetEngine
     private readonly Random _random = new();
     private DateTime _lastInteractionAt = DateTime.Now;
     private DateTime _nextAmbientAt = DateTime.Now.AddSeconds(3);
+    private DateTime _nextExpressiveActionAt = DateTime.Now.AddSeconds(45);
     private DateTime _lastFrameStepAt = DateTime.Now;
     private DateTime _nextSleepEligibleAt = DateTime.Now.AddMinutes(2);
     private DateTime? _sleepUntil;
@@ -242,28 +243,9 @@ public sealed class PetEngine
         }
 
         AnimateCurrentState();
-
-        if (DateTime.Now < _stateEndsAt)
-            return BuildVisual();
-
-        var idleSeconds = (DateTime.Now - _lastInteractionAt).TotalSeconds;
-        if (idleSeconds <= 8)
-        {
-            if (_random.NextDouble() < 0.4)
-                SetBlink();
-            else
-                SetCozy();
-        }
-        else if (Energy <= 20)
-        {
-            BecomeTired();
-        }
-        else
-        {
+        // ponytail: only return to idle here; AutoBehavior owns random state transitions.
+        if (_state != PetState.Idle && DateTime.Now >= _stateEndsAt)
             SetIdle();
-        }
-
-        ScheduleNextAmbient();
         return BuildVisual();
     }
 
@@ -373,67 +355,51 @@ public sealed class PetEngine
             return BuildVisual();
         }
 
-        if (idleSeconds > 20)
+        if (Energy <= 20)
+        {
+            BecomeTired();
+            ScheduleNextAmbient();
+            return BuildVisual();
+        }
+
+        if (idleSeconds > 20 && DateTime.Now >= _nextExpressiveActionAt)
         {
             Energy = Math.Max(0, Energy - 4);
-            switch (_random.Next(0, 4))
+            switch (_random.Next(0, 3))
             {
                 case 0:
-                    SetSolo();
+                    SetWave();
                     break;
                 case 1:
                     SetPatrolling();
                     break;
-                case 2:
-                    SetStretch();
-                    break;
                 default:
-                    SetWave();
+                    SetStretch();
                     break;
             }
 
+            ScheduleNextExpressiveAction();
             ScheduleNextAmbient();
             return BuildVisual();
         }
 
         if (idleSeconds > 10 && Energy > 35)
         {
-            Energy = Math.Max(0, Energy - 3);
-            switch (_random.Next(0, 4))
-            {
-                case 0:
-                    SetCozy();
-                    break;
-                case 1:
-                    SetBlink();
-                    break;
-                case 2:
-                    SetShy();
-                    break;
-                default:
-                    SetListen();
-                    break;
-            }
-
-            ScheduleNextAmbient();
-            return BuildVisual();
+            Energy = Math.Max(0, Energy - 2);
         }
 
-        switch (_random.Next(0, 6))
+        switch (_random.Next(0, 5))
         {
             case 0:
                 SetBlink();
                 break;
             case 1:
-                SetWave();
+                SetListen();
                 break;
             case 2:
                 SetShy();
                 break;
             case 3:
-                SetListen();
-                break;
-            case 4:
                 SetSolo();
                 break;
             default:
@@ -459,7 +425,12 @@ public sealed class PetEngine
 
     private void ScheduleNextAmbient()
     {
-        _nextAmbientAt = DateTime.Now.AddSeconds(_random.Next(4, 9));
+        _nextAmbientAt = DateTime.Now.AddSeconds(_random.Next(12, 21));
+    }
+
+    private void ScheduleNextExpressiveAction()
+    {
+        _nextExpressiveActionAt = DateTime.Now.AddSeconds(_random.Next(40, 91));
     }
 
     private void BeginState(PetState state, int minSeconds, int maxSeconds)
@@ -473,7 +444,7 @@ public sealed class PetEngine
     private void AnimateCurrentState()
     {
         var now = DateTime.Now;
-        if ((now - _lastFrameStepAt).TotalMilliseconds < 420)
+        if ((now - _lastFrameStepAt).TotalMilliseconds < 600)
             return;
 
         _lastFrameStepAt = now;
@@ -482,7 +453,7 @@ public sealed class PetEngine
         switch (_state)
         {
             case PetState.Idle:
-                CurrentFrameIndex = _animationStep % 4 == 1 ? 2 : 0;
+                CurrentFrameIndex = _animationStep % 6 == 1 ? 2 : 0;
                 break;
             case PetState.Blink:
                 CurrentFrameIndex = _animationStep % 2 == 0 ? 0 : 2;
@@ -496,9 +467,11 @@ public sealed class PetEngine
                 CurrentFrameIndex = _animationStep % 3 == 1 ? 10 : 0;
                 break;
             case PetState.Happy:
+                CurrentFrameIndex = _animationStep % 2 == 0 ? 14 : 0;
+                break;
             case PetState.Shy:
             case PetState.Cozy:
-                CurrentFrameIndex = _animationStep % 2 == 0 ? 14 : 0;
+                CurrentFrameIndex = _animationStep % 4 == 1 ? 14 : 0;
                 break;
             case PetState.Dizzy:
                 CurrentFrameIndex = _animationStep % 2 == 0 ? 15 : 10;
@@ -528,7 +501,7 @@ public sealed class PetEngine
 
     private void SetIdle()
     {
-        BeginState(PetState.Idle, 2, 4);
+        BeginState(PetState.Idle, 6, 10);
         CurrentFrameIndex = 0;
         CurrentSpeech = Pick(IdleLines);
         CurrentEmotion = "♡";
@@ -588,7 +561,7 @@ public sealed class PetEngine
 
     private void SetShy()
     {
-        BeginState(PetState.Shy, 2, 3);
+        BeginState(PetState.Shy, 5, 8);
         CurrentFrameIndex = 14;
         CurrentSpeech = Pick(ShyLines);
         CurrentEmotion = "✿";
@@ -598,7 +571,7 @@ public sealed class PetEngine
 
     private void SetListen()
     {
-        BeginState(PetState.Listen, 2, 3);
+        BeginState(PetState.Listen, 5, 8);
         CurrentFrameIndex = 10;
         CurrentSpeech = Pick(ListenLines);
         CurrentEmotion = "◔";
@@ -686,7 +659,7 @@ public sealed class PetEngine
 
     private void SetSolo()
     {
-        BeginState(PetState.Solo, 3, 4);
+        BeginState(PetState.Solo, 5, 8);
         CurrentFrameIndex = 2;
         CurrentSpeech = Pick(SoloLines);
         CurrentEmotion = "…";
@@ -716,7 +689,7 @@ public sealed class PetEngine
 
     private void SetCozy()
     {
-        BeginState(PetState.Cozy, 2, 4);
+        BeginState(PetState.Cozy, 5, 8);
         CurrentFrameIndex = _random.NextDouble() < 0.5 ? 0 : 14;
         CurrentSpeech = Pick(CozyLines);
         CurrentEmotion = "♡";

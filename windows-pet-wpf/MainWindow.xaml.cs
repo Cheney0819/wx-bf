@@ -18,7 +18,7 @@ public partial class MainWindow : Window
     private const double BubbleToPetGap = 12;
     private const double WindowBottomPadding = 34;
     private readonly PetEngine _engine = new();
-    private readonly DispatcherTimer _renderTimer = new() { Interval = TimeSpan.FromMilliseconds(220) };
+    private readonly DispatcherTimer _renderTimer = new() { Interval = TimeSpan.FromMilliseconds(300) };
     private readonly DispatcherTimer _autonomyTimer = new() { Interval = TimeSpan.FromSeconds(4) };
     private readonly DispatcherTimer _energyTimer = new() { Interval = TimeSpan.FromSeconds(4) };
     private readonly List<BitmapSource> _frames = [];
