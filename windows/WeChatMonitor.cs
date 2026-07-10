@@ -27,6 +27,7 @@ public class WeChatMonitor
     private const int DEFAULT_PUSH_INTERVAL_SECONDS = 60;
     private const string DECRYPT_EXE_NAME = "wx_decrypt.exe";
     private const int EXISTING_PROCESS_QUICK_TRY_SECONDS = 30;
+    private const int EXISTING_PROCESS_KEY_SCAN_TIMEOUT_SECONDS = 120;
     private const int DECRYPT_SOFT_TIMEOUT_SECONDS = 180;
     private const int DECRYPT_HARD_TIMEOUT_SECONDS = 600;
     private const int DECRYPT_PROGRESS_EVENT_INTERVAL_SECONDS = 30;
@@ -460,6 +461,7 @@ public class WeChatMonitor
         var nextProgressEventAt = TimeSpan.FromSeconds(DECRYPT_PROGRESS_EVENT_INTERVAL_SECONDS);
         bool slowWarningSent = false;
         bool exited = false;
+        bool timeoutExtendedAfterKeyScanStarted = false;
         bool timeoutExtendedAfterKeyReady = false;
 
         while (decryptStopwatch.Elapsed < TimeSpan.FromSeconds(activeHardTimeoutSeconds))
@@ -468,6 +470,27 @@ public class WeChatMonitor
             {
                 exited = true;
                 break;
+            }
+
+            if (
+                isExistingProcessQuickTry
+                && !timeoutExtendedAfterKeyScanStarted
+                && outputState.HasStartedKeyScan
+            )
+            {
+                activeHardTimeoutSeconds = EXISTING_PROCESS_KEY_SCAN_TIMEOUT_SECONDS;
+                timeoutExtendedAfterKeyScanStarted = true;
+                await PostEventAsync("client_decrypt_progress", new
+                {
+                    pid = process.Id,
+                    elapsed_seconds = (int)Math.Floor(decryptStopwatch.Elapsed.TotalSeconds),
+                    soft_timeout_seconds = activeSoftTimeoutSeconds,
+                    hard_timeout_seconds = activeHardTimeoutSeconds,
+                    decrypt_dir = decryptDir,
+                    attempt_kind = attemptOptions.AttemptKind,
+                    stage = "timeout_extended_after_key_scan_started",
+                    original_hard_timeout_seconds = attemptOptions.HardTimeoutSeconds
+                });
             }
 
             if (
@@ -2689,6 +2712,8 @@ internal sealed class DecryptProcessOutputState
 
     public bool HasConfirmedKeyMaterial { get; set; }
 
+    public bool HasStartedKeyScan { get; set; }
+
     public int MessageCount { get; set; }
 
     public int AddedCount { get; set; }
@@ -2728,6 +2753,12 @@ internal sealed class DecryptProcessOutputState
         {
             if (ReadBool(runtimeEvent.Payload, "success") || ReadBool(runtimeEvent.Payload, "has_key"))
                 HasConfirmedKeyMaterial = true;
+            return;
+        }
+
+        if (string.Equals(runtimeEvent.EventName, "client_chatlog_key_attempt", StringComparison.Ordinal))
+        {
+            HasStartedKeyScan = true;
             return;
         }
 
