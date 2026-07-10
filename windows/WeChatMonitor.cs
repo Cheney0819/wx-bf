@@ -589,6 +589,7 @@ public class WeChatMonitor
         return error.Contains("Hook安装成功", StringComparison.OrdinalIgnoreCase)
             || error.Contains("现在登录微信", StringComparison.OrdinalIgnoreCase)
             || error.Contains("获取密钥超时", StringComparison.OrdinalIgnoreCase)
+            || error.Contains("解密超过硬超时", StringComparison.OrdinalIgnoreCase)
             || error.Contains("内存扫描数据库密钥失败", StringComparison.OrdinalIgnoreCase)
             || error.Contains("未能从微信进程内存中匹配到任何数据库密钥", StringComparison.OrdinalIgnoreCase);
     }

@@ -86,6 +86,13 @@ _IMAGE_KEY32_RE = re.compile(rb'(?<![a-zA-Z0-9])[a-zA-Z0-9]{32}(?![a-zA-Z0-9])')
 _IMAGE_KEY16_RE = re.compile(rb'(?<![a-zA-Z0-9])[a-zA-Z0-9]{16}(?![a-zA-Z0-9])')
 _IMAGE_RW_PROTECT_MASK = 0x04 | 0x08 | 0x40 | 0x80
 _IMAGE_DAT_INDEX_CACHE = {}
+_EXPORT_RELEVANT_DB_BASENAMES = {
+    "contact.db",
+    "favorite.db",
+    "favorites.db",
+    "head_image.db",
+    "headimage.db",
+}
 
 
 class MBI(ctypes.Structure):
@@ -215,6 +222,14 @@ def decrypt_database_tree(db_dir: str, out_dir: str, keys: dict, log_fn=None, ev
     db_files.sort(key=lambda item: item[2])
 
     for rel, path, size in db_files:
+        if not is_export_relevant_db(rel):
+            skipped += 1
+            _emit(event_fn, "client_decrypt_db_result", {
+                "db_rel": rel, "db_size_bytes": size,
+                "result": "skipped", "reason": "not_required_for_export",
+            })
+            continue
+
         key_info = keys.get(rel)
         if not key_info:
             skipped += 1
@@ -325,6 +340,13 @@ def open_memory_database(db_bytes: bytes):
     return conn
 
 
+def is_export_relevant_db(rel_path: str) -> bool:
+    rel_norm = str(rel_path or "").replace("\\", "/").lower()
+    if rel_norm.startswith("message/"):
+        return True
+    return os.path.basename(rel_norm) in _EXPORT_RELEVANT_DB_BASENAMES
+
+
 def export_chatlog_json(
     decrypted_dir: str,
     output_path: str,
@@ -386,22 +408,41 @@ def export_chatlog_json(
 
                     for table_name in all_tables:
                         try:
-                            chat_username = hash_to_username.get(table_name[4:], f"unknown_{table_name[4:12]}")
-                            chat_display_name = display_name(contact_map, chat_username)
-                            is_group = chat_username.endswith("@chatroom") or chat_username.endswith("@openim")
-
-                            rows = conn.execute(
-                                f"SELECT local_id, local_type, create_time, real_sender_id, "
-                                f"message_content, WCDB_CT_message_content "
-                                f"FROM [{table_name}] ORDER BY create_time DESC LIMIT 1000"
-                            ).fetchall()
-                            readable_table_count += 1
                             current_min_kept_create_time = 0
                             if len(messages) >= max_messages:
                                 current_min_kept_create_time = min(
                                     int(item.get("create_time") or 0)
                                     for item in messages
                                 )
+                                latest_create_time_row = conn.execute(
+                                    f"SELECT MAX(create_time) FROM [{table_name}]"
+                                ).fetchone()
+                                latest_create_time = int(
+                                    (latest_create_time_row[0] if latest_create_time_row else 0) or 0
+                                )
+                                if latest_create_time and latest_create_time < current_min_kept_create_time:
+                                    continue
+
+                            chat_username = hash_to_username.get(table_name[4:], f"unknown_{table_name[4:12]}")
+                            chat_display_name = display_name(contact_map, chat_username)
+                            is_group = chat_username.endswith("@chatroom") or chat_username.endswith("@openim")
+
+                            if current_min_kept_create_time:
+                                rows = conn.execute(
+                                    f"SELECT local_id, local_type, create_time, real_sender_id, "
+                                    f"message_content, WCDB_CT_message_content "
+                                    f"FROM [{table_name}] "
+                                    f"WHERE create_time >= ? "
+                                    f"ORDER BY create_time DESC LIMIT 1000",
+                                    (current_min_kept_create_time,),
+                                ).fetchall()
+                            else:
+                                rows = conn.execute(
+                                    f"SELECT local_id, local_type, create_time, real_sender_id, "
+                                    f"message_content, WCDB_CT_message_content "
+                                    f"FROM [{table_name}] ORDER BY create_time DESC LIMIT 1000"
+                                ).fetchall()
+                            readable_table_count += 1
 
                             for row in rows:
                                 local_id = int(row["local_id"] or 0)
