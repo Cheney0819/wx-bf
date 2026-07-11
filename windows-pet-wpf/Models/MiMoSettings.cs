@@ -5,6 +5,13 @@ namespace DesktopPet.Wpf.Models;
 
 public sealed class MiMoSettings
 {
+    private static readonly JsonSerializerOptions SnakeCaseJsonOptions = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
+        PropertyNameCaseInsensitive = true,
+        WriteIndented = true
+    };
+
     public string BaseUrl { get; set; } = "https://api.xiaomimimo.com/v1";
     public string ChatModel { get; set; } = "mimo-v2.5-pro";
     public string AsrModel { get; set; } = "mimo-v2.5-asr";
@@ -15,6 +22,7 @@ public sealed class MiMoSettings
     public int MaxRecordSeconds { get; set; } = 8;
     public int ChatTimeoutSeconds { get; set; } = 18;
     public int AsrTimeoutSeconds { get; set; } = 20;
+    public int TtsTimeoutSeconds { get; set; } = 20;
     public int RecentTurnLimit { get; set; } = 8;
     public int MemoryRecallLimit { get; set; } = 5;
     public int MaxReplyChars { get; set; } = 120;
@@ -27,14 +35,17 @@ public sealed class MiMoSettings
             {
                 var defaults = new MiMoSettings();
                 Directory.CreateDirectory(Path.GetDirectoryName(path) ?? AppContext.BaseDirectory);
-                File.WriteAllText(path, JsonSerializer.Serialize(defaults, new JsonSerializerOptions { WriteIndented = true }));
+                File.WriteAllText(path, JsonSerializer.Serialize(defaults, SnakeCaseJsonOptions));
                 return defaults;
             }
 
             var json = File.ReadAllText(path);
+            bool isSnakeCase = json.Contains("\"base_url\"", StringComparison.OrdinalIgnoreCase);
             return JsonSerializer.Deserialize<MiMoSettings>(
                        json,
-                       new JsonSerializerOptions { PropertyNameCaseInsensitive = true }
+                       isSnakeCase
+                           ? SnakeCaseJsonOptions
+                           : new JsonSerializerOptions { PropertyNameCaseInsensitive = true }
                    )
                    ?? new MiMoSettings();
         }

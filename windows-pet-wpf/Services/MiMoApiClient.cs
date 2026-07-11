@@ -53,12 +53,16 @@ internal sealed class MiMoApiClient
                             ["type"] = "input_audio",
                             ["input_audio"] = new Dictionary<string, object?>
                             {
-                                ["data"] = base64Audio,
+                                ["data"] = $"data:audio/wav;base64,{base64Audio}",
                                 ["format"] = "wav"
                             }
                         }
                     }
                 }
+            },
+            ["asr_options"] = new Dictionary<string, object?>
+            {
+                ["language"] = "auto"
             }
         };
 
@@ -170,7 +174,7 @@ internal sealed class MiMoApiClient
         );
 
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeoutCts.CancelAfter(TimeSpan.FromSeconds(Math.Max(5, settings.AsrTimeoutSeconds)));
+        timeoutCts.CancelAfter(TimeSpan.FromSeconds(Math.Max(5, settings.TtsTimeoutSeconds)));
 
         using var response = await _httpClient.SendAsync(request, timeoutCts.Token);
         string responseText = await response.Content.ReadAsStringAsync(timeoutCts.Token);
