@@ -831,10 +831,7 @@ def detect_v4_instance():
             if name.lower() != "weixin.exe":
                 continue
 
-            cmdline = " ".join(proc.info.get("cmdline") or [])
-            if "--" in cmdline:
-                continue
-
+            # 新版主进程也会携带 --enable-* 等参数；后续的数据目录校验会排除无效目标。
             data_dir = detect_v4_data_dir_from_open_files(proc)
             unc_data_dir = detect_v4_unc_data_dir_from_open_files(proc)
             data_dir_candidates = []
