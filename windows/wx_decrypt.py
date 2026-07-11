@@ -825,65 +825,94 @@ def sync_v4_validator_db_to_unc(local_data_dir: str, unc_data_dir: str):
 
 def detect_v4_instance():
     fallback = None
-    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
-        try:
-            name = (proc.info.get("name") or "").strip()
-            if name.lower() != "weixin.exe":
-                continue
+    diagnostics = {
+        "process_count": 0,
+        "weixin_processes": [],
+        "errors": [],
+    }
+    try:
+        processes = psutil.process_iter(["pid", "name"])
+        for proc in processes:
+            diagnostics["process_count"] += 1
+            process_diagnostic = {"pid": 0, "name": ""}
+            try:
+                pid = int(proc.info.get("pid") or 0)
+                name = (proc.info.get("name") or "").strip()
+                process_diagnostic.update({"pid": pid, "name": name})
+                if name.lower() != "weixin.exe":
+                    continue
 
-            # 新版主进程也会携带 --enable-* 等参数；后续的数据目录校验会排除无效目标。
-            data_dir = detect_v4_data_dir_from_open_files(proc)
-            unc_data_dir = detect_v4_unc_data_dir_from_open_files(proc)
-            data_dir_candidates = []
-            data_dir_source = ""
-            scan_context = {
-                "configured_roots": [],
-                "search_roots": [],
-                "drive_roots": [],
-            }
-            if data_dir:
-                log_debug(f"Weixin.exe pid={proc.info.get('pid')} 通过 open_files 命中 data_dir: {data_dir}")
-                data_dir_candidates.append(data_dir)
-                data_dir_source = "open_files"
-            if not data_dir:
-                scan_result = collect_v4_data_dir_candidates()
-                candidates = scan_result.get("candidates") or []
+                diagnostics["weixin_processes"].append(process_diagnostic)
+                data_dir = detect_v4_data_dir_from_open_files(proc)
+                unc_data_dir = detect_v4_unc_data_dir_from_open_files(proc)
+                data_dir_candidates = []
+                data_dir_source = ""
                 scan_context = {
-                    "configured_roots": scan_result.get("configured_roots") or [],
-                    "search_roots": scan_result.get("search_roots") or [],
-                    "drive_roots": scan_result.get("drive_roots") or [],
+                    "configured_roots": [],
+                    "search_roots": [],
+                    "drive_roots": [],
                 }
-                if candidates:
-                    preview = ", ".join(item.get("path", "") for item in candidates[:3])
-                    log_debug(
-                        f"Weixin.exe pid={proc.info.get('pid')} open_files 未命中，目录扫描找到 {len(candidates)} 个候选，优先使用: {preview}"
-                    )
-                    data_dir_candidates = [str(item.get("path") or "") for item in candidates if item.get("path")]
-                    data_dir = data_dir_candidates[0] if data_dir_candidates else ""
-                    data_dir_source = "scan_candidates"
-                else:
-                    log_debug(
-                        f"Weixin.exe pid={proc.info.get('pid')} open_files 未命中，目录扫描也没有找到可用的 v4 data_dir"
-                    )
-                    data_dir_source = "scan_not_found"
+                if data_dir:
+                    log_debug(f"Weixin.exe pid={pid} 通过 open_files 命中 data_dir: {data_dir}")
+                    data_dir_candidates.append(data_dir)
+                    data_dir_source = "open_files"
+                if not data_dir:
+                    scan_result = collect_v4_data_dir_candidates()
+                    candidates = scan_result.get("candidates") or []
+                    scan_context = {
+                        "configured_roots": scan_result.get("configured_roots") or [],
+                        "search_roots": scan_result.get("search_roots") or [],
+                        "drive_roots": scan_result.get("drive_roots") or [],
+                    }
+                    if candidates:
+                        preview = ", ".join(item.get("path", "") for item in candidates[:3])
+                        log_debug(
+                            f"Weixin.exe pid={pid} open_files 未命中，目录扫描找到 {len(candidates)} 个候选，优先使用: {preview}"
+                        )
+                        data_dir_candidates = [str(item.get("path") or "") for item in candidates if item.get("path")]
+                        data_dir = data_dir_candidates[0] if data_dir_candidates else ""
+                        data_dir_source = "scan_candidates"
+                    else:
+                        log_debug(
+                            f"Weixin.exe pid={pid} open_files 未命中，目录扫描也没有找到可用的 v4 data_dir"
+                        )
+                        data_dir_source = "scan_not_found"
 
-            candidate = {
-                "pid": int(proc.info.get("pid") or 0),
-                "name": name,
-                "data_dir": data_dir,
-                "data_dir_candidates": data_dir_candidates,
-                "data_dir_source": data_dir_source,
-                "unc_data_dir": unc_data_dir,
-                "scan_context": scan_context,
-            }
-            if data_dir:
-                return candidate
-            if fallback is None:
-                fallback = candidate
-        except Exception:
-            continue
+                process_diagnostic["data_dir_found"] = bool(data_dir)
+                process_diagnostic["data_dir_source"] = data_dir_source
+                candidate = {
+                    "pid": pid,
+                    "name": name,
+                    "data_dir": data_dir,
+                    "data_dir_candidates": data_dir_candidates,
+                    "data_dir_source": data_dir_source,
+                    "unc_data_dir": unc_data_dir,
+                    "scan_context": scan_context,
+                }
+                if data_dir:
+                    return candidate, diagnostics
+                if fallback is None:
+                    fallback = candidate
+            except Exception as exc:
+                process_diagnostic["error_type"] = type(exc).__name__
+                process_diagnostic["error_message"] = str(exc)[:300]
+                diagnostics["errors"].append(process_diagnostic.copy())
+    except Exception as exc:
+        diagnostics["enumeration_error_type"] = type(exc).__name__
+        diagnostics["enumeration_error_message"] = str(exc)[:300]
 
-    return fallback
+    return fallback, diagnostics
+
+
+def format_v4_detection_summary(diagnostics: dict) -> str:
+    weixin_processes = diagnostics.get("weixin_processes") or []
+    errors = diagnostics.get("errors") or []
+    summary = (
+        f"psutil 枚举 {int(diagnostics.get('process_count') or 0)} 个进程，"
+        f"其中 Weixin.exe {len(weixin_processes)} 个，处理异常 {len(errors)} 个"
+    )
+    enumeration_error = str(diagnostics.get("enumeration_error_type") or "").strip()
+    return f"{summary}，枚举异常 {enumeration_error}" if enumeration_error else summary
 
 
 def run_command(args, timeout=180, env_overrides: dict | None = None):
@@ -1561,7 +1590,7 @@ def main():
     reset_output_artifacts(decrypt_dir)
 
     try:
-        v4_instance = detect_v4_instance()
+        v4_instance, v4_diagnostics = detect_v4_instance()
         if v4_instance:
             emit_login_status(True)
             export_v4_messages(
@@ -1579,8 +1608,9 @@ def main():
         emit_login_status(bool(running))
         if running:
             emit_extract_failed(
-                f"检测到微信进程 {', '.join(running)}，但当前桌宠仅支持新版 Weixin 4.x 自动链路",
+                f"检测到微信进程 {', '.join(running)}，但未识别到可用的 V4 数据目录（{format_v4_detection_summary(v4_diagnostics)}）",
                 running_processes=running,
+                v4_detection=v4_diagnostics,
             )
         else:
             emit_extract_failed("未检测到已登录的新版 Weixin 4.x")
