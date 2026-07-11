@@ -14,6 +14,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import psutil
 from string import ascii_uppercase
 from base64 import b64encode
 from datetime import datetime
@@ -823,11 +824,6 @@ def sync_v4_validator_db_to_unc(local_data_dir: str, unc_data_dir: str):
 
 
 def detect_v4_instance():
-    try:
-        import psutil
-    except ImportError:
-        return None
-
     fallback = None
     for proc in psutil.process_iter(["pid", "name", "cmdline"]):
         try:

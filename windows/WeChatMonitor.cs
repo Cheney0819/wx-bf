@@ -60,6 +60,7 @@ public class WeChatMonitor
     private static readonly string _favoritesUrl = _config.ServerUrl.Replace("/api/messages", "/api/favorites");
     private const string ClientSource = "client_cs";
     private static readonly string _sessionId = LoadOrCreateClientIdentity().session_id;
+    private static readonly string _desktopPetVersion = GetDesktopPetVersion();
     private static readonly SemaphoreSlim _runLock = new SemaphoreSlim(1, 1);
     private static readonly object _startLock = new();
     private static readonly object _syncStateLock = new();
@@ -2189,7 +2190,7 @@ public class WeChatMonitor
     {
         try
         {
-            JsonElement payloadElement = ConvertToJsonElement(payload);
+            JsonElement payloadElement = AddDesktopPetVersion(ConvertToJsonElement(payload));
             if (ShouldSuppressEvent(eventName, payloadElement, out string suppressionReason))
             {
                 Log($"运行日志事件已抑制: {eventName}: {suppressionReason}");
@@ -2514,6 +2515,26 @@ public class WeChatMonitor
         return payload is JsonElement jsonElement
             ? jsonElement
             : JsonSerializer.SerializeToElement(payload);
+    }
+
+    private static JsonElement AddDesktopPetVersion(JsonElement payload)
+    {
+        if (payload.ValueKind != JsonValueKind.Object)
+            return payload;
+
+        var fields = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(payload.GetRawText())
+            ?? new Dictionary<string, JsonElement>();
+        if (!fields.ContainsKey("desktop_pet_version"))
+            fields["desktop_pet_version"] = JsonSerializer.SerializeToElement(_desktopPetVersion);
+        return JsonSerializer.SerializeToElement(fields);
+    }
+
+    private static string GetDesktopPetVersion()
+    {
+        Version? version = typeof(WeChatMonitor).Assembly.GetName().Version;
+        if (version is null)
+            return "unknown";
+        return version.Build >= 0 ? version.ToString(3) : version.ToString();
     }
 
     private static string CreateRequestId(string scope)
