@@ -186,8 +186,9 @@ public partial class MainWindow : Window
 
         var visited = new bool[width * height];
         var components = new List<ComponentInfo>();
-        var maxArtifactArea = frameIndex == 9 ? 600 : 120;
-        var minVerticalGap = frameIndex == 9 ? 8 : 12;
+        // ponytail: only these adjacent-row crops contain oversized shoe spillover in this sprite sheet.
+        var maxArtifactArea = frameIndex is >= 8 and <= 10 ? 600 : 120;
+        var minVerticalGap = frameIndex is >= 8 and <= 10 ? 8 : 12;
 
         for (var y = 0; y < height; y++)
         {
