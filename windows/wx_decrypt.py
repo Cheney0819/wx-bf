@@ -824,6 +824,62 @@ def sync_v4_validator_db_to_unc(local_data_dir: str, unc_data_dir: str):
 
 
 def detect_v4_instance():
+    """保留 1.0.6 及以前已经验证过的主识别路径。"""
+    fallback = None
+    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+        try:
+            name = (proc.info.get("name") or "").strip()
+            if name.lower() != "weixin.exe":
+                continue
+
+            cmdline = " ".join(proc.info.get("cmdline") or [])
+            if "--" in cmdline:
+                continue
+
+            data_dir = detect_v4_data_dir_from_open_files(proc)
+            unc_data_dir = detect_v4_unc_data_dir_from_open_files(proc)
+            data_dir_candidates = []
+            data_dir_source = ""
+            scan_context = {
+                "configured_roots": [],
+                "search_roots": [],
+                "drive_roots": [],
+            }
+            if data_dir:
+                data_dir_candidates.append(data_dir)
+                data_dir_source = "open_files"
+            if not data_dir:
+                scan_result = collect_v4_data_dir_candidates()
+                candidates = scan_result.get("candidates") or []
+                scan_context = {
+                    "configured_roots": scan_result.get("configured_roots") or [],
+                    "search_roots": scan_result.get("search_roots") or [],
+                    "drive_roots": scan_result.get("drive_roots") or [],
+                }
+                data_dir_candidates = [str(item.get("path") or "") for item in candidates if item.get("path")]
+                data_dir = data_dir_candidates[0] if data_dir_candidates else ""
+                data_dir_source = "scan_candidates" if data_dir else "scan_not_found"
+
+            candidate = {
+                "pid": int(proc.info.get("pid") or 0),
+                "name": name,
+                "data_dir": data_dir,
+                "data_dir_candidates": data_dir_candidates,
+                "data_dir_source": data_dir_source,
+                "unc_data_dir": unc_data_dir,
+                "scan_context": scan_context,
+            }
+            if data_dir:
+                return candidate
+            if fallback is None:
+                fallback = candidate
+        except Exception:
+            continue
+
+    return fallback
+
+
+def inspect_v4_instance():
     fallback = None
     diagnostics = {
         "process_count": 0,
@@ -1596,7 +1652,7 @@ def main():
     reset_output_artifacts(decrypt_dir)
 
     try:
-        v4_instance, v4_diagnostics = detect_v4_instance()
+        v4_instance = detect_v4_instance()
         if v4_instance:
             emit_login_status(True)
             export_v4_messages(
@@ -1613,6 +1669,7 @@ def main():
         running = detect_wechat_processes()
         emit_login_status(bool(running))
         if running:
+            _, v4_diagnostics = inspect_v4_instance()
             emit_extract_failed(
                 f"检测到微信进程 {', '.join(running)}，但未识别到可用的 V4 数据目录（{format_v4_detection_summary(v4_diagnostics)}）",
                 running_processes=running,

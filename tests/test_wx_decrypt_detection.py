@@ -18,7 +18,34 @@ def load_function(function_name: str, namespace: dict) -> object:
 
 
 def load_detector(namespace: dict) -> object:
-    return load_function("detect_v4_instance", namespace)
+    return load_function("inspect_v4_instance", namespace)
+
+
+def test_legacy_detector_keeps_the_previous_working_path() -> None:
+    class Process:
+        info = {
+            "pid": 2468,
+            "name": "Weixin.exe",
+            "cmdline": ["Weixin.exe"],
+        }
+
+    class Psutil:
+        @staticmethod
+        def process_iter(_attributes):
+            return [Process()]
+
+    detector = load_function(
+        "detect_v4_instance",
+        {
+            "psutil": Psutil(),
+            "detect_v4_data_dir_from_open_files": lambda _proc: r"D:\\WeChat\\wxid_test",
+            "detect_v4_unc_data_dir_from_open_files": lambda _proc: "",
+            "collect_v4_data_dir_candidates": lambda: {},
+            "log_debug": lambda _message: None,
+        },
+    )
+
+    assert detector()["pid"] == 2468
 
 
 def test_detects_main_weixin_process_with_startup_flags() -> None:
@@ -103,6 +130,7 @@ def test_detection_summary_includes_the_first_error() -> None:
 
 
 if __name__ == "__main__":
+    test_legacy_detector_keeps_the_previous_working_path()
     test_detects_main_weixin_process_with_startup_flags()
     test_continues_after_a_process_enumeration_error()
     test_detection_summary_includes_the_first_error()
