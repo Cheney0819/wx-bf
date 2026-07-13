@@ -911,6 +911,12 @@ def format_v4_detection_summary(diagnostics: dict) -> str:
         f"psutil 枚举 {int(diagnostics.get('process_count') or 0)} 个进程，"
         f"其中 Weixin.exe {len(weixin_processes)} 个，处理异常 {len(errors)} 个"
     )
+    if errors and isinstance(errors[0], dict):
+        first_error = errors[0]
+        error_type = str(first_error.get("error_type") or "UnknownError").strip()
+        error_message = " ".join(str(first_error.get("error_message") or "").split())[:180]
+        if error_message:
+            summary += f"，首个异常 PID {int(first_error.get('pid') or 0)} {error_type}: {error_message}"
     enumeration_error = str(diagnostics.get("enumeration_error_type") or "").strip()
     return f"{summary}，枚举异常 {enumeration_error}" if enumeration_error else summary
 

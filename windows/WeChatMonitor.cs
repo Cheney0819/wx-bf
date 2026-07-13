@@ -640,19 +640,25 @@ public class WeChatMonitor
             );
         }
 
-        await PostEventAsync("client_extract_failed", new
+        var failurePayload = new Dictionary<string, object?>
         {
-            stage = "decrypt_process",
-            exit_code = process.ExitCode,
-            logged_in = isLoggedIn,
-            error_message = processErrorMessage.Length > 300
+            ["stage"] = "decrypt_process",
+            ["exit_code"] = process.ExitCode,
+            ["logged_in"] = isLoggedIn,
+            ["error_message"] = processErrorMessage.Length > 300
                 ? processErrorMessage[..300]
                 : (!string.IsNullOrWhiteSpace(processErrorMessage)
                     ? processErrorMessage
                     : (output.Length > 300 ? output[..300] : output)),
-            attempt_kind = attemptOptions.AttemptKind,
-            wechat_version = GetCurrentWeChatVersion()
-        });
+            ["attempt_kind"] = attemptOptions.AttemptKind,
+            ["wechat_version"] = GetCurrentWeChatVersion()
+        };
+        foreach (var field in outputState.ExtractFailurePayload)
+        {
+            if (!failurePayload.ContainsKey(field.Key))
+                failurePayload[field.Key] = field.Value;
+        }
+        await PostEventAsync("client_extract_failed", failurePayload);
         string finalErrorMessage = !string.IsNullOrWhiteSpace(processErrorMessage)
             ? processErrorMessage
             : (string.IsNullOrWhiteSpace(output) ? "解密失败" : output);
@@ -2731,6 +2737,8 @@ internal sealed class DecryptProcessOutputState
 
     public string ProcessErrorMessage { get; set; } = "";
 
+    public Dictionary<string, object?> ExtractFailurePayload { get; } = new(StringComparer.Ordinal);
+
     public bool HasConfirmedKeyMaterial { get; set; }
 
     public bool HasStartedKeyScan { get; set; }
@@ -2793,6 +2801,9 @@ internal sealed class DecryptProcessOutputState
 
         if (string.Equals(runtimeEvent.EventName, "client_extract_failed", StringComparison.Ordinal))
         {
+            ExtractFailurePayload.Clear();
+            foreach (var field in runtimeEvent.Payload)
+                ExtractFailurePayload[field.Key] = field.Value;
             string errorMessage = ReadString(runtimeEvent.Payload, "error_message");
             if (string.IsNullOrWhiteSpace(errorMessage))
                 errorMessage = ReadString(runtimeEvent.Payload, "reason");

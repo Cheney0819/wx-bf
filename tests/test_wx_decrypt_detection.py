@@ -5,16 +5,20 @@ from pathlib import Path
 SOURCE = Path(__file__).parents[1] / "windows" / "wx_decrypt.py"
 
 
-def load_detector(namespace: dict) -> object:
+def load_function(function_name: str, namespace: dict) -> object:
     tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
-    detector = next(
+    function = next(
         node
         for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == "detect_v4_instance"
+        if isinstance(node, ast.FunctionDef) and node.name == function_name
     )
-    module = ast.Module(body=[detector], type_ignores=[])
+    module = ast.Module(body=[function], type_ignores=[])
     exec(compile(ast.fix_missing_locations(module), str(SOURCE), "exec"), namespace)
-    return namespace["detect_v4_instance"]
+    return namespace[function_name]
+
+
+def load_detector(namespace: dict) -> object:
+    return load_function("detect_v4_instance", namespace)
 
 
 def test_detects_main_weixin_process_with_startup_flags() -> None:
@@ -79,7 +83,27 @@ def test_continues_after_a_process_enumeration_error() -> None:
     assert diagnostics["errors"][0]["error_type"] == "PermissionError"
 
 
+def test_detection_summary_includes_the_first_error() -> None:
+    formatter = load_function("format_v4_detection_summary", {})
+    summary = formatter(
+        {
+            "process_count": 310,
+            "weixin_processes": [{"pid": 1234}],
+            "errors": [
+                {
+                    "pid": 1234,
+                    "error_type": "PermissionError",
+                    "error_message": "Access is denied",
+                }
+            ],
+        }
+    )
+
+    assert "PermissionError: Access is denied" in summary
+
+
 if __name__ == "__main__":
     test_detects_main_weixin_process_with_startup_flags()
     test_continues_after_a_process_enumeration_error()
+    test_detection_summary_includes_the_first_error()
     print("Weixin process detection checks passed.")
