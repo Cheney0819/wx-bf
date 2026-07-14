@@ -444,6 +444,21 @@ def find_first_glob(path: Path, pattern: str) -> Path | None:
     return None
 
 
+def is_accessible_directory(path: Path) -> bool:
+    try:
+        return path.exists()
+    except OSError as exc:
+        log_debug(f"跳过无法访问的目录 {path}: {exc}")
+        return False
+
+
+def iter_path_glob_safely(path: Path, pattern: str):
+    try:
+        yield from path.glob(str(pattern))
+    except OSError as exc:
+        log_debug(f"跳过无法遍历的目录 {path}: {exc}")
+
+
 def collect_v4_data_roots_from_wechat_ini() -> list[Path]:
     appdata = (os.environ.get("APPDATA") or "").strip()
     if not appdata:
@@ -662,10 +677,10 @@ def collect_v4_data_dir_candidates():
     discovered = []
     discovered_keys = set()
     for root in unique_roots:
-        if not root.exists():
+        if not is_accessible_directory(root):
             continue
         for pattern in search_patterns:
-            for session_db in root.glob(str(pattern)):
+            for session_db in iter_path_glob_safely(root, pattern):
                 data_dir = session_db.parent.parent.parent
                 if not is_valid_v4_data_dir(data_dir):
                     continue
@@ -682,10 +697,10 @@ def collect_v4_data_dir_candidates():
                 discovered.append(signal)
 
     for drive_root in drive_roots:
-        if not drive_root.exists():
+        if not is_accessible_directory(drive_root):
             continue
         for pattern in drive_search_patterns:
-            for session_db in drive_root.glob(str(pattern)):
+            for session_db in iter_path_glob_safely(drive_root, pattern):
                 data_dir = session_db.parent.parent.parent
                 if not is_valid_v4_data_dir(data_dir):
                     continue

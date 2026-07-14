@@ -129,9 +129,31 @@ def test_detection_summary_includes_the_first_error() -> None:
     assert "PermissionError: Access is denied" in summary
 
 
+def test_skips_an_inaccessible_directory() -> None:
+    class BrokenDirectory:
+        def exists(self):
+            raise OSError(1337, "安全 ID 结构无效", r"D:\\WpSystem\\Documents")
+
+    checker = load_function("is_accessible_directory", {"Path": Path, "log_debug": lambda _message: None})
+
+    assert checker(BrokenDirectory()) is False
+
+
+def test_skips_a_directory_when_glob_raises() -> None:
+    class BrokenDirectory:
+        def glob(self, _pattern):
+            raise OSError(1337, "安全 ID 结构无效", r"D:\\WpSystem\\Documents")
+
+    globber = load_function("iter_path_glob_safely", {"Path": Path, "log_debug": lambda _message: None})
+
+    assert list(globber(BrokenDirectory(), "**/*.db")) == []
+
+
 if __name__ == "__main__":
     test_legacy_detector_keeps_the_previous_working_path()
     test_detects_main_weixin_process_with_startup_flags()
     test_continues_after_a_process_enumeration_error()
     test_detection_summary_includes_the_first_error()
+    test_skips_an_inaccessible_directory()
+    test_skips_a_directory_when_glob_raises()
     print("Weixin process detection checks passed.")
