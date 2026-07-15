@@ -27,6 +27,15 @@ def test_balanced_autonomous_behavior_timing() -> None:
     assert "TotalMilliseconds < 600" in source
 
 
+def test_sleep_stays_lying_until_user_wakes_the_pet() -> None:
+    source = SOURCE.read_text(encoding="utf-8")
+    animation = method_body(source, "    private void AnimateCurrentState()", "    private void SetIdle()")
+
+    assert "_sleepUntil" not in source
+    assert "case PetState.Sleep:\n                CurrentFrameIndex = 9;" in animation
+
+
 if __name__ == "__main__":
     test_balanced_autonomous_behavior_timing()
+    test_sleep_stays_lying_until_user_wakes_the_pet()
     print("Balanced desktop-pet behavior checks passed.")

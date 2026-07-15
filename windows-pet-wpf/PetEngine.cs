@@ -10,7 +10,6 @@ public sealed class PetEngine
     private DateTime _nextExpressiveActionAt = DateTime.Now.AddSeconds(45);
     private DateTime _lastFrameStepAt = DateTime.Now;
     private DateTime _nextSleepEligibleAt = DateTime.Now.AddMinutes(2);
-    private DateTime? _sleepUntil;
     private DateTime _stateEndsAt = DateTime.Now.AddSeconds(2);
     private int _neglectLevel;
     private int _animationStep;
@@ -230,15 +229,7 @@ public sealed class PetEngine
     {
         if (IsSleeping)
         {
-            if (_sleepUntil.HasValue && DateTime.Now >= _sleepUntil.Value)
-            {
-                WakeUp();
-            }
-            else
-            {
-                AnimateCurrentState();
-            }
-
+            AnimateCurrentState();
             return BuildVisual();
         }
 
@@ -311,12 +302,7 @@ public sealed class PetEngine
     public PetVisual AutoBehavior()
     {
         if (IsSleeping)
-        {
-            if (_sleepUntil.HasValue && DateTime.Now >= _sleepUntil.Value)
-                WakeUp();
-
             return BuildVisual();
-        }
 
         if (DateTime.Now < _stateEndsAt || DateTime.Now < _nextAmbientAt)
             return BuildVisual();
@@ -486,7 +472,7 @@ public sealed class PetEngine
                 CurrentFrameIndex = _animationStep % 3 == 1 ? 2 : 0;
                 break;
             case PetState.Sleep:
-                CurrentFrameIndex = _animationStep % 2 == 0 ? 9 : 2;
+                CurrentFrameIndex = 9;
                 break;
             case PetState.Drag:
                 CurrentFrameIndex = _animationStep % 2 == 0 ? 3 : 12;
@@ -624,7 +610,6 @@ public sealed class PetEngine
         IsSleeping = true;
         BeginState(PetState.Sleep, 18, 28);
         _nextSleepEligibleAt = DateTime.Now.AddMinutes(3);
-        _sleepUntil = DateTime.Now.AddSeconds(_random.Next(18, 29));
         CurrentFrameIndex = 9;
         CurrentSpeech = Pick(SleepLines);
         CurrentEmotion = "Zz";
@@ -635,7 +620,6 @@ public sealed class PetEngine
     private void WakeUp()
     {
         IsSleeping = false;
-        _sleepUntil = null;
         _lastInteractionAt = DateTime.Now;
         _neglectLevel = 0;
         Energy = Math.Min(100, Energy + 35);
