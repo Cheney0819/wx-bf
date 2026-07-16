@@ -203,16 +203,70 @@ def _emit(event_fn, event_name: str, payload: dict):
         pass
 
 
+def is_required_sync_database(rel_path: str) -> bool:
+    rel_norm = str(rel_path or "").replace("\\", "/").lower()
+    return rel_norm == "session/session.db" or bool(
+        re.fullmatch(r"message/message_\d+\.db", rel_norm)
+    )
+
+
+def build_decrypt_tree_result(db_results: list[dict], snapshot_result: dict, started_at: float) -> dict:
+    sanitized_results = [
+        {
+            "db_rel": str(item.get("db_rel") or ""),
+            "reason": str(item.get("reason") or ""),
+            "required": bool(item.get("required")),
+            "result": str(item.get("result") or ""),
+            "db_size_bytes": int(item.get("db_size_bytes") or 0),
+            "wal_applied": int(item.get("wal_applied") or 0),
+            "wal_present": bool(item.get("wal_present")),
+        }
+        for item in db_results
+    ]
+    required_failures = [
+        {"db_rel": item["db_rel"], "reason": item["reason"], "required": True}
+        for item in sanitized_results
+        if item["required"] and item["result"] != "success"
+    ]
+    optional_failures = [
+        {"db_rel": item["db_rel"], "reason": item["reason"], "required": False}
+        for item in sanitized_results
+        if not item["required"] and item["result"] != "success"
+    ]
+    success_items = [item for item in sanitized_results if item["result"] == "success"]
+
+    return {
+        "success": not required_failures,
+        "can_export_messages": not required_failures,
+        "success_count": len(success_items),
+        "failed_count": sum(1 for item in sanitized_results if item["result"] == "failed"),
+        "skipped_count": sum(1 for item in sanitized_results if item["result"] == "skipped"),
+        "wal_applied_count": sum(1 for item in success_items if item["wal_applied"] > 0),
+        "wal_skipped_count": sum(
+            1 for item in success_items if item["wal_present"] and item["wal_applied"] == 0
+        ),
+        "integrity_failed_count": sum(
+            1 for item in sanitized_results if item["reason"] == "integrity_failed"
+        ),
+        "required_integrity_failed_count": sum(
+            1
+            for item in sanitized_results
+            if item["required"] and item["reason"] == "integrity_failed"
+        ),
+        "required_failure_count": len(required_failures),
+        "optional_failure_count": len(optional_failures),
+        "required_failures": required_failures,
+        "optional_failures": optional_failures,
+        "failure_reason": required_failures[0]["reason"] if required_failures else "",
+        "snapshot_attempts": int(snapshot_result.get("attempts") or 0),
+        "total_bytes": sum(item["db_size_bytes"] for item in success_items),
+        "duration_seconds": round(time.time() - started_at, 3),
+    }
+
+
 def decrypt_database_tree(db_dir: str, out_dir: str, keys: dict, log_fn=None, event_fn=None, wechat_running: bool = False) -> dict:
     started_at = time.time()
-    success = 0
-    failed = 0
-    skipped = 0
-    total_bytes = 0
-    wal_applied = 0
-    wal_skipped = 0
-    integrity_failed = 0
-    required_integrity_failed = 0
+    db_results = []
 
     with tempfile.TemporaryDirectory(prefix="wx-db-snapshot-") as snapshot_dir:
         snapshot_result = create_stable_database_snapshot(
@@ -224,58 +278,61 @@ def decrypt_database_tree(db_dir: str, out_dir: str, keys: dict, log_fn=None, ev
             event_fn=event_fn,
         )
         if not snapshot_result["success"]:
-            failure_reason = snapshot_result["reason"]
+            snapshot_reason = snapshot_result["reason"]
+            failure_reason = (
+                "snapshot_unstable" if snapshot_reason == "source_modified" else "source_read_failed"
+            )
             _emit(event_fn, "client_extract_failed", {
                 "stage": "database_snapshot",
                 "reason": failure_reason,
                 "error_message": "微信数据库持续写入，未取得一致快照",
                 "snapshot_attempts": snapshot_result["attempts"],
             })
-            result = {
+            result = build_decrypt_tree_result([], snapshot_result, started_at)
+            result.update({
                 "success": False,
-                "success_count": 0,
+                "can_export_messages": False,
                 "failed_count": 1,
-                "skipped_count": 0,
-                "wal_applied_count": 0,
                 "wal_skipped_count": snapshot_result["modified_db_count"],
-                "integrity_failed_count": 0,
-                "snapshot_attempts": snapshot_result["attempts"],
+                "required_failure_count": 1,
+                "required_failures": [
+                    {"db_rel": "", "reason": failure_reason, "required": True}
+                ],
                 "failure_reason": failure_reason,
-                "total_bytes": 0,
-                "duration_seconds": round(time.time() - started_at, 3),
-            }
+                "snapshot_reason": snapshot_reason,
+            })
             _emit(event_fn, "client_decrypt_tree_done", result)
             return result
 
         db_files = collect_snapshot_database_files(snapshot_dir)
         for rel, path, size in db_files:
+            required = is_required_sync_database(rel)
             key_info = keys.get(rel)
             if not key_info:
-                skipped += 1
-                _emit(event_fn, "client_decrypt_db_result", {
+                db_result = {
                     "db_rel": rel, "db_size_bytes": size,
-                    "result": "skipped", "reason": "no_key",
-                })
+                    "required": required, "result": "skipped", "reason": "key_unmatched",
+                }
+                db_results.append(db_result)
+                _emit(event_fn, "client_decrypt_db_result", db_result)
                 continue
 
             out_path = os.path.join(out_dir, rel)
             enc_key = bytes.fromhex(str(key_info["enc_key"]))
             ok = decrypt_database(path, out_path, enc_key)
             if not ok:
-                failed += 1
                 if log_fn:
                     log_fn(f"[wechat-decrypt] 解密失败: {rel}")
-                _emit(event_fn, "client_decrypt_db_result", {
+                db_result = {
                     "db_rel": rel, "db_size_bytes": size,
-                    "result": "failed", "reason": "hmac_or_decrypt",
-                })
+                    "required": required, "result": "failed", "reason": "decrypt_failed",
+                }
+                db_results.append(db_result)
+                _emit(event_fn, "client_decrypt_db_result", db_result)
                 continue
 
             wal_result = apply_encrypted_wal_to_decrypted_db(path, out_path, enc_key, log_fn=log_fn)
-            if wal_result.get("applied", 0) > 0:
-                wal_applied += 1
-            elif wal_result.get("present"):
-                wal_skipped += 1
+            if wal_result.get("present") and not wal_result.get("applied", 0):
                 _emit(event_fn, "client_wal_merge_skipped", {
                     "db_rel": rel,
                     "reason": wal_result.get("reason") or "wal_not_applied",
@@ -284,55 +341,44 @@ def decrypt_database_tree(db_dir: str, out_dir: str, keys: dict, log_fn=None, ev
 
             valid, validation_reason = validate_decrypted_database(out_path)
             if not valid:
-                failed += 1
-                integrity_failed += 1
-                if is_required_chatlog_database(rel):
-                    required_integrity_failed += 1
                 try:
                     os.remove(out_path)
                 except OSError:
                     pass
                 if log_fn:
                     log_fn(f"[wechat-decrypt] 明文库校验失败: {rel} ({validation_reason})")
-                _emit(event_fn, "client_decrypt_db_result", {
+                db_result = {
                     "db_rel": rel,
                     "db_size_bytes": size,
+                    "required": required,
                     "result": "failed",
-                    "reason": "sqlite_integrity_check_failed",
+                    "reason": "integrity_failed",
                     "validation_reason": validation_reason,
                     "wal_applied": wal_result.get("applied", 0),
                     "wal_present": wal_result.get("present", False),
-                })
+                }
+                db_results.append(db_result)
+                _emit(event_fn, "client_decrypt_db_result", db_result)
                 continue
 
-            success += 1
-            total_bytes += size
             if log_fn:
                 log_fn(f"[wechat-decrypt] 解密成功: {rel}")
-            _emit(event_fn, "client_decrypt_db_result", {
+            db_result = {
                 "db_rel": rel,
                 "db_size_bytes": size,
+                "required": required,
                 "result": "success",
+                "reason": "",
                 "wal_applied": wal_result.get("applied", 0),
                 "wal_present": wal_result.get("present", False),
                 "wal_committed_frames": wal_result.get("committed_frames", 0),
                 "snapshot_attempts": snapshot_result["attempts"],
                 "integrity_checked": True,
-            })
+            }
+            db_results.append(db_result)
+            _emit(event_fn, "client_decrypt_db_result", db_result)
 
-    result = {
-        "success": success > 0 and required_integrity_failed == 0,
-        "success_count": success,
-        "failed_count": failed,
-        "skipped_count": skipped,
-        "wal_applied_count": wal_applied,
-        "wal_skipped_count": wal_skipped,
-        "integrity_failed_count": integrity_failed,
-        "required_integrity_failed_count": required_integrity_failed,
-        "snapshot_attempts": snapshot_result["attempts"],
-        "total_bytes": total_bytes,
-        "duration_seconds": round(time.time() - started_at, 3),
-    }
+    result = build_decrypt_tree_result(db_results, snapshot_result, started_at)
     _emit(event_fn, "client_decrypt_tree_done", result)
     return result
 
@@ -345,15 +391,14 @@ def collect_snapshot_source_database_files(db_dir: str, keys: dict):
                 continue
             path = os.path.join(root, name)
             rel = os.path.relpath(path, db_dir)
-            if not is_export_relevant_db(rel) or rel not in keys:
+            if not is_export_relevant_db(rel):
                 continue
             files.append((rel, path))
     return sorted(files, key=lambda item: item[0].lower())
 
 
 def is_required_chatlog_database(rel_path: str) -> bool:
-    rel_norm = str(rel_path or "").replace("\\", "/").lower()
-    return bool(re.fullmatch(r"message/message_\d+\.db", rel_norm))
+    return is_required_sync_database(rel_path)
 
 
 def collect_snapshot_database_files(snapshot_dir: str):

@@ -226,10 +226,12 @@ def try_get_cached_key_scan_result(
     }
 
 
+def can_export_decrypted_messages(decrypt_result: dict) -> bool:
+    return bool(decrypt_result.get("can_export_messages", decrypt_result.get("success")))
+
+
 def should_fallback_from_cached_decrypt(decrypt_dir: Path, decrypt_result: dict) -> bool:
-    if not decrypt_result.get("success"):
-        return True
-    if int(decrypt_result.get("failed_count") or 0) > 0:
+    if not can_export_decrypted_messages(decrypt_result):
         return True
     return not (decrypt_dir / "message").is_dir()
 
@@ -1445,7 +1447,7 @@ def export_v4_messages(
             wechat_running=bool(detect_wechat_processes()),
         )
         key_source = "wechat_decrypt_memory_scan"
-    if not decrypt_result.get("success"):
+    if not can_export_decrypted_messages(decrypt_result):
         if server_url and server_token:
             emit_runtime_event(
                 "client_disk_pipeline_result",
@@ -1458,6 +1460,11 @@ def export_v4_messages(
                     "duration_seconds": float(decrypt_result.get("duration_seconds") or 0),
                     "mode": "ephemeral_disk_v4",
                     "will_cleanup_after_upload": True,
+                    "failure_reason": decrypt_result.get("failure_reason") or "decrypt_failed",
+                    "required_failure_count": int(decrypt_result.get("required_failure_count") or 0),
+                    "required_failures": decrypt_result.get("required_failures") or [],
+                    "optional_failure_count": int(decrypt_result.get("optional_failure_count") or 0),
+                    "optional_failures": decrypt_result.get("optional_failures") or [],
                     "error_message": "wechat-decrypt 解密数据库失败",
                 },
             )
@@ -1571,7 +1578,7 @@ def export_v4_messages(
                 wechat_running=bool(detect_wechat_processes()),
             )
             key_source = "wechat_decrypt_memory_scan"
-            if not decrypt_result.get("success"):
+            if not can_export_decrypted_messages(decrypt_result):
                 raise RuntimeError("缓存密钥导出失败，重新扫描后再次解密仍失败") from exc
 
             exported_messages = export_chatlog_json(
@@ -1637,6 +1644,8 @@ def export_v4_messages(
                 "duration_seconds": float(decrypt_result.get("duration_seconds") or 0),
                 "mode": "ephemeral_disk_v4",
                 "will_cleanup_after_upload": True,
+                "optional_failure_count": int(decrypt_result.get("optional_failure_count") or 0),
+                "optional_failures": decrypt_result.get("optional_failures") or [],
             },
         )
 

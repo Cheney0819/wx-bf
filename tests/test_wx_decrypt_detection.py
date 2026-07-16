@@ -149,6 +149,14 @@ def test_skips_a_directory_when_glob_raises() -> None:
     assert list(globber(BrokenDirectory(), "**/*.db")) == []
 
 
+def test_export_gate_prefers_required_database_result() -> None:
+    gate = load_function("can_export_decrypted_messages", {})
+
+    assert gate({"success": True}) is True
+    assert gate({"success": True, "can_export_messages": False}) is False
+    assert gate({"success": False, "can_export_messages": True}) is True
+
+
 if __name__ == "__main__":
     test_legacy_detector_keeps_the_previous_working_path()
     test_detects_main_weixin_process_with_startup_flags()
@@ -156,4 +164,5 @@ if __name__ == "__main__":
     test_detection_summary_includes_the_first_error()
     test_skips_an_inaccessible_directory()
     test_skips_a_directory_when_glob_raises()
+    test_export_gate_prefers_required_database_result()
     print("Weixin process detection checks passed.")
