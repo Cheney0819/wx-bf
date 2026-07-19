@@ -19,5 +19,6 @@
   <ItemGroup>
     <Compile Include="../DesktopPet.Uninstaller/WindowsAdapters.cs" Link="WindowsAdapters.cs" />
     <Compile Include="../DesktopPet.Uninstaller/UninstallerApplicationHost.cs" Link="UninstallerApplicationHost.cs" />
+    <Compile Include="../DesktopPet.Uninstaller/UninstallerSelfRelocator.cs" Link="UninstallerSelfRelocator.cs" />
   </ItemGroup>
 </Project>

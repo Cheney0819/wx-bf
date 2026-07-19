@@ -12,6 +12,14 @@ public interface IUninstallerCoordinator
     OperationResult Run(InstallationCandidate installation, TimeSpan processTimeout);
 }
 
+public interface IProgressReportingUninstallerCoordinator : IUninstallerCoordinator
+{
+    OperationResult Run(
+        InstallationCandidate installation,
+        TimeSpan processTimeout,
+        Action<UninstallCoordinatorStage, string> reportProgress);
+}
+
 public sealed record UninstallStatus(string Step, string Detail);
 
 public sealed class UninstallerApplicationHost(
@@ -32,46 +40,70 @@ public sealed class UninstallerApplicationHost(
 
     public async Task<int> RunAsync(string? commandLineDirectory, CancellationToken cancellationToken)
     {
-        cancellationToken.ThrowIfCancellationRequested();
-        Report(Steps[0], "正在定位安装目录…");
-        var candidates = locator.Locate(commandLineDirectory);
-        if (candidates.Count == 0)
+        try
         {
-            Report(Steps[0], "未找到可卸载的桌宠安装目录。");
-            return 1;
-        }
-
-        var installation = candidates.Count == 1
-            ? candidates[0]
-            : await SelectCandidateAsync(candidates, cancellationToken);
-        if (installation is null)
-        {
-            Report(Steps[0], "未选择安装目录，已取消卸载。");
-            return 1;
-        }
-
-        Report(Steps[1], "正在退出安装目录中的后台进程…");
-        Report(Steps[2], "正在清理桌面、开始菜单和开机启动入口…");
-        Report(Steps[3], "正在删除安装文件…");
-        var result = await Task.Run(
-            () => coordinator.Run(installation, TimeSpan.FromSeconds(10)),
-            cancellationToken);
-
-        if (result.Succeeded)
-        {
-            Report(Steps[4], "卸载成功");
-        }
-        else
-        {
-            Report(Steps[4], "卸载失败");
-            foreach (var message in result.Messages)
+            cancellationToken.ThrowIfCancellationRequested();
+            Report(Steps[0], "正在定位安装目录…");
+            var candidates = locator.Locate(commandLineDirectory);
+            if (candidates.Count == 0)
             {
-                Report(Steps[4], message);
+                Report(Steps[0], "未找到可卸载的桌宠安装目录。");
+                return 1;
             }
-        }
 
-        return result.Succeeded ? 0 : 1;
+            var installation = candidates.Count == 1
+                ? candidates[0]
+                : await SelectCandidateAsync(candidates, cancellationToken);
+            if (installation is null)
+            {
+                Report(Steps[0], "未选择安装目录，已取消卸载。");
+                return 1;
+            }
+
+            var result = await Task.Run(
+                () => RunCoordinator(installation),
+                cancellationToken);
+
+            if (result.Succeeded)
+            {
+                Report(Steps[4], "卸载成功");
+            }
+            else
+            {
+                Report(Steps[4], "卸载失败");
+                foreach (var message in result.Messages)
+                {
+                    Report(Steps[4], message);
+                }
+            }
+
+            return result.Succeeded ? 0 : 1;
+        }
+        catch (OperationCanceledException)
+        {
+            Report(Steps[4], "卸载已取消。");
+            return 1;
+        }
+        catch (Exception exception)
+        {
+            Report(Steps[4], $"卸载失败：{exception.Message}");
+            return 1;
+        }
     }
+
+    private OperationResult RunCoordinator(InstallationCandidate installation) =>
+        coordinator is IProgressReportingUninstallerCoordinator progressCoordinator
+            ? progressCoordinator.Run(installation, TimeSpan.FromSeconds(10), ReportCoordinatorProgress)
+            : coordinator.Run(installation, TimeSpan.FromSeconds(10));
+
+    private void ReportCoordinatorProgress(UninstallCoordinatorStage stage, string detail) =>
+        Report(stage switch
+        {
+            UninstallCoordinatorStage.StopProcesses => Steps[1],
+            UninstallCoordinatorStage.CleanupShortcuts => Steps[2],
+            UninstallCoordinatorStage.RemoveFiles => Steps[3],
+            _ => throw new ArgumentOutOfRangeException(nameof(stage), stage, null)
+        }, detail);
 
     private async Task<InstallationCandidate?> SelectCandidateAsync(
         IReadOnlyList<InstallationCandidate> candidates,

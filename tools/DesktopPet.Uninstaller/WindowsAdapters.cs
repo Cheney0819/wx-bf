@@ -10,7 +10,7 @@ namespace DesktopPet.Uninstaller;
 [SupportedOSPlatform("windows")]
 public sealed class WindowsInstallationStore : IInstallationStore
 {
-    public const string AppId = "{8D5C4C3A-9F3E-4BA3-A8F1-35D3C86A7C11}";
+    public const string AppId = IUninstallOperations.DesktopPetAppId;
     private const string UninstallKeyPath = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
 
     public IEnumerable<InstallationCandidate> ReadInnoCandidates()
@@ -272,7 +272,9 @@ public sealed class WindowsUninstallOperations : IUninstallOperations
         return process.ExitCode;
     }
 
-    public bool HasAppIdRegistration()
+    public bool HasAppIdRegistration() => FindAppIdRegistrations().Any();
+
+    public IEnumerable<string> FindAppIdRegistrations()
     {
         foreach (var hive in new[] { RegistryHive.LocalMachine, RegistryHive.CurrentUser })
         {
@@ -280,14 +282,12 @@ public sealed class WindowsUninstallOperations : IUninstallOperations
             {
                 using var baseKey = RegistryKey.OpenBaseKey(hive, view);
                 using var uninstallKey = baseKey.OpenSubKey(UninstallKeyPath);
-                if (uninstallKey?.GetSubKeyNames().Any(IsMatchingAppId) == true)
+                foreach (var keyName in uninstallKey?.GetSubKeyNames().Where(IsMatchingAppId) ?? [])
                 {
-                    return true;
+                    yield return $"{hive}\\{view}\\{UninstallKeyPath}\\{keyName}";
                 }
             }
         }
-
-        return false;
     }
 
     private static bool IsMatchingAppId(string keyName) =>

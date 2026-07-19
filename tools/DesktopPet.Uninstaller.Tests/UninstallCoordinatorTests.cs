@@ -49,13 +49,15 @@ public sealed class UninstallCoordinatorTests
         var operations = new FakeOperations
         {
             Uninstallers = [@"C:\Pet\unins000.exe"],
-            UninstallerExitCode = 1
+            UninstallerExitCode = 1,
+            DirectoryExistsAfterDelete = true
         };
 
         var result = CreateCoordinator(operations)
             .Run(new(@"C:\Pet", InstallKind.InnoSetup, null), TimeSpan.Zero);
 
         Assert.False(result.Succeeded);
+        Assert.Contains(result.Messages, message => message.Contains(@"C:\Pet", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -65,6 +67,31 @@ public sealed class UninstallCoordinatorTests
             .Run(new(@"C:\Pet", InstallKind.Direct, null), TimeSpan.Zero);
 
         Assert.False(result.Succeeded);
+    }
+
+    [Fact]
+    public void Run_lists_each_exact_remaining_artifact()
+    {
+        var installDirectory = @"C:\Pet";
+        var shortcut = new ShortcutEntry(
+            @"C:\Users\alice\Desktop\桌宠.lnk",
+            @"C:\Pet\DesktopPet.Wpf.exe");
+        var registration = @"HKCU\Registry64\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{8D5C4C3A-9F3E-4BA3-A8F1-35D3C86A7C11}_is1";
+        var shortcuts = new FakeShortcutStore([shortcut]) { IgnoreDeletes = true };
+        var operations = new FakeOperations
+        {
+            DirectoryExistsAfterDelete = true,
+            AppIdRegistrations = [registration]
+        };
+
+        var result = CreateCoordinator(operations, shortcuts)
+            .Run(new(installDirectory, InstallKind.Direct, null), TimeSpan.Zero);
+
+        Assert.False(result.Succeeded);
+        Assert.Contains(result.Messages, message => message.Contains(installDirectory, StringComparison.Ordinal));
+        Assert.Contains(result.Messages, message => message.Contains(shortcut.ShortcutPath, StringComparison.Ordinal));
+        Assert.Contains(result.Messages, message => message.Contains(shortcut.TargetPath, StringComparison.Ordinal));
+        Assert.Contains(result.Messages, message => message.Contains(registration, StringComparison.Ordinal));
     }
 
     [Fact]
@@ -119,7 +146,9 @@ public sealed class UninstallCoordinatorTests
         public List<(string Executable, string Arguments, string WorkingDirectory)> Runs { get; } = [];
         public int UninstallerExitCode { get; init; }
         public bool AppIdRegistrationExists { get; init; }
-        public bool DirectoryExists(string path) => false;
+        public bool DirectoryExistsAfterDelete { get; init; }
+        public IReadOnlyList<string> AppIdRegistrations { get; init; } = [];
+        public bool DirectoryExists(string path) => DirectoryExistsAfterDelete;
         public void DeleteDirectory(string path) { }
         public IEnumerable<string> FindUninstallers(string installDirectory) => Uninstallers;
         public int RunUninstaller(string executablePath, string arguments, string workingDirectory)
@@ -129,5 +158,6 @@ public sealed class UninstallCoordinatorTests
         }
 
         public bool HasAppIdRegistration() => AppIdRegistrationExists;
+        public IEnumerable<string> FindAppIdRegistrations() => AppIdRegistrations;
     }
 }

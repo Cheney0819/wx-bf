@@ -2,6 +2,8 @@ namespace DesktopPet.Uninstaller.Core;
 
 public interface IUninstallOperations
 {
+    const string DesktopPetAppId = "{8D5C4C3A-9F3E-4BA3-A8F1-35D3C86A7C11}";
+
     bool DirectoryExists(string path);
 
     void DeleteDirectory(string path);
@@ -11,6 +13,16 @@ public interface IUninstallOperations
     int RunUninstaller(string executablePath, string arguments, string workingDirectory);
 
     bool HasAppIdRegistration();
+
+    IEnumerable<string> FindAppIdRegistrations() =>
+        HasAppIdRegistration() ? [DesktopPetAppId] : [];
+}
+
+public enum UninstallCoordinatorStage
+{
+    StopProcesses,
+    CleanupShortcuts,
+    RemoveFiles
 }
 
 public sealed class UninstallCoordinator(
@@ -22,21 +34,39 @@ public sealed class UninstallCoordinator(
     private const string InnoArguments = "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART";
 
     public OperationResult Run(InstallationCandidate installation, TimeSpan processTimeout)
+        => Run(installation, processTimeout, reportProgress: null);
+
+    public OperationResult Run(
+        InstallationCandidate installation,
+        TimeSpan processTimeout,
+        Action<UninstallCoordinatorStage, string>? reportProgress)
     {
         try
         {
+            reportProgress?.Invoke(
+                UninstallCoordinatorStage.StopProcesses,
+                $"正在退出安装目录中的后台进程：{installation.InstallDirectory}");
             var remainingProcesses = processShutdown.StopWithin(installation.InstallDirectory, processTimeout);
             if (remainingProcesses.Count != 0)
             {
-                return OperationResult.Failure("Target processes are still running.");
+                return FailureWithRemainingArtifacts(
+                    installation.InstallDirectory,
+                    remainingProcesses.Select(process =>
+                        $"Target process remains: PID {process.Pid}, {process.ExecutablePath}"));
             }
 
+            reportProgress?.Invoke(
+                UninstallCoordinatorStage.CleanupShortcuts,
+                $"正在清理指向安装目录的快捷方式：{installation.InstallDirectory}");
             var beforeUninstall = shortcutCleanup.RemoveTargetShortcuts(installation.InstallDirectory);
             if (!beforeUninstall.Succeeded)
             {
-                return beforeUninstall;
+                return FailureWithRemainingArtifacts(installation.InstallDirectory, beforeUninstall.Messages);
             }
 
+            reportProgress?.Invoke(
+                UninstallCoordinatorStage.RemoveFiles,
+                $"正在删除安装文件：{installation.InstallDirectory}");
             var uninstallResult = installation.Kind switch
             {
                 InstallKind.InnoSetup => RunInnoUninstaller(installation.InstallDirectory),
@@ -45,22 +75,25 @@ public sealed class UninstallCoordinator(
             };
             if (!uninstallResult.Succeeded)
             {
-                return uninstallResult;
+                return FailureWithRemainingArtifacts(installation.InstallDirectory, uninstallResult.Messages);
             }
 
             var afterUninstall = shortcutCleanup.RemoveTargetShortcuts(installation.InstallDirectory);
             if (!afterUninstall.Succeeded)
             {
-                return afterUninstall;
+                return FailureWithRemainingArtifacts(installation.InstallDirectory, afterUninstall.Messages);
             }
 
-            return HasNoResidue(installation.InstallDirectory)
+            var remainingArtifacts = FindRemainingArtifacts(installation.InstallDirectory);
+            return remainingArtifacts.Count == 0
                 ? OperationResult.Success("Installation artifacts removed.")
-                : OperationResult.Failure("Installation artifacts remain after uninstall.");
+                : OperationResult.Failure(remainingArtifacts.ToArray());
         }
         catch (Exception exception)
         {
-            return OperationResult.Failure($"Uninstall failed: {exception.Message}");
+            return FailureWithRemainingArtifacts(
+                installation.InstallDirectory,
+                [$"Uninstall failed: {exception.Message}"]);
         }
     }
 
@@ -110,10 +143,47 @@ public sealed class UninstallCoordinator(
                fileName.EndsWith(".exe", StringComparison.OrdinalIgnoreCase);
     }
 
-    private bool HasNoResidue(string installDirectory) =>
-        !operations.DirectoryExists(installDirectory) &&
-        !shortcutStore.List().Any(shortcut => InstallPathPolicy.IsWithin(installDirectory, shortcut.TargetPath)) &&
-        !operations.HasAppIdRegistration();
+    private IReadOnlyList<string> FindRemainingArtifacts(string installDirectory)
+    {
+        var messages = new List<string>();
+        if (operations.DirectoryExists(installDirectory))
+        {
+            messages.Add($"Installation directory remains: {installDirectory}");
+        }
+
+        foreach (var shortcut in shortcutStore.List()
+                     .Where(shortcut => InstallPathPolicy.IsWithin(installDirectory, shortcut.TargetPath)))
+        {
+            messages.Add($"Target shortcut remains: {shortcut.ShortcutPath} -> {shortcut.TargetPath}");
+        }
+
+        var registrations = operations.FindAppIdRegistrations().ToArray();
+        if (registrations.Length == 0 && operations.HasAppIdRegistration())
+        {
+            registrations = [IUninstallOperations.DesktopPetAppId];
+        }
+
+        messages.AddRange(registrations.Select(registration =>
+            $"AppId registry entry remains: {registration}"));
+        return messages;
+    }
+
+    private OperationResult FailureWithRemainingArtifacts(
+        string installDirectory,
+        IEnumerable<string> failureMessages)
+    {
+        var messages = failureMessages.ToList();
+        try
+        {
+            messages.AddRange(FindRemainingArtifacts(installDirectory));
+        }
+        catch (Exception exception)
+        {
+            messages.Add($"Residue verification failed: {exception.Message}");
+        }
+
+        return OperationResult.Failure(messages.Distinct(StringComparer.Ordinal).ToArray());
+    }
 
     private sealed class EmptyShortcutStore : IShortcutStore
     {

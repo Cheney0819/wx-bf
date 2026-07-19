@@ -17,20 +17,22 @@ public partial class MainWindow : Window
         Closed += (_, _) => lifetime.Cancel();
     }
 
-    public async Task RunUninstallAsync(UninstallerApplicationHost host, string? installDirectory)
+    public async Task<int> RunUninstallAsync(UninstallerApplicationHost host, string? installDirectory)
     {
         host.StatusChanged += HostOnStatusChanged;
         try
         {
-            await host.RunAsync(installDirectory, lifetime.Token);
+            return await host.RunAsync(installDirectory, lifetime.Token);
         }
         catch (OperationCanceledException)
         {
             AddStatus("已取消卸载。", "验证结果");
+            return 1;
         }
         catch (Exception exception)
         {
             AddStatus($"卸载失败：{exception.Message}", "验证结果");
+            return 1;
         }
         finally
         {
@@ -55,8 +57,16 @@ public partial class MainWindow : Window
         return installationSelection.Task;
     }
 
-    private void HostOnStatusChanged(object? sender, UninstallStatus status) =>
+    private void HostOnStatusChanged(object? sender, UninstallStatus status)
+    {
+        if (!Dispatcher.CheckAccess())
+        {
+            Dispatcher.Invoke(() => AddStatus(status.Detail, status.Step));
+            return;
+        }
+
         AddStatus(status.Detail, status.Step);
+    }
 
     private void AddStatus(string detail, string step)
     {

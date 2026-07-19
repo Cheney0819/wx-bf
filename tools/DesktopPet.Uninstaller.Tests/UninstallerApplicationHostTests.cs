@@ -15,10 +15,10 @@ public sealed class UninstallerApplicationHostTests
     }
 
     [Fact]
-    public async Task RunAsync_runs_the_single_candidate_and_reports_all_uninstall_stages()
+    public async Task RunAsync_reports_coordinator_stages_only_when_they_are_reached()
     {
         var candidate = new InstallationCandidate(@"C:\Pet", InstallKind.Direct, null);
-        var coordinator = new FakeCoordinator();
+        var coordinator = new ProgressFakeCoordinator();
         var host = new UninstallerApplicationHost(new FakeLocator([candidate]), coordinator);
         var statuses = new List<UninstallStatus>();
         host.StatusChanged += (_, status) => statuses.Add(status);
@@ -35,6 +35,42 @@ public sealed class UninstallerApplicationHostTests
             "删除文件",
             "验证结果"
         ], statuses.Select(status => status.Step));
+    }
+
+    [Fact]
+    public async Task RunAsync_does_not_report_later_stages_after_process_shutdown_failure()
+    {
+        var candidate = new InstallationCandidate(@"C:\Pet", InstallKind.Direct, null);
+        var coordinator = new ProgressFakeCoordinator
+        {
+            StopAfter = UninstallCoordinatorStage.StopProcesses,
+            Result = OperationResult.Failure("Target process remains: PID 42")
+        };
+        var host = new UninstallerApplicationHost(new FakeLocator([candidate]), coordinator);
+        var statuses = new List<UninstallStatus>();
+        host.StatusChanged += (_, status) => statuses.Add(status);
+
+        var exitCode = await host.RunAsync(null, CancellationToken.None);
+
+        Assert.Equal(1, exitCode);
+        Assert.DoesNotContain(statuses, status => status.Step is "清理安装入口" or "删除文件");
+    }
+
+    [Fact]
+    public async Task RunAsync_returns_one_and_reports_exception_when_coordinator_throws()
+    {
+        var candidate = new InstallationCandidate(@"C:\Pet", InstallKind.Direct, null);
+        var host = new UninstallerApplicationHost(
+            new FakeLocator([candidate]),
+            new ThrowingCoordinator(new InvalidOperationException("coordinator crashed")));
+        var statuses = new List<UninstallStatus>();
+        host.StatusChanged += (_, status) => statuses.Add(status);
+
+        var exitCode = await host.RunAsync(null, CancellationToken.None);
+
+        Assert.Equal(1, exitCode);
+        Assert.Contains(statuses, status =>
+            status.Step == "验证结果" && status.Detail.Contains("coordinator crashed", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -72,5 +108,41 @@ public sealed class UninstallerApplicationHostTests
             Installation = installation;
             return Result;
         }
+    }
+
+    private sealed class ProgressFakeCoordinator : IProgressReportingUninstallerCoordinator
+    {
+        public InstallationCandidate? Installation { get; private set; }
+        public UninstallCoordinatorStage? StopAfter { get; init; }
+        public OperationResult Result { get; init; } = OperationResult.Success("Installation artifacts removed.");
+
+        public OperationResult Run(InstallationCandidate installation, TimeSpan processTimeout)
+        {
+            Installation = installation;
+            return Result;
+        }
+
+        public OperationResult Run(
+            InstallationCandidate installation,
+            TimeSpan processTimeout,
+            Action<UninstallCoordinatorStage, string> reportProgress)
+        {
+            Installation = installation;
+            foreach (var stage in Enum.GetValues<UninstallCoordinatorStage>())
+            {
+                reportProgress(stage, $"Reached {stage}.");
+                if (stage == StopAfter)
+                {
+                    break;
+                }
+            }
+
+            return Result;
+        }
+    }
+
+    private sealed class ThrowingCoordinator(Exception exception) : IUninstallerCoordinator
+    {
+        public OperationResult Run(InstallationCandidate installation, TimeSpan processTimeout) => throw exception;
     }
 }
