@@ -18,4 +18,16 @@ public sealed class InstallPathPolicyTests
         Assert.True(InstallPathPolicy.IsWithin(@"C:\Apps\Pet", @"C:\Apps\Pet\ffmpeg.exe"));
         Assert.False(InstallPathPolicy.IsWithin(@"C:\Apps\Pet", @"C:\Apps\PetBackup\ffmpeg.exe"));
     }
+
+    [Fact]
+    public void TryCreate_rejects_consecutive_traversal_resolving_to_injected_profile_directory()
+    {
+        Assert.False(InstallPathPolicy.TryCreate(@"C:\Users\alice\foo\..\..", @"C:\Users", out _));
+    }
+
+    [Fact]
+    public void TryCreate_rejects_consecutive_traversal_resolving_to_drive_root()
+    {
+        Assert.False(InstallPathPolicy.TryCreate(@"C:\foo\..\..", @"C:\Users\alice", out _));
+    }
 }

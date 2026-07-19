@@ -45,23 +45,25 @@ public static class InstallPathPolicy
 
         var normalized = path.Replace('/', '\\');
         var drive = normalized[..2].ToUpperInvariant();
-        var segments = normalized[3..]
-            .Split('\\', StringSplitOptions.RemoveEmptyEntries)
-            .Where(segment => segment != ".")
-            .ToList();
-
-        for (var index = 0; index < segments.Count; index++)
+        var segments = new List<string>();
+        foreach (var segment in normalized[3..].Split('\\', StringSplitOptions.RemoveEmptyEntries))
         {
-            if (segments[index] != "..")
+            if (segment == ".")
             {
                 continue;
             }
 
-            if (index > 0)
+            if (segment == "..")
             {
-                segments.RemoveAt(index--);
-                segments.RemoveAt(index--);
+                if (segments.Count > 0)
+                {
+                    segments.RemoveAt(segments.Count - 1);
+                }
+
+                continue;
             }
+
+            segments.Add(segment);
         }
 
         return segments.Count == 0 ? drive + "\\" : drive + "\\" + string.Join('\\', segments);
