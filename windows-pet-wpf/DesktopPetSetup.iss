@@ -44,9 +44,6 @@ Name: "{userstartup}\桌宠"; Filename: "{app}\DesktopPet.Wpf.exe"; Tasks: autor
 [Run]
 Filename: "{app}\DesktopPet.Wpf.exe"; Description: "立即启动桌宠"; Flags: nowait postinstall skipifsilent shellexec
 
-[UninstallRun]
-Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -File ""{app}\uninstall.ps1"" -InstallDir ""{app}"""; Flags: runhidden waituntilterminated skipifdoesntexist
-
 [Code]
 procedure StopProcessTree(const ImageName: String);
 var

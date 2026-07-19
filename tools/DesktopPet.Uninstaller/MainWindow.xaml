@@ -1,0 +1,53 @@
+<Window
+    x:Class="DesktopPet.Uninstaller.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="桌宠一键卸载"
+    Width="560"
+    MinHeight="350"
+    SizeToContent="Height"
+    WindowStartupLocation="CenterScreen"
+    ResizeMode="NoResize">
+  <Grid Margin="28">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto" />
+      <RowDefinition Height="12" />
+      <RowDefinition Height="Auto" />
+      <RowDefinition Height="16" />
+      <RowDefinition Height="*" />
+      <RowDefinition Height="16" />
+      <RowDefinition Height="Auto" />
+    </Grid.RowDefinitions>
+
+    <StackPanel Grid.Row="0">
+      <TextBlock FontSize="24" FontWeight="SemiBold" Text="桌宠一键卸载" />
+      <TextBlock Margin="0,8,0,0" Foreground="#5F6368" Text="正在按安装目录清理后台进程、快捷方式和安装文件。" TextWrapping="Wrap" />
+    </StackPanel>
+
+    <Border Grid.Row="2" Padding="14" Background="#F4F8FF" BorderBrush="#C7D9F7" BorderThickness="1" CornerRadius="6">
+      <TextBlock x:Name="CurrentStatusText" FontSize="15" Text="正在准备…" TextWrapping="Wrap" />
+    </Border>
+
+    <Grid Grid.Row="4">
+      <Grid.RowDefinitions>
+        <RowDefinition Height="Auto" />
+        <RowDefinition Height="8" />
+        <RowDefinition Height="Auto" />
+        <RowDefinition Height="12" />
+        <RowDefinition Height="*" />
+      </Grid.RowDefinitions>
+      <TextBlock Grid.Row="0" FontWeight="SemiBold" Text="执行状态" />
+      <ListBox x:Name="StatusList" Grid.Row="2" MinHeight="110" MaxHeight="180" IsHitTestVisible="False" />
+      <StackPanel x:Name="CandidatePanel" Grid.Row="4" Visibility="Collapsed">
+        <TextBlock FontWeight="SemiBold" Text="检测到多个安装目录，请选择要卸载的路径：" />
+        <ListBox x:Name="CandidateList" Margin="0,8,0,0" MinHeight="82" DisplayMemberPath="InstallDirectory" />
+      </StackPanel>
+    </Grid>
+
+    <StackPanel Grid.Row="6" HorizontalAlignment="Right" Orientation="Horizontal">
+      <Button x:Name="CancelSelectionButton" Width="92" Margin="0,0,8,0" Click="CancelSelectionButton_OnClick" Visibility="Collapsed">取消</Button>
+      <Button x:Name="ConfirmSelectionButton" Width="120" Margin="0,0,8,0" Click="ConfirmSelectionButton_OnClick" Visibility="Collapsed">卸载所选路径</Button>
+      <Button Width="88" Click="CloseButton_OnClick">关闭</Button>
+    </StackPanel>
+  </Grid>
+</Window>
