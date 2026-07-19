@@ -9,32 +9,65 @@ public interface IInstallationStore
 
 public sealed class InstallLocator(IInstallationStore store, Func<string, bool> isVerifiedInstallation)
 {
+    private readonly string profileDirectory =
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+
     public IReadOnlyList<InstallationCandidate> Locate(string? commandLineDirectory)
     {
-        var innoCandidates = store.ReadInnoCandidates()
-            .Where(candidate => IsVerified(candidate.InstallDirectory))
-            .DistinctBy(candidate => candidate.InstallDirectory, StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-
-        if (IsVerified(commandLineDirectory))
+        // An explicit target is authoritative.  If it is malformed, points at
+        // a protected root/profile directory, or is not a verified pet install,
+        // do not silently substitute a different registry or legacy target.
+        if (commandLineDirectory is not null)
         {
+            if (!TryGetVerifiedDirectory(commandLineDirectory, out var normalizedCommandLineDirectory))
+            {
+                return [];
+            }
+
+            var innoCandidates = ReadVerifiedInnoCandidates();
             var innoCandidate = innoCandidates.FirstOrDefault(candidate =>
-                candidate.InstallDirectory.Equals(commandLineDirectory, StringComparison.OrdinalIgnoreCase));
-            return [innoCandidate ?? new InstallationCandidate(commandLineDirectory!, InstallKind.Direct, null)];
+                candidate.InstallDirectory.Equals(normalizedCommandLineDirectory, StringComparison.OrdinalIgnoreCase));
+            return [innoCandidate ?? new InstallationCandidate(normalizedCommandLineDirectory, InstallKind.Direct, null)];
         }
 
-        if (innoCandidates.Length > 0)
+        var verifiedInnoCandidates = ReadVerifiedInnoCandidates();
+        if (verifiedInnoCandidates.Length > 0)
         {
-            return innoCandidates;
+            return verifiedInnoCandidates;
         }
 
         return store.ReadLegacyDirectories()
-            .Where(IsVerified)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .Select(directory => new InstallationCandidate(directory, InstallKind.Direct, null))
+            .Select(TryCreateVerifiedCandidate)
+            .OfType<InstallationCandidate>()
+            .DistinctBy(candidate => candidate.InstallDirectory, StringComparer.OrdinalIgnoreCase)
             .ToArray();
     }
 
-    private bool IsVerified(string? directory) =>
-        !string.IsNullOrWhiteSpace(directory) && isVerifiedInstallation(directory);
+    private InstallationCandidate[] ReadVerifiedInnoCandidates() =>
+        store.ReadInnoCandidates()
+            .Select(candidate =>
+            {
+                var verified = TryCreateVerifiedCandidate(candidate.InstallDirectory);
+                return verified is null ? null : candidate with { InstallDirectory = verified.InstallDirectory };
+            })
+            .OfType<InstallationCandidate>()
+            .DistinctBy(candidate => candidate.InstallDirectory, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+    private InstallationCandidate? TryCreateVerifiedCandidate(string? directory)
+    {
+        if (!TryGetVerifiedDirectory(directory, out var normalized))
+        {
+            return null;
+        }
+
+        return new InstallationCandidate(normalized, InstallKind.Direct, null);
+    }
+
+    private bool TryGetVerifiedDirectory(string? directory, out string normalized)
+    {
+        normalized = string.Empty;
+        return InstallPathPolicy.TryCreate(directory ?? string.Empty, profileDirectory, out normalized) &&
+               isVerifiedInstallation(normalized);
+    }
 }

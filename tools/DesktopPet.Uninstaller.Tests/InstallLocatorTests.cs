@@ -55,6 +55,74 @@ public sealed class InstallLocatorTests
         Assert.Equal(new InstallationCandidate(@"C:\LegacyPet", InstallKind.Direct, null), result);
     }
 
+    [Fact]
+    public void Locate_rejects_drive_root_command_line_before_verification()
+    {
+        var verifiedDirectories = new List<string>();
+        var locator = new InstallLocator(
+            new FakeInstallationStore(
+                [new(@"D:\Pet", InstallKind.InnoSetup, "unins000.exe")],
+                [@"D:\LegacyPet"]),
+            path =>
+            {
+                verifiedDirectories.Add(path);
+                return true;
+            });
+
+        Assert.Empty(locator.Locate(@"C:\"));
+        Assert.Empty(verifiedDirectories);
+    }
+
+    [Fact]
+    public void Locate_rejects_current_user_profile_command_line_before_verification()
+    {
+        var verifiedDirectories = new List<string>();
+        var profileDirectory = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        var locator = new InstallLocator(
+            new FakeInstallationStore(
+                [new(@"D:\Pet", InstallKind.InnoSetup, "unins000.exe")],
+                [@"D:\LegacyPet"]),
+            path =>
+            {
+                verifiedDirectories.Add(path);
+                return true;
+            });
+
+        Assert.Empty(locator.Locate(profileDirectory));
+        Assert.Empty(verifiedDirectories);
+    }
+
+    [Fact]
+    public void Locate_rejects_unverified_command_line_without_falling_back_to_discovery()
+    {
+        var locator = new InstallLocator(
+            new FakeInstallationStore(
+                [new(@"D:\Pet", InstallKind.InnoSetup, "unins000.exe")],
+                [@"D:\LegacyPet"]),
+            path => path is @"D:\Pet" or @"D:\LegacyPet");
+
+        Assert.Empty(locator.Locate(@"D:\Missing"));
+    }
+
+    [Fact]
+    public void Locate_rejects_unsafe_registry_and_legacy_candidates_before_verification()
+    {
+        var verifiedDirectories = new List<string>();
+        var profileDirectory = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        var locator = new InstallLocator(
+            new FakeInstallationStore(
+                [new(@"C:\", InstallKind.InnoSetup, "unins000.exe")],
+                [profileDirectory]),
+            path =>
+            {
+                verifiedDirectories.Add(path);
+                return true;
+            });
+
+        Assert.Empty(locator.Locate(null));
+        Assert.Empty(verifiedDirectories);
+    }
+
     private sealed class FakeInstallationStore(
         IEnumerable<InstallationCandidate> innoCandidates,
         IEnumerable<string>? legacyDirectories = null) : IInstallationStore

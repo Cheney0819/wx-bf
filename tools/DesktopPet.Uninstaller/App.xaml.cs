@@ -29,7 +29,9 @@ public partial class App : Application
             return;
         }
 
-        var installationLocator = new InstallLocator(new WindowsInstallationStore(), Directory.Exists);
+        var installationLocator = new InstallLocator(
+            new WindowsInstallationStore(),
+            directory => File.Exists(Path.Combine(directory, "DesktopPet.Wpf.exe")));
         var installDirectory = ReadInstallDirectory(e.Args);
         try
         {
