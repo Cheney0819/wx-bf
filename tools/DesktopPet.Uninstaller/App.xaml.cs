@@ -29,17 +29,28 @@ public partial class App : Application
             return;
         }
 
+        var installDirectoryArgument = InstallDirectoryCommandLine.Parse(e.Args);
+        if (installDirectoryArgument.State == InstallDirectoryArgumentState.Malformed)
+        {
+            MessageBox.Show(
+                "--install-dir 参数缺少有效安装目录。",
+                "桌宠一键卸载",
+                MessageBoxButton.OK,
+                MessageBoxImage.Error);
+            Shutdown(1);
+            return;
+        }
+
         var installationLocator = new InstallLocator(
             new WindowsInstallationStore(),
             directory => File.Exists(Path.Combine(directory, "DesktopPet.Wpf.exe")));
-        var installDirectory = ReadInstallDirectory(e.Args);
         try
         {
             var relocation = UninstallerSelfRelocator.CreatePlan(
                 e.Args,
                 Environment.ProcessPath ?? string.Empty,
                 Path.GetTempPath(),
-                installationLocator.Locate(installDirectory).Select(candidate => candidate.InstallDirectory),
+                installationLocator.Locate(installDirectoryArgument.Directory).Select(candidate => candidate.InstallDirectory),
                 Environment.ProcessId);
             if (relocation is not null)
             {
@@ -80,17 +91,17 @@ public partial class App : Application
             new UninstallCoordinatorAdapter(coordinator),
             window.SelectInstallationAsync);
 
-        _ = RunAndShutdownAsync(window, host, installDirectory);
+        _ = RunAndShutdownAsync(window, host, installDirectoryArgument);
     }
 
     private async Task RunAndShutdownAsync(
         MainWindow window,
         UninstallerApplicationHost host,
-        string? installDirectory)
+        InstallDirectoryArgument installDirectoryArgument)
     {
         var windowClosed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         window.Closed += (_, _) => windowClosed.TrySetResult();
-        var exitCode = await window.RunUninstallAsync(host, installDirectory);
+        var exitCode = await window.RunUninstallAsync(host, installDirectoryArgument);
         if (window.IsVisible)
         {
             await windowClosed.Task;
@@ -138,19 +149,6 @@ public partial class App : Application
         }
 
         return true;
-    }
-
-    private static string? ReadInstallDirectory(IReadOnlyList<string> arguments)
-    {
-        for (var index = 0; index < arguments.Count - 1; index++)
-        {
-            if (arguments[index].Equals("--install-dir", StringComparison.OrdinalIgnoreCase))
-            {
-                return arguments[index + 1];
-            }
-        }
-
-        return null;
     }
 
     private sealed class InstallationLocatorAdapter(InstallLocator locator) : IUninstallerInstallationLocator

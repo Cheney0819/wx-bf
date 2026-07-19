@@ -19,12 +19,12 @@ public partial class MainWindow : Window
 
     public void ShowRelocatedWorkerNotice() => HandoffNoticeText.Visibility = Visibility.Visible;
 
-    public async Task<int> RunUninstallAsync(UninstallerApplicationHost host, string? installDirectory)
+    public async Task<int> RunUninstallAsync(UninstallerApplicationHost host, InstallDirectoryArgument installDirectoryArgument)
     {
         host.StatusChanged += HostOnStatusChanged;
         try
         {
-            return await host.RunAsync(installDirectory, lifetime.Token);
+            return await host.RunParsedAsync(installDirectoryArgument, lifetime.Token);
         }
         catch (OperationCanceledException)
         {

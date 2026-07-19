@@ -39,12 +39,25 @@ public sealed class UninstallerApplicationHost(
     public event EventHandler<UninstallStatus>? StatusChanged;
 
     public async Task<int> RunAsync(string? commandLineDirectory, CancellationToken cancellationToken)
+        => await RunParsedAsync(
+            string.IsNullOrWhiteSpace(commandLineDirectory)
+                ? InstallDirectoryArgument.Absent
+                : new InstallDirectoryArgument(InstallDirectoryArgumentState.Valid, commandLineDirectory),
+            cancellationToken);
+
+    public async Task<int> RunParsedAsync(InstallDirectoryArgument installDirectoryArgument, CancellationToken cancellationToken)
     {
         try
         {
             cancellationToken.ThrowIfCancellationRequested();
             Report(Steps[0], "正在定位安装目录…");
-            var candidates = locator.Locate(commandLineDirectory);
+            if (installDirectoryArgument.State == InstallDirectoryArgumentState.Malformed)
+            {
+                Report(Steps[0], "--install-dir 参数缺少有效安装目录。已取消卸载。");
+                return 1;
+            }
+
+            var candidates = locator.Locate(installDirectoryArgument.Directory);
             if (candidates.Count == 0)
             {
                 Report(Steps[0], "未找到可卸载的桌宠安装目录。");

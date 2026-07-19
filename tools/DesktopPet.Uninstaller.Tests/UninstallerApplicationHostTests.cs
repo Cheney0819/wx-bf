@@ -15,6 +15,25 @@ public sealed class UninstallerApplicationHostTests
     }
 
     [Fact]
+    public async Task RunAsync_does_not_discover_candidates_when_install_dir_argument_is_missing_its_value()
+    {
+        var locator = new RecordingLocator(
+        [new InstallationCandidate(@"C:\Pet", InstallKind.Direct, null)]);
+        var host = new UninstallerApplicationHost(locator, new FakeCoordinator());
+        var statuses = new List<UninstallStatus>();
+        host.StatusChanged += (_, status) => statuses.Add(status);
+
+        var argument = InstallDirectoryCommandLine.Parse(["--install-dir"]);
+        var exitCode = await host.RunParsedAsync(argument, CancellationToken.None);
+
+        Assert.Equal(InstallDirectoryArgumentState.Malformed, argument.State);
+        Assert.Equal(1, exitCode);
+        Assert.Equal(0, locator.Calls);
+        Assert.Contains(statuses, status =>
+            status.Step == "定位安装目录" && status.Detail.Contains("--install-dir", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task RunAsync_reports_coordinator_stages_only_when_they_are_reached()
     {
         var candidate = new InstallationCandidate(@"C:\Pet", InstallKind.Direct, null);
@@ -96,6 +115,17 @@ public sealed class UninstallerApplicationHostTests
     private sealed class FakeLocator(IReadOnlyList<InstallationCandidate> candidates) : IUninstallerInstallationLocator
     {
         public IReadOnlyList<InstallationCandidate> Locate(string? commandLineDirectory) => candidates;
+    }
+
+    private sealed class RecordingLocator(IReadOnlyList<InstallationCandidate> candidates) : IUninstallerInstallationLocator
+    {
+        public int Calls { get; private set; }
+
+        public IReadOnlyList<InstallationCandidate> Locate(string? commandLineDirectory)
+        {
+            Calls++;
+            return candidates;
+        }
     }
 
     private sealed class FakeCoordinator : IUninstallerCoordinator
