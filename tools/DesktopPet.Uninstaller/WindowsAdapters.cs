@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
 using Microsoft.Win32;
 using DesktopPet.Uninstaller.Core;
@@ -137,4 +138,138 @@ public sealed class WindowsProcessCatalog : IProcessCatalog
             return false;
         }
     }
+}
+
+[SupportedOSPlatform("windows")]
+public sealed class WindowsShortcutStore : IShortcutStore
+{
+    public IEnumerable<ShortcutEntry> List()
+    {
+        foreach (var directory in ShortcutDirectories())
+        {
+            if (!Directory.Exists(directory))
+            {
+                continue;
+            }
+
+            IEnumerable<string> shortcuts;
+            try
+            {
+                shortcuts = Directory.EnumerateFiles(directory, "*.lnk", SearchOption.TopDirectoryOnly).ToArray();
+            }
+            catch (Exception exception) when (exception is UnauthorizedAccessException or IOException)
+            {
+                continue;
+            }
+
+            foreach (var shortcutPath in shortcuts)
+            {
+                var targetPath = TryReadTarget(shortcutPath);
+                if (!string.IsNullOrWhiteSpace(targetPath))
+                {
+                    yield return new ShortcutEntry(shortcutPath, targetPath);
+                }
+            }
+        }
+    }
+
+    public void Delete(string shortcutPath) => File.Delete(shortcutPath);
+
+    private static IEnumerable<string> ShortcutDirectories() =>
+    [
+        Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),
+        Environment.GetFolderPath(Environment.SpecialFolder.Programs),
+        Environment.GetFolderPath(Environment.SpecialFolder.Startup)
+    ];
+
+    private static string? TryReadTarget(string shortcutPath)
+    {
+        object? shell = null;
+        object? shortcut = null;
+        try
+        {
+            var shellType = Type.GetTypeFromProgID("WScript.Shell");
+            if (shellType is null)
+            {
+                return null;
+            }
+
+            shell = Activator.CreateInstance(shellType);
+            if (shell is null)
+            {
+                return null;
+            }
+
+            shortcut = shellType.InvokeMember("CreateShortcut", System.Reflection.BindingFlags.InvokeMethod,
+                null, shell, [shortcutPath]);
+            return shortcut?.GetType().InvokeMember("TargetPath", System.Reflection.BindingFlags.GetProperty,
+                null, shortcut, null) as string;
+        }
+        catch (Exception exception) when (exception is COMException or System.Reflection.TargetInvocationException or
+                                           UnauthorizedAccessException or IOException)
+        {
+            return null;
+        }
+        finally
+        {
+            ReleaseComObject(shortcut);
+            ReleaseComObject(shell);
+        }
+    }
+
+    private static void ReleaseComObject(object? value)
+    {
+        if (value is not null && Marshal.IsComObject(value))
+        {
+            Marshal.FinalReleaseComObject(value);
+        }
+    }
+}
+
+[SupportedOSPlatform("windows")]
+public sealed class WindowsUninstallOperations : IUninstallOperations
+{
+    private const string UninstallKeyPath = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
+
+    public bool DirectoryExists(string path) => Directory.Exists(path);
+
+    public void DeleteDirectory(string path) => Directory.Delete(path, recursive: true);
+
+    public IEnumerable<string> FindUninstallers(string installDirectory) =>
+        Directory.Exists(installDirectory)
+            ? Directory.EnumerateFiles(installDirectory, "unins*.exe", SearchOption.TopDirectoryOnly)
+            : [];
+
+    public int RunUninstaller(string executablePath, string arguments, string workingDirectory)
+    {
+        using var process = Process.Start(new ProcessStartInfo(executablePath, arguments)
+        {
+            UseShellExecute = false,
+            WorkingDirectory = workingDirectory
+        }) ?? throw new InvalidOperationException("Unable to start the Inno Setup uninstaller.");
+        process.WaitForExit();
+        return process.ExitCode;
+    }
+
+    public bool HasAppIdRegistration()
+    {
+        foreach (var hive in new[] { RegistryHive.LocalMachine, RegistryHive.CurrentUser })
+        {
+            foreach (var view in new[] { RegistryView.Registry64, RegistryView.Registry32 })
+            {
+                using var baseKey = RegistryKey.OpenBaseKey(hive, view);
+                using var uninstallKey = baseKey.OpenSubKey(UninstallKeyPath);
+                if (uninstallKey?.GetSubKeyNames().Any(IsMatchingAppId) == true)
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private static bool IsMatchingAppId(string keyName) =>
+        keyName.Equals(WindowsInstallationStore.AppId, StringComparison.OrdinalIgnoreCase) ||
+        keyName.Equals(WindowsInstallationStore.AppId + "_is1", StringComparison.OrdinalIgnoreCase);
 }
