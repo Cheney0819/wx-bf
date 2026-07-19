@@ -7,6 +7,12 @@ namespace DesktopPet.Uninstaller.Tests;
 public sealed class UninstallerSelfRelocatorTests
 {
     [Fact]
+    public void Bootstrap_handoff_exit_code_is_distinct_and_nonzero()
+    {
+        Assert.Equal(2, UninstallerSelfRelocator.BootstrapHandoffExitCode);
+    }
+
+    [Fact]
     public void CreatePlan_moves_the_executable_to_a_unique_temporary_directory_and_preserves_arguments()
     {
         var plan = UninstallerSelfRelocator.CreatePlan(

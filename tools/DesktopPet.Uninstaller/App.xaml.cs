@@ -13,9 +13,10 @@ public partial class App : Application
 
         ShutdownMode = ShutdownMode.OnExplicitShutdown;
 
+        bool relocatedWorker;
         try
         {
-            WaitForBootstrapProcess(e.Args);
+            relocatedWorker = WaitForBootstrapProcess(e.Args);
         }
         catch (Exception exception)
         {
@@ -41,7 +42,9 @@ public partial class App : Application
             if (relocation is not null)
             {
                 RelaunchFromTemporaryDirectory(relocation);
-                Shutdown(0);
+                // This process is only a bootstrap. Its handoff code is
+                // intentionally nonzero; the worker owns the final result.
+                Shutdown(UninstallerSelfRelocator.BootstrapHandoffExitCode);
                 return;
             }
         }
@@ -59,6 +62,10 @@ public partial class App : Application
         var window = new MainWindow();
         MainWindow = window;
         window.Show();
+        if (relocatedWorker)
+        {
+            window.ShowRelocatedWorkerNotice();
+        }
 
         var shortcuts = new WindowsShortcutStore();
         var coordinator = new UninstallCoordinator(
@@ -107,12 +114,12 @@ public partial class App : Application
         _ = Process.Start(startInfo) ?? throw new InvalidOperationException("未能从临时目录启动卸载工具。");
     }
 
-    private static void WaitForBootstrapProcess(IReadOnlyList<string> arguments)
+    private static bool WaitForBootstrapProcess(IReadOnlyList<string> arguments)
     {
         var processId = UninstallerSelfRelocator.ReadBootstrapProcessId(arguments);
         if (processId is null)
         {
-            return;
+            return false;
         }
 
         try
@@ -127,6 +134,8 @@ public partial class App : Application
         {
             // The bootstrap process already exited before the relocated process started waiting.
         }
+
+        return true;
     }
 
     private static string? ReadInstallDirectory(IReadOnlyList<string> arguments)

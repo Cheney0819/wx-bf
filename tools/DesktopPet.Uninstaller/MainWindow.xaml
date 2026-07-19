@@ -22,6 +22,7 @@
     <StackPanel Grid.Row="0">
       <TextBlock FontSize="24" FontWeight="SemiBold" Text="桌宠一键卸载" />
       <TextBlock Margin="0,8,0,0" Foreground="#5F6368" Text="正在按安装目录清理后台进程、快捷方式和安装文件。" TextWrapping="Wrap" />
+      <TextBlock x:Name="HandoffNoticeText" Margin="0,8,0,0" Foreground="#8A4B08" Text="本窗口负责显示临时工作进程的最终结果；从安装目录启动的引导进程会以退出码 2 完成交接。" TextWrapping="Wrap" Visibility="Collapsed" />
     </StackPanel>
 
     <Border Grid.Row="2" Padding="14" Background="#F4F8FF" BorderBrush="#C7D9F7" BorderThickness="1" CornerRadius="6">

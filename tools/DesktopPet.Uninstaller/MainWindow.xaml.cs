@@ -17,6 +17,8 @@ public partial class MainWindow : Window
         Closed += (_, _) => lifetime.Cancel();
     }
 
+    public void ShowRelocatedWorkerNotice() => HandoffNoticeText.Visibility = Visibility.Visible;
+
     public async Task<int> RunUninstallAsync(UninstallerApplicationHost host, string? installDirectory)
     {
         host.StatusChanged += HostOnStatusChanged;

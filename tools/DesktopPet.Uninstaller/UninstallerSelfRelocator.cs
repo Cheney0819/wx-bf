@@ -12,6 +12,7 @@ public static class UninstallerSelfRelocator
 {
     public const string RelocatedMarker = "--running-from-temp";
     public const string BootstrapProcessOption = "--wait-for-pid";
+    public const int BootstrapHandoffExitCode = 2;
 
     public static UninstallerSelfRelocationPlan? CreatePlan(
         IReadOnlyList<string> arguments,
