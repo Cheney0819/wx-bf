@@ -23,7 +23,7 @@ public sealed class UninstallCoordinatorTests
         };
         var coordinator = CreateCoordinator(operations);
 
-        var result = coordinator.Run(new(@"C:\Pet", InstallKind.InnoSetup, null), TimeSpan.Zero);
+        var result = coordinator.Run(new(@"C:\Pet", InstallKind.InnoSetup, @"""C:\Pet\unins000.exe"""), TimeSpan.Zero);
 
         Assert.True(result.Succeeded);
         Assert.Equal((@"C:\Pet\unins000.exe", "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART", @"C:\Pet"),
@@ -54,10 +54,39 @@ public sealed class UninstallCoordinatorTests
         };
 
         var result = CreateCoordinator(operations)
-            .Run(new(@"C:\Pet", InstallKind.InnoSetup, null), TimeSpan.Zero);
+            .Run(new(@"C:\Pet", InstallKind.InnoSetup, @"C:\Pet\unins000.exe"), TimeSpan.Zero);
 
         Assert.False(result.Succeeded);
         Assert.Contains(result.Messages, message => message.Contains(@"C:\Pet", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Run_rejects_uninstall_command_outside_target_even_when_matching_file_exists()
+    {
+        var operations = new FakeOperations
+        {
+            Uninstallers = [@"C:\Pet\unins000.exe"],
+            UninstallerExitCode = 0
+        };
+
+        var result = CreateCoordinator(operations)
+            .Run(new(@"C:\Pet", InstallKind.InnoSetup, @"C:\Other\unins000.exe"), TimeSpan.Zero);
+
+        Assert.False(result.Succeeded);
+        Assert.Empty(operations.Runs);
+    }
+
+    [Fact]
+    public void Run_rejects_noncanonical_target_before_any_delete_or_launch()
+    {
+        var operations = new FakeOperations { DirectoryExistsAfterDelete = true };
+
+        var result = CreateCoordinator(operations)
+            .Run(new(@"C:\Pet.", InstallKind.Direct, null), TimeSpan.Zero);
+
+        Assert.False(result.Succeeded);
+        Assert.Equal(0, operations.DeleteCalls);
+        Assert.Empty(operations.Runs);
     }
 
     [Fact]
@@ -67,6 +96,21 @@ public sealed class UninstallCoordinatorTests
             .Run(new(@"C:\Pet", InstallKind.Direct, null), TimeSpan.Zero);
 
         Assert.False(result.Succeeded);
+    }
+
+    [Fact]
+    public void Run_ignores_same_appid_registration_for_another_install_directory()
+    {
+        var operations = new FakeOperations
+        {
+            AppIdRegistrations = [@"HKCU\...\{APPID}_is1"],
+            RegistrationInstallDirectory = @"C:\OtherPet"
+        };
+
+        var result = CreateCoordinator(operations)
+            .Run(new(@"C:\Pet", InstallKind.Direct, null), TimeSpan.Zero);
+
+        Assert.True(result.Succeeded);
     }
 
     [Fact]
@@ -148,8 +192,10 @@ public sealed class UninstallCoordinatorTests
         public bool AppIdRegistrationExists { get; init; }
         public bool DirectoryExistsAfterDelete { get; init; }
         public IReadOnlyList<string> AppIdRegistrations { get; init; } = [];
+        public string? RegistrationInstallDirectory { get; init; }
+        public int DeleteCalls { get; private set; }
         public bool DirectoryExists(string path) => DirectoryExistsAfterDelete;
-        public void DeleteDirectory(string path) { }
+        public void DeleteDirectory(string path) => DeleteCalls++;
         public IEnumerable<string> FindUninstallers(string installDirectory) => Uninstallers;
         public int RunUninstaller(string executablePath, string arguments, string workingDirectory)
         {
@@ -159,5 +205,12 @@ public sealed class UninstallCoordinatorTests
 
         public bool HasAppIdRegistration() => AppIdRegistrationExists;
         public IEnumerable<string> FindAppIdRegistrations() => AppIdRegistrations;
+        public bool HasAppIdRegistration(string installDirectory) =>
+            AppIdRegistrationExists || FindAppIdRegistrations(installDirectory).Any();
+        public IEnumerable<string> FindAppIdRegistrations(string installDirectory) =>
+            RegistrationInstallDirectory is null ||
+            RegistrationInstallDirectory.Equals(installDirectory, StringComparison.OrdinalIgnoreCase)
+                ? AppIdRegistrations
+                : [];
     }
 }

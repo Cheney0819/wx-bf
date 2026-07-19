@@ -16,6 +16,12 @@ public interface IUninstallOperations
 
     IEnumerable<string> FindAppIdRegistrations() =>
         HasAppIdRegistration() ? [DesktopPetAppId] : [];
+
+    // Implementations must scope this query to the selected installation's
+    // App Path. The empty default is deliberately not a global fallback.
+    IEnumerable<string> FindAppIdRegistrations(string installDirectory) => [];
+
+    bool HasAppIdRegistration(string installDirectory) => FindAppIdRegistrations(installDirectory).Any();
 }
 
 public enum UninstallCoordinatorStage
@@ -43,6 +49,18 @@ public sealed class UninstallCoordinator(
     {
         try
         {
+            if (!InstallPathPolicy.TryCreate(
+                    installation.InstallDirectory,
+                    Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                    out var canonicalInstallDirectory))
+            {
+                return OperationResult.Failure(
+                    $"Rejected unsafe or non-canonical installation directory: {installation.InstallDirectory}");
+            }
+
+            // The locator normally already canonicalizes this value; repeat
+            // the boundary check here so direct callers cannot bypass it.
+            installation = installation with { InstallDirectory = canonicalInstallDirectory };
             reportProgress?.Invoke(
                 UninstallCoordinatorStage.StopProcesses,
                 $"正在退出安装目录中的后台进程：{installation.InstallDirectory}");
@@ -69,7 +87,7 @@ public sealed class UninstallCoordinator(
                 $"正在删除安装文件：{installation.InstallDirectory}");
             var uninstallResult = installation.Kind switch
             {
-                InstallKind.InnoSetup => RunInnoUninstaller(installation.InstallDirectory),
+                InstallKind.InnoSetup => RunInnoUninstaller(installation),
                 InstallKind.Direct => DeleteInstallationDirectory(installation.InstallDirectory),
                 _ => OperationResult.Failure("Unknown installation kind.")
             };
@@ -108,22 +126,69 @@ public sealed class UninstallCoordinator(
             new TestOperations(directoryExistsAfterDelete));
     }
 
-    private OperationResult RunInnoUninstaller(string installDirectory)
+    private OperationResult RunInnoUninstaller(InstallationCandidate installation)
     {
-        var uninstaller = operations.FindUninstallers(installDirectory)
-            .Where(path => InstallPathPolicy.IsWithin(installDirectory, path))
-            .Where(IsInnoUninstaller)
-            .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
-            .FirstOrDefault();
-
-        if (uninstaller is null)
+        if (!TryParseValidatedCommand(installation.UninstallCommand, installation.InstallDirectory, out var uninstaller, out var commandArguments))
         {
-            return OperationResult.Failure("No Inno Setup uninstaller was found in the installation directory.");
+            return OperationResult.Failure("The recorded Inno Setup uninstall command is missing or outside the installation directory.");
         }
 
-        return operations.RunUninstaller(uninstaller, InnoArguments, installDirectory) == 0
+        var arguments = string.IsNullOrWhiteSpace(commandArguments)
+            ? InnoArguments
+            : $"{commandArguments} {InnoArguments}";
+        return operations.RunUninstaller(uninstaller, arguments, installation.InstallDirectory) == 0
             ? OperationResult.Success("Inno Setup uninstaller completed.")
             : OperationResult.Failure("Inno Setup uninstaller returned a non-zero exit code.");
+    }
+
+    private static bool TryParseValidatedCommand(
+        string? command,
+        string installDirectory,
+        out string executable,
+        out string arguments)
+    {
+        executable = string.Empty;
+        arguments = string.Empty;
+        if (string.IsNullOrWhiteSpace(command))
+        {
+            return false;
+        }
+
+        var text = command.Trim();
+        var token = text;
+        if (text[0] == '"')
+        {
+            var end = text.IndexOf('"', 1);
+            if (end <= 1)
+            {
+                return false;
+            }
+
+            token = text[1..end];
+            arguments = text[(end + 1)..].Trim();
+        }
+        else
+        {
+            var separator = text.IndexOfAny([' ', '\t']);
+            if (separator >= 0)
+            {
+                token = text[..separator];
+                arguments = text[separator..].Trim();
+            }
+        }
+
+        if (!token.Contains('\\') && !token.Contains('/') && !InstallPathPolicy.IsWithin(installDirectory, installDirectory + "\\" + token))
+        {
+            token = installDirectory + "\\" + token;
+        }
+
+        if (!InstallPathPolicy.IsWithin(installDirectory, token) || !IsInnoUninstaller(token))
+        {
+            return false;
+        }
+
+        executable = token;
+        return true;
     }
 
     private OperationResult DeleteInstallationDirectory(string installDirectory)
@@ -157,8 +222,8 @@ public sealed class UninstallCoordinator(
             messages.Add($"Target shortcut remains: {shortcut.ShortcutPath} -> {shortcut.TargetPath}");
         }
 
-        var registrations = operations.FindAppIdRegistrations().ToArray();
-        if (registrations.Length == 0 && operations.HasAppIdRegistration())
+        var registrations = operations.FindAppIdRegistrations(installDirectory).ToArray();
+        if (registrations.Length == 0 && operations.HasAppIdRegistration(installDirectory))
         {
             registrations = [IUninstallOperations.DesktopPetAppId];
         }

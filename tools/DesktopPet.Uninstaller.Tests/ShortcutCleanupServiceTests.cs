@@ -7,6 +7,18 @@ namespace DesktopPet.Uninstaller.Tests;
 public sealed class ShortcutCleanupServiceTests
 {
     [Fact]
+    [SupportedOSPlatform("windows")]
+    public void WindowsShortcutStore_includes_user_and_common_shell_scopes()
+    {
+        var scopes = DesktopPet.Uninstaller.WindowsShortcutStore.BuildShortcutDirectories(
+            folder => folder.ToString());
+
+        Assert.Equal(6, scopes.Count());
+        Assert.Contains(scopes, scope => scope.Path == Environment.SpecialFolder.CommonDesktopDirectory.ToString());
+        Assert.Contains(scopes, scope => scope.Path == Environment.SpecialFolder.CommonPrograms.ToString());
+        Assert.Contains(scopes, scope => scope.Path == Environment.SpecialFolder.CommonStartup.ToString());
+    }
+    [Fact]
     public void RemoveTargetShortcuts_removes_only_targets_in_installation()
     {
         var store = new FakeShortcutStore(

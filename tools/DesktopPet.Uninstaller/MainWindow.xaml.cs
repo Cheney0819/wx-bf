@@ -1,19 +1,17 @@
 using DesktopPet.Uninstaller.Core;
-using System.Collections.ObjectModel;
 using System.Windows;
 
 namespace DesktopPet.Uninstaller;
 
 public partial class MainWindow : Window
 {
-    private readonly ObservableCollection<string> statuses = [];
+    private readonly List<string> statuses = [];
     private readonly CancellationTokenSource lifetime = new();
     private TaskCompletionSource<InstallationCandidate?>? installationSelection;
 
     public MainWindow()
     {
         InitializeComponent();
-        StatusList.ItemsSource = statuses;
         Closed += (_, _) => lifetime.Cancel();
     }
 
@@ -74,7 +72,18 @@ public partial class MainWindow : Window
     {
         CurrentStatusText.Text = $"{step}：{detail}";
         statuses.Add($"{step}：{detail}");
-        StatusList.ScrollIntoView(statuses.Last());
+        DiagnosticsText.Text = string.Join(Environment.NewLine, statuses);
+        DiagnosticsText.CaretIndex = DiagnosticsText.Text.Length;
+        DiagnosticsText.ScrollToEnd();
+    }
+
+    private void CopyDiagnosticsButton_OnClick(object sender, RoutedEventArgs e)
+    {
+        if (!string.IsNullOrEmpty(DiagnosticsText.Text))
+        {
+            Clipboard.SetText(DiagnosticsText.Text);
+            CurrentStatusText.Text = "诊断信息已复制到剪贴板。";
+        }
     }
 
     private void ConfirmSelectionButton_OnClick(object sender, RoutedEventArgs e) =>

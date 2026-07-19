@@ -11,6 +11,7 @@ namespace DesktopPet.Uninstaller;
 public sealed class WindowsInstallationStore : IInstallationStore
 {
     public const string AppId = IUninstallOperations.DesktopPetAppId;
+    public const string DisplayName = "桌宠";
     private const string UninstallKeyPath = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
 
     public IEnumerable<InstallationCandidate> ReadInnoCandidates()
@@ -53,6 +54,11 @@ public sealed class WindowsInstallationStore : IInstallationStore
             }
 
             using var appKey = uninstallKey.OpenSubKey(name);
+            if (!string.Equals(appKey?.GetValue("DisplayName") as string, DisplayName, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
             var directory = appKey?.GetValue("Inno Setup: App Path") as string;
             if (string.IsNullOrWhiteSpace(directory))
             {
@@ -73,6 +79,8 @@ public sealed class WindowsInstallationStore : IInstallationStore
 
 public sealed class WindowsProcessCatalog : IProcessCatalog
 {
+    private const uint Th32csSnapProcess = 0x00000002;
+    private static readonly IntPtr InvalidHandleValue = new(-1);
     private readonly List<string> diagnostics = [];
 
     public IReadOnlyList<string> Diagnostics => diagnostics;
@@ -80,6 +88,7 @@ public sealed class WindowsProcessCatalog : IProcessCatalog
     public IReadOnlyList<ProcessSnapshot> List()
     {
         var processes = new List<ProcessSnapshot>();
+        var parentProcesses = ReadParentProcessIds();
         foreach (var process in Process.GetProcesses())
         {
             using (process)
@@ -93,7 +102,10 @@ public sealed class WindowsProcessCatalog : IProcessCatalog
                         continue;
                     }
 
-                    processes.Add(new ProcessSnapshot(process.Id, null, executablePath));
+                    processes.Add(new ProcessSnapshot(
+                        process.Id,
+                        parentProcesses.TryGetValue(process.Id, out var parentPid) ? parentPid : null,
+                        executablePath));
                 }
                 catch (Exception exception) when (exception is InvalidOperationException or
                                                    System.ComponentModel.Win32Exception or
@@ -107,6 +119,71 @@ public sealed class WindowsProcessCatalog : IProcessCatalog
 
         return processes;
     }
+
+    private Dictionary<int, int> ReadParentProcessIds()
+    {
+        var parents = new Dictionary<int, int>();
+        var snapshot = CreateToolhelp32Snapshot(Th32csSnapProcess, 0);
+        if (snapshot == InvalidHandleValue)
+        {
+            diagnostics.Add($"Unable to enumerate process parents: Win32 error {Marshal.GetLastWin32Error()}.");
+            return parents;
+        }
+
+        try
+        {
+            var entry = new ProcessEntry32 { Size = (uint)Marshal.SizeOf<ProcessEntry32>() };
+            if (!Process32First(snapshot, ref entry))
+            {
+                diagnostics.Add($"Unable to enumerate process parents: Win32 error {Marshal.GetLastWin32Error()}.");
+                return parents;
+            }
+
+            do
+            {
+                parents[(int)entry.ProcessId] = (int)entry.ParentProcessId;
+                entry.Size = (uint)Marshal.SizeOf<ProcessEntry32>();
+            }
+            while (Process32Next(snapshot, ref entry));
+        }
+        finally
+        {
+            CloseHandle(snapshot);
+        }
+
+        return parents;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct ProcessEntry32
+    {
+        public uint Size;
+        public uint Usage;
+        public uint ProcessId;
+        public IntPtr DefaultHeapId;
+        public uint ModuleId;
+        public uint Threads;
+        public uint ParentProcessId;
+        public int PriorityClassBase;
+        public uint Flags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+        public string ExeFile;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint processId);
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool Process32First(IntPtr snapshot, ref ProcessEntry32 entry);
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool Process32Next(IntPtr snapshot, ref ProcessEntry32 entry);
+
+    [DllImport("kernel32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CloseHandle(IntPtr handle);
 
     public bool TryKill(int pid, bool entireTree)
     {
@@ -198,11 +275,21 @@ public sealed class WindowsShortcutStore : IShortcutStore
     public void Delete(string shortcutPath) => File.Delete(shortcutPath);
 
     private static IEnumerable<ShortcutSearchDirectory> ShortcutDirectories() =>
-    [
-        new(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), SearchSubdirectories: false),
-        new(Environment.GetFolderPath(Environment.SpecialFolder.Programs), SearchSubdirectories: true),
-        new(Environment.GetFolderPath(Environment.SpecialFolder.Startup), SearchSubdirectories: false)
-    ];
+        BuildShortcutDirectories(Environment.GetFolderPath);
+
+    internal static IEnumerable<ShortcutSearchDirectory> BuildShortcutDirectories(
+        Func<Environment.SpecialFolder, string> getFolderPath) =>
+        new[]
+        {
+            new ShortcutSearchDirectory(getFolderPath(Environment.SpecialFolder.DesktopDirectory), false),
+            new ShortcutSearchDirectory(getFolderPath(Environment.SpecialFolder.CommonDesktopDirectory), false),
+            new ShortcutSearchDirectory(getFolderPath(Environment.SpecialFolder.Programs), true),
+            new ShortcutSearchDirectory(getFolderPath(Environment.SpecialFolder.CommonPrograms), true),
+            new ShortcutSearchDirectory(getFolderPath(Environment.SpecialFolder.Startup), false),
+            new ShortcutSearchDirectory(getFolderPath(Environment.SpecialFolder.CommonStartup), false)
+        }
+        .Where(directory => !string.IsNullOrWhiteSpace(directory.Path))
+        .DistinctBy(directory => directory.Path, StringComparer.OrdinalIgnoreCase);
 
     private static string? ReadTarget(string shortcutPath)
     {
@@ -274,7 +361,16 @@ public sealed class WindowsUninstallOperations : IUninstallOperations
 
     public bool HasAppIdRegistration() => FindAppIdRegistrations().Any();
 
+    public bool HasAppIdRegistration(string installDirectory) =>
+        FindAppIdRegistrations(installDirectory).Any();
+
     public IEnumerable<string> FindAppIdRegistrations()
+        => FindAppIdRegistrationsCore(installDirectory: null);
+
+    public IEnumerable<string> FindAppIdRegistrations(string installDirectory)
+        => FindAppIdRegistrationsCore(installDirectory);
+
+    private static IEnumerable<string> FindAppIdRegistrationsCore(string? installDirectory)
     {
         foreach (var hive in new[] { RegistryHive.LocalMachine, RegistryHive.CurrentUser })
         {
@@ -284,6 +380,16 @@ public sealed class WindowsUninstallOperations : IUninstallOperations
                 using var uninstallKey = baseKey.OpenSubKey(UninstallKeyPath);
                 foreach (var keyName in uninstallKey?.GetSubKeyNames().Where(IsMatchingAppId) ?? [])
                 {
+                    using var appKey = uninstallKey!.OpenSubKey(keyName);
+                    var appPath = appKey?.GetValue("Inno Setup: App Path") as string;
+                    if (installDirectory is not null &&
+                        (!InstallPathPolicy.TryCreate(appPath ?? string.Empty,
+                            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), out var normalizedAppPath) ||
+                         !string.Equals(normalizedAppPath, installDirectory, StringComparison.OrdinalIgnoreCase)))
+                    {
+                        continue;
+                    }
+
                     yield return $"{hive}\\{view}\\{UninstallKeyPath}\\{keyName}";
                 }
             }

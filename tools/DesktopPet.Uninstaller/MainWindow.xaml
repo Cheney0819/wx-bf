@@ -38,7 +38,15 @@
         <RowDefinition Height="*" />
       </Grid.RowDefinitions>
       <TextBlock Grid.Row="0" FontWeight="SemiBold" Text="执行状态" />
-      <ListBox x:Name="StatusList" Grid.Row="2" MinHeight="110" MaxHeight="180" IsHitTestVisible="False" />
+      <TextBox x:Name="DiagnosticsText"
+               Grid.Row="2"
+               MinHeight="110"
+               MaxHeight="180"
+               IsReadOnly="True"
+               AcceptsReturn="True"
+               TextWrapping="Wrap"
+               VerticalScrollBarVisibility="Auto"
+               ToolTip="可选择文本，并使用 Ctrl+C 复制诊断信息。" />
       <StackPanel x:Name="CandidatePanel" Grid.Row="4" Visibility="Collapsed">
         <TextBlock FontWeight="SemiBold" Text="检测到多个安装目录，请选择要卸载的路径：" />
         <ListBox x:Name="CandidateList" Margin="0,8,0,0" MinHeight="82" DisplayMemberPath="InstallDirectory" />
@@ -46,6 +54,7 @@
     </Grid>
 
     <StackPanel Grid.Row="6" HorizontalAlignment="Right" Orientation="Horizontal">
+      <Button x:Name="CopyDiagnosticsButton" Width="100" Margin="0,0,8,0" Click="CopyDiagnosticsButton_OnClick">复制诊断</Button>
       <Button x:Name="CancelSelectionButton" Width="92" Margin="0,0,8,0" Click="CancelSelectionButton_OnClick" Visibility="Collapsed">取消</Button>
       <Button x:Name="ConfirmSelectionButton" Width="120" Margin="0,0,8,0" Click="ConfirmSelectionButton_OnClick" Visibility="Collapsed">卸载所选路径</Button>
       <Button Width="88" Click="CloseButton_OnClick">关闭</Button>

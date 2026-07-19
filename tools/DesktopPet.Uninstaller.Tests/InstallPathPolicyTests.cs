@@ -30,4 +30,15 @@ public sealed class InstallPathPolicyTests
     {
         Assert.False(InstallPathPolicy.TryCreate(@"C:\foo\..\..", @"C:\Users\alice", out _));
     }
+
+    [Theory]
+    [InlineData(@"C:\Users\alice.")]
+    [InlineData(@"C:\Users\ALICE~1")]
+    [InlineData(@"\\?\C:\Users\alice")]
+    [InlineData(@"\\.\C:\")]
+    [InlineData(@"\\server\share\Users\alice")]
+    public void TryCreate_rejects_windows_namespace_and_aliases(string input)
+    {
+        Assert.False(InstallPathPolicy.TryCreate(input, @"C:\Users\alice", out _));
+    }
 }
