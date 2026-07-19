@@ -79,8 +79,7 @@ public sealed class UninstallCoordinator(
     {
         var uninstaller = operations.FindUninstallers(installDirectory)
             .Where(path => InstallPathPolicy.IsWithin(installDirectory, path))
-            .Where(path => Path.GetFileName(path).StartsWith("unins", StringComparison.OrdinalIgnoreCase) &&
-                           Path.GetExtension(path).Equals(".exe", StringComparison.OrdinalIgnoreCase))
+            .Where(IsInnoUninstaller)
             .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
             .FirstOrDefault();
 
@@ -102,6 +101,13 @@ public sealed class UninstallCoordinator(
         }
 
         return OperationResult.Success("Installation directory deletion completed.");
+    }
+
+    private static bool IsInnoUninstaller(string path)
+    {
+        var fileName = path.Replace('\\', '/').Split('/').Last();
+        return fileName.StartsWith("unins", StringComparison.OrdinalIgnoreCase) &&
+               fileName.EndsWith(".exe", StringComparison.OrdinalIgnoreCase);
     }
 
     private bool HasNoResidue(string installDirectory) =>
