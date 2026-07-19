@@ -67,7 +67,16 @@ public sealed class UninstallCoordinatorTests
         Assert.False(result.Succeeded);
     }
 
-    private static UninstallCoordinator CreateCoordinator(FakeOperations operations, FakeShortcutStore? shortcuts = null)
+    [Fact]
+    public void Run_fails_when_shortcut_enumeration_is_unreadable()
+    {
+        var result = CreateCoordinator(new FakeOperations(), new ThrowingShortcutStore())
+            .Run(new(@"C:\Pet", InstallKind.Direct, null), TimeSpan.Zero);
+
+        Assert.False(result.Succeeded);
+    }
+
+    private static UninstallCoordinator CreateCoordinator(FakeOperations operations, IShortcutStore? shortcuts = null)
     {
         shortcuts ??= new FakeShortcutStore([]);
         return new UninstallCoordinator(
@@ -96,6 +105,12 @@ public sealed class UninstallCoordinatorTests
                 entries.RemoveAll(entry => entry.ShortcutPath == shortcutPath);
             }
         }
+    }
+
+    private sealed class ThrowingShortcutStore : IShortcutStore
+    {
+        public IEnumerable<ShortcutEntry> List() => throw new UnauthorizedAccessException("Programs directory is inaccessible.");
+        public void Delete(string shortcutPath) { }
     }
 
     private sealed class FakeOperations : IUninstallOperations

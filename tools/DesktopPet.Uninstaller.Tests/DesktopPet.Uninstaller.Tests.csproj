@@ -16,4 +16,7 @@
   <ItemGroup>
     <ProjectReference Include="../DesktopPet.Uninstaller.Core/DesktopPet.Uninstaller.Core.csproj" />
   </ItemGroup>
+  <ItemGroup>
+    <Compile Include="../DesktopPet.Uninstaller/WindowsAdapters.cs" Link="WindowsAdapters.cs" />
+  </ItemGroup>
 </Project>

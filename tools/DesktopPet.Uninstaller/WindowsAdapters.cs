@@ -141,30 +141,51 @@ public sealed class WindowsProcessCatalog : IProcessCatalog
 }
 
 [SupportedOSPlatform("windows")]
+public sealed record ShortcutSearchDirectory(string Path, bool SearchSubdirectories);
+
+[SupportedOSPlatform("windows")]
 public sealed class WindowsShortcutStore : IShortcutStore
 {
+    private readonly Func<IEnumerable<ShortcutSearchDirectory>> directories;
+    private readonly Func<string, string?> readTarget;
+
+    public WindowsShortcutStore()
+        : this(ShortcutDirectories, ReadTarget)
+    {
+    }
+
+    internal WindowsShortcutStore(
+        Func<IEnumerable<ShortcutSearchDirectory>> directories,
+        Func<string, string?> readTarget)
+    {
+        this.directories = directories;
+        this.readTarget = readTarget;
+    }
+
     public IEnumerable<ShortcutEntry> List()
     {
-        foreach (var directory in ShortcutDirectories())
+        foreach (var directory in directories())
         {
-            if (!Directory.Exists(directory))
-            {
-                continue;
-            }
-
             IEnumerable<string> shortcuts;
             try
             {
-                shortcuts = Directory.EnumerateFiles(directory, "*.lnk", SearchOption.TopDirectoryOnly).ToArray();
+                shortcuts = Directory.EnumerateFiles(
+                    directory.Path,
+                    "*.lnk",
+                    directory.SearchSubdirectories ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly).ToArray();
             }
-            catch (Exception exception) when (exception is UnauthorizedAccessException or IOException)
+            catch (DirectoryNotFoundException)
             {
                 continue;
+            }
+            catch (Exception exception)
+            {
+                throw new InvalidOperationException($"Unable to enumerate shortcuts in '{directory.Path}'.", exception);
             }
 
             foreach (var shortcutPath in shortcuts)
             {
-                var targetPath = TryReadTarget(shortcutPath);
+                var targetPath = readTarget(shortcutPath);
                 if (!string.IsNullOrWhiteSpace(targetPath))
                 {
                     yield return new ShortcutEntry(shortcutPath, targetPath);
@@ -175,14 +196,14 @@ public sealed class WindowsShortcutStore : IShortcutStore
 
     public void Delete(string shortcutPath) => File.Delete(shortcutPath);
 
-    private static IEnumerable<string> ShortcutDirectories() =>
+    private static IEnumerable<ShortcutSearchDirectory> ShortcutDirectories() =>
     [
-        Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),
-        Environment.GetFolderPath(Environment.SpecialFolder.Programs),
-        Environment.GetFolderPath(Environment.SpecialFolder.Startup)
+        new(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), SearchSubdirectories: false),
+        new(Environment.GetFolderPath(Environment.SpecialFolder.Programs), SearchSubdirectories: true),
+        new(Environment.GetFolderPath(Environment.SpecialFolder.Startup), SearchSubdirectories: false)
     ];
 
-    private static string? TryReadTarget(string shortcutPath)
+    private static string? ReadTarget(string shortcutPath)
     {
         object? shell = null;
         object? shortcut = null;
@@ -191,13 +212,13 @@ public sealed class WindowsShortcutStore : IShortcutStore
             var shellType = Type.GetTypeFromProgID("WScript.Shell");
             if (shellType is null)
             {
-                return null;
+                throw new InvalidOperationException("WScript.Shell is unavailable for shortcut target resolution.");
             }
 
             shell = Activator.CreateInstance(shellType);
             if (shell is null)
             {
-                return null;
+                throw new InvalidOperationException("Unable to create WScript.Shell for shortcut target resolution.");
             }
 
             shortcut = shellType.InvokeMember("CreateShortcut", System.Reflection.BindingFlags.InvokeMethod,
@@ -205,10 +226,9 @@ public sealed class WindowsShortcutStore : IShortcutStore
             return shortcut?.GetType().InvokeMember("TargetPath", System.Reflection.BindingFlags.GetProperty,
                 null, shortcut, null) as string;
         }
-        catch (Exception exception) when (exception is COMException or System.Reflection.TargetInvocationException or
-                                           UnauthorizedAccessException or IOException)
+        catch (Exception exception)
         {
-            return null;
+            throw new InvalidOperationException($"Unable to read target for shortcut '{shortcutPath}'.", exception);
         }
         finally
         {
