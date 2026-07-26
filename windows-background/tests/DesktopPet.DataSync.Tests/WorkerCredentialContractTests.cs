@@ -13,7 +13,8 @@ public sealed class WorkerCredentialContractTests
             "DesktopPet.DataSync.Worker",
             "Program.cs"));
 
-        Assert.DoesNotContain("wx_monitor_2026", program, StringComparison.Ordinal);
+        var retiredDeploymentToken = string.Concat("wx_", "monitor_", "2026");
+        Assert.DoesNotContain(retiredDeploymentToken, program, StringComparison.Ordinal);
         Assert.DoesNotContain("WECHAT_MONITOR_SERVER_TOKEN=", program, StringComparison.Ordinal);
     }
 

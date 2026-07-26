@@ -71,7 +71,8 @@ Describe "production credential source contract" {
                     ".cs", ".json", ".ps1", ".psm1", ".iss", ".py",
                     ".xml", ".props", ".targets", ".yml", ".yaml", ".txt")
             }
-        $matches = @($sourceFiles | Select-String -SimpleMatch "wx_monitor_2026")
+        $retiredDeploymentToken = "wx_" + "monitor_" + "2026"
+        $matches = @($sourceFiles | Select-String -SimpleMatch $retiredDeploymentToken)
 
         $matches.Count | Should -Be 0
     }
