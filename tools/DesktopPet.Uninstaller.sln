@@ -1,0 +1,28 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DesktopPet.Uninstaller.Core", "DesktopPet.Uninstaller.Core\DesktopPet.Uninstaller.Core.csproj", "{95325EEB-7F8C-420E-A781-B1F325E64C08}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DesktopPet.Uninstaller.Tests", "DesktopPet.Uninstaller.Tests\DesktopPet.Uninstaller.Tests.csproj", "{5CD622A0-89B0-4DE8-BFEB-4C2AB495B19F}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{95325EEB-7F8C-420E-A781-B1F325E64C08}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{95325EEB-7F8C-420E-A781-B1F325E64C08}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{95325EEB-7F8C-420E-A781-B1F325E64C08}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{95325EEB-7F8C-420E-A781-B1F325E64C08}.Release|Any CPU.Build.0 = Release|Any CPU
+		{5CD622A0-89B0-4DE8-BFEB-4C2AB495B19F}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{5CD622A0-89B0-4DE8-BFEB-4C2AB495B19F}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{5CD622A0-89B0-4DE8-BFEB-4C2AB495B19F}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{5CD622A0-89B0-4DE8-BFEB-4C2AB495B19F}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal

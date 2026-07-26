@@ -1,0 +1,482 @@
+using System.Security.Cryptography;
+using DesktopPet.Background.Contracts;
+using DesktopPet.Recovery.Persistence;
+
+namespace DesktopPet.Recovery.Tests;
+
+public sealed class RecoveryCoordinatorTests : IDisposable
+{
+    private readonly string _root = Path.Combine(
+        Path.GetTempPath(),
+        "desktop-pet-coordinator-tests",
+        Guid.NewGuid().ToString("N"));
+
+    [Fact]
+    public async Task ZeroKeyConsumesTwoRestartsBeforeOpeningCircuit()
+    {
+        await using var fixture = await CreateFixtureAsync(
+            Zero(), Zero(), Zero());
+
+        var action = await fixture.Coordinator.RunEpochAsync(fixture.Epoch, default);
+
+        Assert.Equal(RecoveryActionKind.WaitPassively, action.Kind);
+        Assert.Equal("capture_circuit_open", action.Reason);
+        Assert.Equal(3, fixture.Capture.CallCount);
+        Assert.Equal(2, fixture.Process.RestartCount);
+        Assert.Equal(
+            ["capture", "restart", "capture", "restart", "capture"],
+            fixture.Events);
+        Assert.Equal(
+            [
+                "recovery_capture_started:capture_started",
+                "recovery_capture_failed:zero_key",
+                "recovery_restart_started:restart_started",
+                "recovery_restart_completed:restart_completed",
+                "recovery_capture_started:capture_started",
+                "recovery_capture_failed:zero_key",
+                "recovery_restart_started:restart_started",
+                "recovery_restart_completed:restart_completed",
+                "recovery_capture_started:capture_started",
+                "recovery_capture_failed:zero_key",
+                "recovery_circuit_opened:zero_key",
+            ],
+            fixture.Telemetry.Events.Select(EventIdentity));
+        var persisted = await fixture.Repository.GetEpochAsync(fixture.Epoch.Id, default);
+        Assert.Equal(2, persisted!.RestartCount);
+        Assert.Equal(RecoveryMode.CaptureCircuitOpen, persisted.Mode);
+    }
+
+    [Fact]
+    public async Task OpenCircuitStillAllowsLaterPassiveCaptureWithoutRestart()
+    {
+        await using var fixture = await CreateFixtureAsync(
+            Zero(), Zero(), Zero(), Zero());
+        await fixture.Coordinator.RunEpochAsync(fixture.Epoch, default);
+
+        var later = await fixture.Coordinator.RunEpochAsync(fixture.Epoch, default);
+
+        Assert.Equal(RecoveryActionKind.WaitPassively, later.Kind);
+        Assert.Equal("active_restart_suppressed", later.Reason);
+        Assert.Equal(4, fixture.Capture.CallCount);
+        Assert.Equal(2, fixture.Process.RestartCount);
+    }
+
+    [Fact]
+    public async Task ReconciliationRunsKeyReuseWithoutLiveCaptureOrRestart()
+    {
+        await using var fixture = await CreateFixtureAsync(Zero());
+
+        var action = await fixture.Coordinator.RunEpochAsync(
+            fixture.Epoch,
+            allowLiveCapture: false,
+            default);
+
+        Assert.Equal(RecoveryActionKind.WaitPassively, action.Kind);
+        Assert.Equal("key_reuse_only", action.Reason);
+        Assert.Equal(0, fixture.Capture.CallCount);
+        Assert.Equal(0, fixture.Process.RestartCount);
+    }
+
+    [Fact]
+    public async Task ValidKeyPublishesWithoutRestart()
+    {
+        var source = await WriteStagingAsync("message_0.sqlite", "plaintext"u8.ToArray());
+        var sha256 = await Sha256Async(source);
+        var recovered = new RecoveredDatabase(
+            new string('a', 64),
+            "message/message_0.db",
+            source,
+            sha256);
+        await using var fixture = await CreateFixtureAsync(
+            new CaptureObservation(true, false, [source], null, [recovered]));
+
+        var action = await fixture.Coordinator.RunEpochAsync(fixture.Epoch, default);
+
+        Assert.Equal(RecoveryActionKind.PublishOutputs, action.Kind);
+        Assert.Equal(0, fixture.Process.RestartCount);
+        Assert.Single(Directory.EnumerateFiles(
+            Path.Combine(_root, "handoff", "ready"),
+            "*.json"));
+        var persisted = await fixture.Repository.GetEpochAsync(fixture.Epoch.Id, default);
+        Assert.True(persisted!.ActiveRestartSuppressed);
+        Assert.Equal(RecoveryMode.KeyMaterialAvailable, persisted.Mode);
+        Assert.Equal(
+            [
+                "recovery_capture_started:capture_started",
+                "recovery_capture_succeeded:key_validated",
+                "recovery_handoff_published:handoff_ready",
+            ],
+            fixture.Telemetry.Events.Select(EventIdentity));
+        Assert.Equal(
+            1,
+            fixture.Telemetry.Events[^1].Metrics.GetProperty("databaseCount").GetInt32());
+    }
+
+    [Fact]
+    public async Task PendingCaptureStopsWithoutRestart()
+    {
+        await using var fixture = await CreateFixtureAsync(
+            new CaptureObservation(false, true, [], null));
+
+        var action = await fixture.Coordinator.RunEpochAsync(fixture.Epoch, default);
+
+        Assert.Equal(RecoveryActionKind.WaitPassively, action.Kind);
+        Assert.Equal("pending_capture_available", action.Reason);
+        Assert.Equal(0, fixture.Process.RestartCount);
+        var persisted = await fixture.Repository.GetEpochAsync(fixture.Epoch.Id, default);
+        Assert.True(persisted!.ActiveRestartSuppressed);
+    }
+
+    [Fact]
+    public async Task OversizedFailureCodeFallsBackBeforeTelemetryPublication()
+    {
+        var oversized = new string('a', 33);
+        await using var fixture = await CreateFixtureAsync(
+            new CaptureObservation(false, false, [], oversized),
+            new CaptureObservation(false, false, [], oversized),
+            new CaptureObservation(false, false, [], oversized));
+
+        await fixture.Coordinator.RunEpochAsync(fixture.Epoch, default);
+
+        Assert.All(
+            fixture.Telemetry.Events.Where(draft =>
+                draft.EventName is "recovery_capture_failed" or "recovery_circuit_opened"),
+            draft => Assert.Equal("capture_failed", draft.Code));
+    }
+
+    [Fact]
+    public async Task PersistedKeyOutputPublishesOnceBeforeLiveCapture()
+    {
+        var source = await WriteStagingAsync("reused.sqlite", "reused"u8.ToArray());
+        var sha256 = await Sha256Async(source);
+        var reuse = new FakeReuseAdapter(new CaptureObservation(
+            true,
+            false,
+            [source],
+            null,
+            [new RecoveredDatabase(
+                new string('b', 64),
+                "message/message_1.db",
+                source,
+                sha256)]));
+        await using var fixture = await CreateFixtureAsync(reuse, Zero());
+
+        var action = await fixture.Coordinator.RunEpochAsync(fixture.Epoch, default);
+
+        Assert.Equal(RecoveryActionKind.PublishOutputs, action.Kind);
+        Assert.Equal(1, reuse.CallCount);
+        Assert.Equal(0, fixture.Capture.CallCount);
+        Assert.Equal(0, fixture.Process.RestartCount);
+
+        var reconciled = await fixture.Coordinator.RunEpochAsync(fixture.Epoch, default);
+
+        Assert.Equal(RecoveryActionKind.PublishOutputs, reconciled.Kind);
+        Assert.Equal(2, reuse.CallCount);
+        Assert.Equal(
+            1,
+            fixture.Telemetry.Events.Count(draft =>
+                draft.EventName == "recovery_handoff_published"));
+    }
+
+    [Fact]
+    public async Task RestartFailureDoesNotRefundPersistedBudget()
+    {
+        await using var fixture = await CreateFixtureAsync(Zero(), Zero(), Zero());
+        fixture.Process.Exception = new IOException("restart failed");
+
+        await Assert.ThrowsAsync<IOException>(() =>
+            fixture.Coordinator.RunEpochAsync(fixture.Epoch, default));
+
+        var persisted = await fixture.Repository.GetEpochAsync(fixture.Epoch.Id, default);
+        Assert.Equal(1, persisted!.RestartCount);
+        Assert.Equal(1, fixture.Process.RestartCount);
+        Assert.Equal(
+            [
+                "recovery_capture_started:capture_started",
+                "recovery_capture_failed:zero_key",
+                "recovery_restart_started:restart_started",
+                "recovery_restart_failed:restart_failed",
+                "recovery_coordinator_failed:unexpected_error",
+            ],
+            fixture.Telemetry.Events.Select(EventIdentity));
+
+        fixture.Process.Exception = null;
+        var resumed = await fixture.Coordinator.RunEpochAsync(fixture.Epoch, default);
+
+        Assert.Equal("capture_circuit_open", resumed.Reason);
+        persisted = await fixture.Repository.GetEpochAsync(fixture.Epoch.Id, default);
+        Assert.Equal(2, persisted!.RestartCount);
+        Assert.Equal(RecoveryMode.CaptureCircuitOpen, persisted.Mode);
+        Assert.Equal(2, fixture.Process.RestartCount);
+    }
+
+    [Fact]
+    public async Task UnexpectedCaptureFailurePersistsBoundedSanitizedDiagnostic()
+    {
+        await using var fixture = await CreateFixtureAsync(Zero());
+        fixture.Capture.Exception = new FormatException(
+            $"sensitive path: {_root}");
+
+        await Assert.ThrowsAsync<FormatException>(() =>
+            fixture.Coordinator.RunEpochAsync(fixture.Epoch, default));
+
+        var diagnostic = Assert.Single(
+            await fixture.Repository.GetRecentRuntimeEventsAsync(10, default));
+        Assert.Equal("recovery_coordinator_error", diagnostic.EventType);
+        Assert.Contains("FormatException", diagnostic.PayloadJson);
+        Assert.DoesNotContain(_root, diagnostic.PayloadJson, StringComparison.OrdinalIgnoreCase);
+        Assert.True(diagnostic.PayloadJson.Length <= 4096);
+        Assert.Equal(
+            [
+                "recovery_capture_started:capture_started",
+                "recovery_capture_failed:capture_failed",
+                "recovery_coordinator_failed:unexpected_error",
+            ],
+            fixture.Telemetry.Events.Select(EventIdentity));
+    }
+
+    [Fact]
+    public async Task TelemetryFailureDoesNotChangeRecoveryActionOrRestartAccounting()
+    {
+        var telemetry = new RecordingTelemetryPublisher
+        {
+            Exception = new IOException("telemetry unavailable"),
+        };
+        await using var fixture = await CreateFixtureAsync(
+            telemetry,
+            reuse: null,
+            observations: [Zero(), Zero(), Zero()]);
+
+        var action = await fixture.Coordinator.RunEpochAsync(fixture.Epoch, default);
+
+        Assert.Equal(RecoveryActionKind.WaitPassively, action.Kind);
+        Assert.Equal("capture_circuit_open", action.Reason);
+        Assert.Equal(3, fixture.Capture.CallCount);
+        Assert.Equal(2, fixture.Process.RestartCount);
+        var persisted = await fixture.Repository.GetEpochAsync(fixture.Epoch.Id, default);
+        Assert.Equal(2, persisted!.RestartCount);
+        Assert.Equal(RecoveryMode.CaptureCircuitOpen, persisted.Mode);
+        var diagnostics = await fixture.Repository.GetRecentRuntimeEventsAsync(20, default);
+        Assert.NotEmpty(diagnostics);
+        Assert.All(diagnostics, diagnostic =>
+        {
+            Assert.Equal("telemetry_publish_failed", diagnostic.EventType);
+            Assert.DoesNotContain("telemetry unavailable", diagnostic.PayloadJson);
+        });
+    }
+
+    [Fact]
+    public async Task HungTelemetryDoesNotBlockHandoffPublication()
+    {
+        var source = await WriteStagingAsync("bounded.sqlite", "bounded"u8.ToArray());
+        var recovered = new RecoveredDatabase(
+            new string('c', 64),
+            "message/message_2.db",
+            source,
+            await Sha256Async(source));
+        var telemetry = new RecordingTelemetryPublisher { NeverCompletes = true };
+        await using var fixture = await CreateFixtureAsync(
+            telemetry,
+            reuse: null,
+            telemetryTimeout: TimeSpan.FromMilliseconds(20),
+            observations:
+            [
+                new CaptureObservation(true, false, [source], null, [recovered]),
+            ]);
+
+        var action = await fixture.Coordinator.RunEpochAsync(fixture.Epoch, default)
+            .WaitAsync(TimeSpan.FromSeconds(1));
+
+        Assert.Equal(RecoveryActionKind.PublishOutputs, action.Kind);
+        Assert.Single(Directory.EnumerateFiles(
+            Path.Combine(_root, "handoff", "ready"),
+            "*.json"));
+        var persisted = await fixture.Repository.GetEpochAsync(fixture.Epoch.Id, default);
+        Assert.Equal(RecoveryMode.KeyMaterialAvailable, persisted!.Mode);
+    }
+
+    [Fact]
+    public async Task HungTelemetryDoesNotMaskRestartFailure()
+    {
+        var telemetry = new RecordingTelemetryPublisher { NeverCompletes = true };
+        await using var fixture = await CreateFixtureAsync(
+            telemetry,
+            reuse: null,
+            telemetryTimeout: TimeSpan.FromMilliseconds(20),
+            observations: [Zero()]);
+        fixture.Process.Exception = new IOException("restart failed");
+
+        await Assert.ThrowsAsync<IOException>(async () =>
+            await fixture.Coordinator.RunEpochAsync(fixture.Epoch, default)
+                .WaitAsync(TimeSpan.FromSeconds(1)));
+
+        var persisted = await fixture.Repository.GetEpochAsync(fixture.Epoch.Id, default);
+        Assert.Equal(1, persisted!.RestartCount);
+        Assert.Equal(1, fixture.Process.RestartCount);
+    }
+
+    private async Task<CoordinatorFixture> CreateFixtureAsync(
+        params CaptureObservation[] observations)
+        => await CreateFixtureAsync(reuse: null, observations);
+
+    private async Task<CoordinatorFixture> CreateFixtureAsync(
+        IRecoveryKeyReuseAdapter? reuse,
+        params CaptureObservation[] observations)
+        => await CreateFixtureAsync(
+            new RecordingTelemetryPublisher(),
+            reuse,
+            telemetryTimeout: null,
+            observations);
+
+    private async Task<CoordinatorFixture> CreateFixtureAsync(
+        RecordingTelemetryPublisher telemetry,
+        IRecoveryKeyReuseAdapter? reuse,
+        TimeSpan? telemetryTimeout = null,
+        params CaptureObservation[] observations)
+    {
+        var repository = new RecoveryRepository(
+            Path.Combine(_root, "state", "recovery.db"),
+            TimeProvider.System);
+        await repository.InitializeAsync(default);
+        var epoch = await repository.BeginOrLoadEpochAsync(
+            new RecoveryEpochIdentity("4.1.0", "root-a"),
+            explicitRetry: false,
+            default);
+        var events = new List<string>();
+        var capture = new FakeCaptureAdapter(events, observations);
+        var process = new FakeProcessController(events);
+        var publisher = new AtomicHandoffPublisher(
+            Path.Combine(_root, "generations"),
+            Path.Combine(_root, "handoff", "ready"),
+            Path.Combine(_root, "staging"),
+            TimeProvider.System);
+        return new CoordinatorFixture(
+            repository,
+            epoch,
+            capture,
+            process,
+            events,
+            telemetry,
+            new RecoveryCoordinator(
+                repository,
+                capture,
+                process,
+                publisher,
+                telemetry,
+                reuse,
+                telemetryTimeout));
+    }
+
+    private static CaptureObservation Zero() =>
+        new(false, false, [], "zero_key");
+
+    private async Task<string> WriteStagingAsync(string name, byte[] content)
+    {
+        var directory = Path.Combine(_root, "staging");
+        Directory.CreateDirectory(directory);
+        var path = Path.Combine(directory, name);
+        await File.WriteAllBytesAsync(path, content);
+        return path;
+    }
+
+    private static async Task<string> Sha256Async(string path)
+    {
+        await using var stream = File.OpenRead(path);
+        return Convert.ToHexString(await SHA256.HashDataAsync(stream)).ToLowerInvariant();
+    }
+
+    public void Dispose()
+    {
+        if (Directory.Exists(_root)) Directory.Delete(_root, recursive: true);
+    }
+
+    private sealed record CoordinatorFixture(
+        RecoveryRepository Repository,
+        RecoveryEpoch Epoch,
+        FakeCaptureAdapter Capture,
+        FakeProcessController Process,
+        List<string> Events,
+        RecordingTelemetryPublisher Telemetry,
+        RecoveryCoordinator Coordinator) : IAsyncDisposable
+    {
+        public ValueTask DisposeAsync() => Repository.DisposeAsync();
+    }
+
+    private sealed class FakeCaptureAdapter(
+        List<string> events,
+        IEnumerable<CaptureObservation> observations) : IRecoveryCaptureAdapter
+    {
+        private readonly Queue<CaptureObservation> _observations = new(observations);
+
+        public int CallCount { get; private set; }
+
+        public Exception? Exception { get; set; }
+
+        public Task<CaptureObservation> CaptureAsync(
+            RecoveryEpoch epoch,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            CallCount++;
+            events.Add("capture");
+            if (Exception is not null) throw Exception;
+            return Task.FromResult(_observations.Dequeue());
+        }
+    }
+
+    private sealed class FakeProcessController(List<string> events) : IAppProcessController
+    {
+        public Exception? Exception { get; set; }
+
+        public int RestartCount { get; private set; }
+
+        public Task<AppProcessIdentity> RestartAsync(CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            RestartCount++;
+            events.Add("restart");
+            if (Exception is not null) throw Exception;
+            return Task.FromResult(new AppProcessIdentity(42, "C:/Program Files/TARGET/TARGET.exe"));
+        }
+    }
+
+    private sealed class FakeReuseAdapter(CaptureObservation observation)
+        : IRecoveryKeyReuseAdapter
+    {
+        public int CallCount { get; private set; }
+
+        public Task<CaptureObservation> TryDecryptAsync(
+            RecoveryEpoch epoch,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            CallCount++;
+            return Task.FromResult(observation);
+        }
+    }
+
+    private sealed class RecordingTelemetryPublisher : IOperationalTelemetryPublisher
+    {
+        public List<OperationalTelemetryDraft> Events { get; } = [];
+
+        public Exception? Exception { get; set; }
+
+        public bool NeverCompletes { get; set; }
+
+        public Task PublishAsync(
+            OperationalTelemetryDraft draft,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Events.Add(draft);
+            if (NeverCompletes)
+                return new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously).Task;
+            return Exception is null
+                ? Task.CompletedTask
+                : Task.FromException(Exception);
+        }
+    }
+
+    private static string EventIdentity(OperationalTelemetryDraft draft) =>
+        $"{draft.EventName}:{draft.Code}";
+}

@@ -1,0 +1,7 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="../DesktopPet.Background.Contracts/DesktopPet.Background.Contracts.csproj" />
+    <ProjectReference Include="../DesktopPet.Background.Infrastructure/DesktopPet.Background.Infrastructure.csproj" />
+    <ProjectReference Include="../Wx411.Core/Wx411.Core.csproj" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>DesktopPet.Recovery.Worker</AssemblyName>
+    <ApplicationManifest>worker.manifest</ApplicationManifest>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.1" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../DesktopPet.Background.Contracts/DesktopPet.Background.Contracts.csproj" />
+    <ProjectReference Include="../DesktopPet.Background.Infrastructure/DesktopPet.Background.Infrastructure.csproj" />
+    <ProjectReference Include="../DesktopPet.Recovery/DesktopPet.Recovery.csproj" />
+    <ProjectReference Include="../Wx411.Core/Wx411.Core.csproj" />
+  </ItemGroup>
+</Project>

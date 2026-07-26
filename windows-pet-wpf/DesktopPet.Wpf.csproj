@@ -9,10 +9,10 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>DesktopPet.Wpf</AssemblyName>
     <RootNamespace>DesktopPet.Wpf</RootNamespace>
-    <Version>1.0.13</Version>
-    <AssemblyVersion>1.0.13.0</AssemblyVersion>
-    <FileVersion>1.0.13.0</FileVersion>
-    <InformationalVersion>1.0.13</InformationalVersion>
+    <Version>1.0.14</Version>
+    <AssemblyVersion>1.0.14.0</AssemblyVersion>
+    <FileVersion>1.0.14.0</FileVersion>
+    <InformationalVersion>1.0.14</InformationalVersion>
     <ApplicationIcon>Assets\app-icon.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>
   </PropertyGroup>
@@ -23,13 +23,10 @@
   </ItemGroup>
 
   <ItemGroup>
-    <None Include="wx_decrypt.exe" CopyToOutputDirectory="PreserveNewest" Condition="Exists('wx_decrypt.exe')" />
-    <None Include="ffmpeg.exe" CopyToOutputDirectory="PreserveNewest" Condition="Exists('ffmpeg.exe')" />
-    <None Include="install.bat" CopyToOutputDirectory="PreserveNewest" />
-    <None Include="install.ps1" CopyToOutputDirectory="PreserveNewest" />
-    <None Include="uninstall.bat" CopyToOutputDirectory="PreserveNewest" />
-    <None Include="uninstall.ps1" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="Assets\**\*" CopyToOutputDirectory="PreserveNewest" />
-    <Compile Include="..\windows\WeChatMonitor.cs" Link="WeChatMonitor.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\windows-background\src\DesktopPet.Background.Launcher\DesktopPet.Background.Launcher.csproj" />
   </ItemGroup>
 </Project>

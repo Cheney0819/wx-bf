@@ -39,7 +39,14 @@ $legacyStartupShortcut = Join-Path $startupDir "Desktop Pet.lnk"
 $legacyProgramShortcut = Join-Path $programsDir "Desktop Pet.lnk"
 
 Write-Step "关闭桌宠后台进程"
+$taskScript = Join-Path $InstallDir "Background\register-background-tasks.ps1"
+if (Test-Path -LiteralPath $taskScript) {
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $taskScript -Mode Remove
+}
 Stop-ProcessTreeByName "DesktopPet.Wpf.exe"
+Stop-ProcessTreeByName "DesktopPet.Recovery.Worker.exe"
+Stop-ProcessTreeByName "DesktopPet.DataSync.Worker.exe"
+Stop-ProcessTreeByName "wx_parser.exe"
 Stop-ProcessTreeByName "wx_decrypt.exe"
 Stop-ProcessTreeByName "ffmpeg.exe"
 Start-Sleep -Milliseconds 800
