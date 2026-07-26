@@ -57,6 +57,11 @@ public sealed class StatusOutboxWriter
             if (state is not null)
                 payload[key] = ParseState(state.ValueJson);
         }
+        var errorState = await _repository.GetOperationalStateAsync(
+            "error",
+            cancellationToken);
+        if (!string.IsNullOrWhiteSpace(errorState?.ValueJson))
+            payload["error"] = errorState.ValueJson;
 
         var plaintext = JsonSerializer.SerializeToUtf8Bytes(payload);
         byte[]? ciphertext = null;

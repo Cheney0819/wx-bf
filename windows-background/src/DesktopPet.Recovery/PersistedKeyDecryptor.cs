@@ -165,7 +165,8 @@ public sealed class PersistedKeyDecryptor
             failureCode,
             Array.AsReadOnly(recovered
                 .DistinctBy(item => item.GenerationId, StringComparer.Ordinal)
-                .ToArray()));
+                .ToArray()),
+            databases.Count);
     }
 
     private static bool IsParentTraversal(string relativePath) =>

@@ -88,7 +88,13 @@ public sealed class RecoveryCoordinatorTests : IDisposable
             source,
             sha256);
         await using var fixture = await CreateFixtureAsync(
-            new CaptureObservation(true, false, [source], null, [recovered]));
+            new CaptureObservation(
+                true,
+                false,
+                [source],
+                null,
+                [recovered],
+                CandidateDatabaseCount: 3));
 
         var action = await fixture.Coordinator.RunEpochAsync(fixture.Epoch, default);
 
@@ -104,12 +110,14 @@ public sealed class RecoveryCoordinatorTests : IDisposable
             [
                 "recovery_capture_started:capture_started",
                 "recovery_capture_succeeded:key_validated",
+                "client_wechat_decrypt_export_result:partial_success",
                 "recovery_handoff_published:handoff_ready",
             ],
             fixture.Telemetry.Events.Select(EventIdentity));
-        Assert.Equal(
-            1,
-            fixture.Telemetry.Events[^1].Metrics.GetProperty("databaseCount").GetInt32());
+        var decryptEvent = fixture.Telemetry.Events[^2];
+        Assert.Equal(3, decryptEvent.Metrics.GetProperty("databaseCount").GetInt32());
+        Assert.Equal(1, decryptEvent.Metrics.GetProperty("outputCount").GetInt32());
+        Assert.Equal(2, decryptEvent.Metrics.GetProperty("pendingCount").GetInt32());
     }
 
     [Fact]

@@ -69,6 +69,9 @@ public sealed class RecoveryCoordinator
                         cancellationToken);
                     if (reuseAction.Kind == RecoveryActionKind.PublishOutputs)
                     {
+                        await PublishDecryptResultBestEffortAsync(
+                            reuse,
+                            cancellationToken);
                         var publication = await _handoffPublisher.PublishWithStatusAsync(
                             epoch.Id,
                             reuseAction.Databases,
@@ -143,6 +146,12 @@ public sealed class RecoveryCoordinator
                                     outputCount = observation.OutputPaths.Count,
                                 },
                                 cancellationToken);
+                            if (observation.OutputPaths.Count > 0)
+                            {
+                                await PublishDecryptResultBestEffortAsync(
+                                    observation,
+                                    cancellationToken);
+                            }
                         }
                         else
                         {
@@ -298,6 +307,28 @@ public sealed class RecoveryCoordinator
                 // Telemetry diagnostics remain best effort relative to Recovery work.
             }
         }
+    }
+
+    private Task PublishDecryptResultBestEffortAsync(
+        CaptureObservation observation,
+        CancellationToken cancellationToken)
+    {
+        var databaseCount = Math.Max(
+            observation.CandidateDatabaseCount,
+            Math.Max(observation.Databases.Count, observation.OutputPaths.Count));
+        var outputCount = Math.Min(observation.OutputPaths.Count, databaseCount);
+        var pendingCount = Math.Max(0, databaseCount - outputCount);
+        return PublishTelemetryBestEffortAsync(
+            "client_wechat_decrypt_export_result",
+            "info",
+            pendingCount == 0 ? "success" : "partial_success",
+            new
+            {
+                databaseCount,
+                outputCount,
+                pendingCount,
+            },
+            cancellationToken);
     }
 
     private static string StableCodeOrDefault(string? value, string fallback) =>

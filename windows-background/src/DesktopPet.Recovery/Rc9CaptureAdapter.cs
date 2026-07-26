@@ -76,7 +76,10 @@ public sealed class Rc9CaptureAdapter : IRecoveryCaptureAdapter
         cancellationToken.ThrowIfCancellationRequested();
         var databases = _discoverDatabases();
         if (databases.Count == 0)
-            return Failure("capture_no_database_candidates", hasPending: SnapshotHasPending());
+            return Failure(
+                "capture_no_database_candidates",
+                hasPending: SnapshotHasPending(),
+                candidateDatabaseCount: 0);
 
         IReadOnlyList<string> pendingBefore;
         try
@@ -109,7 +112,8 @@ public sealed class Rc9CaptureAdapter : IRecoveryCaptureAdapter
                     HasPendingCapture: HasPendingAfter(pendingBefore) ||
                         result.LoadedPendingCaptureTicketIds.Count > 0,
                     OutputPaths: [],
-                    FailureCode: "capture_result_mapping_failed");
+                    FailureCode: "capture_result_mapping_failed",
+                    CandidateDatabaseCount: databases.Count);
             }
 
             return new CaptureObservation(
@@ -118,7 +122,8 @@ public sealed class Rc9CaptureAdapter : IRecoveryCaptureAdapter
                     result.LoadedPendingCaptureTicketIds.Count > 0,
                 result.OutputPaths,
                 FailureCode: null,
-                recovered);
+                recovered,
+                databases.Count);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -128,7 +133,8 @@ public sealed class Rc9CaptureAdapter : IRecoveryCaptureAdapter
         {
             return Failure(
                 FailureCode(exception),
-                HasPendingAfter(pendingBefore));
+                HasPendingAfter(pendingBefore),
+                databases.Count);
         }
     }
 
@@ -203,8 +209,16 @@ public sealed class Rc9CaptureAdapter : IRecoveryCaptureAdapter
         }
     }
 
-    private static CaptureObservation Failure(string code, bool hasPending) =>
-        new(false, hasPending, [], code);
+    private static CaptureObservation Failure(
+        string code,
+        bool hasPending,
+        int candidateDatabaseCount = 0) =>
+        new(
+            false,
+            hasPending,
+            [],
+            code,
+            CandidateDatabaseCount: candidateDatabaseCount);
 
     private static bool IsParentTraversal(string relativePath) =>
         relativePath.Equals("..", StringComparison.Ordinal) ||

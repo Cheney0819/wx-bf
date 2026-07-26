@@ -63,6 +63,56 @@ public sealed class TelemetryHandoffImporterTests : IDisposable
     }
 
     [Fact]
+    public async Task RecoveryPreflightFailureFlowsIntoNextStatusHeartbeat()
+    {
+        var fixture = await CreateFixtureAsync();
+        await fixture.Writer.CommitAsync(
+            new OperationalTelemetryEnvelope(
+                1,
+                EventId('9'),
+                "recovery",
+                "client_v4_data_dir_result",
+                "warning",
+                "data_root_missing",
+                _now,
+                JsonSerializer.SerializeToElement(new
+                {
+                    candidateCount = 0,
+                    databaseCount = 0,
+                    wechatLoggedIn = false,
+                })),
+            default);
+        var identity = new ClientIdentityDocument(
+            1,
+            "client-cs-existing",
+            "client_cs",
+            DateTimeOffset.Parse("2026-07-01T00:00:00Z"));
+        var status = new StatusOutboxWriter(
+            fixture.Repository,
+            fixture.Protector,
+            identity,
+            new FixedTimeProvider(_now));
+
+        await status.EnqueueHeartbeatAsync(default);
+
+        Assert.Equal(
+            "data_root_missing",
+            await ReadStateAsync(fixture.Repository.DatabasePath, "error"));
+        var row = Assert.Single(
+            await fixture.Repository.GetPendingOutboxAsync(10, default),
+            item => item.Endpoint == "status");
+        var plaintext = fixture.Protector.Unprotect(
+            row.Id,
+            row.Endpoint,
+            row.Ciphertext);
+        using var document = JsonDocument.Parse(plaintext);
+        Assert.False(document.RootElement.GetProperty("wechat_logged_in").GetBoolean());
+        Assert.Equal(
+            "data_root_missing",
+            document.RootElement.GetProperty("error").GetString());
+    }
+
+    [Fact]
     public async Task ReplayAfterCommitCreatesNoDuplicateRows()
     {
         var fixture = await CreateFixtureAsync();

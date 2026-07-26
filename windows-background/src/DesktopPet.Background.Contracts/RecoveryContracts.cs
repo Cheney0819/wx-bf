@@ -25,7 +25,8 @@ public sealed record CaptureObservation(
     bool HasPendingCapture,
     IReadOnlyList<string> OutputPaths,
     string? FailureCode,
-    IReadOnlyList<RecoveredDatabase>? RecoveredDatabases = null)
+    IReadOnlyList<RecoveredDatabase>? RecoveredDatabases = null,
+    int CandidateDatabaseCount = 0)
 {
     public IReadOnlyList<RecoveredDatabase> Databases => RecoveredDatabases ?? [];
 }
