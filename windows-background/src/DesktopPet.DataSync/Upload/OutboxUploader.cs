@@ -262,7 +262,9 @@ public sealed class OutboxUploader
         {
             if (string.Equals(_credentialFingerprint, fingerprint, StringComparison.Ordinal))
                 return;
-            await _repository.RequeueQuarantinedOutboxAsync([401, 403], cancellationToken);
+            await _repository.RequeueAuthenticationFailuresIfCredentialChangedAsync(
+                fingerprint,
+                cancellationToken);
             _credentialFingerprint = fingerprint;
         }
         finally

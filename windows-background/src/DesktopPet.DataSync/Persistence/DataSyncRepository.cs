@@ -9,6 +9,9 @@ namespace DesktopPet.DataSync.Persistence;
 
 public sealed class DataSyncRepository : IDataSyncRepository
 {
+    private const string UploadCredentialFingerprintStateKey =
+        "datasync_upload_credential_fingerprint_v1";
+
     private readonly string _databasePath;
     private readonly TimeProvider _timeProvider;
     private readonly IOutboxProtector _outboxProtector;
@@ -579,6 +582,76 @@ public sealed class DataSyncRepository : IDataSyncRepository
         foreach (var parameter in parameters)
             command.Parameters.AddWithValue(parameter.Name, parameter.Code);
         return await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    public async Task<int> RequeueAuthenticationFailuresIfCredentialChangedAsync(
+        string credentialFingerprint,
+        CancellationToken cancellationToken)
+    {
+        if (credentialFingerprint.Length != 64 ||
+            credentialFingerprint.Any(character => !Uri.IsHexDigit(character)))
+        {
+            throw new ArgumentException(
+                "Credential fingerprint must be a SHA-256 hex string.",
+                nameof(credentialFingerprint));
+        }
+
+        var normalizedFingerprint = credentialFingerprint.ToLowerInvariant();
+        var valueJson = JsonSerializer.Serialize(normalizedFingerprint);
+        var now = _timeProvider.GetUtcNow().ToString("O");
+        await using var connection = await OpenAsync(cancellationToken);
+        using var transaction = connection.BeginTransaction(deferred: false);
+        await using (var read = connection.CreateCommand())
+        {
+            read.Transaction = transaction;
+            read.CommandText = "SELECT value_json FROM operational_state WHERE key = $key;";
+            read.Parameters.AddWithValue("$key", UploadCredentialFingerprintStateKey);
+            if (string.Equals(
+                    Convert.ToString(await read.ExecuteScalarAsync(cancellationToken)),
+                    valueJson,
+                    StringComparison.Ordinal))
+            {
+                transaction.Commit();
+                return 0;
+            }
+        }
+
+        int requeued;
+        await using (var update = connection.CreateCommand())
+        {
+            update.Transaction = transaction;
+            update.CommandText = """
+                UPDATE outbox
+                SET state = 'pending',
+                    lease_owner = NULL,
+                    lease_until_utc = NULL,
+                    next_attempt_at_utc = $now,
+                    updated_at_utc = $now
+                WHERE state = 'quarantined'
+                  AND last_status_code IN (401, 403);
+                """;
+            update.Parameters.AddWithValue("$now", now);
+            requeued = await update.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        await using (var remember = connection.CreateCommand())
+        {
+            remember.Transaction = transaction;
+            remember.CommandText = """
+                INSERT INTO operational_state(key, value_json, updated_at_utc)
+                VALUES($key, $value, $now)
+                ON CONFLICT(key) DO UPDATE SET
+                    value_json = excluded.value_json,
+                    updated_at_utc = excluded.updated_at_utc;
+                """;
+            remember.Parameters.AddWithValue("$key", UploadCredentialFingerprintStateKey);
+            remember.Parameters.AddWithValue("$value", valueJson);
+            remember.Parameters.AddWithValue("$now", now);
+            await remember.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        transaction.Commit();
+        return requeued;
     }
 
     public async Task RecordRuntimeEventAsync(

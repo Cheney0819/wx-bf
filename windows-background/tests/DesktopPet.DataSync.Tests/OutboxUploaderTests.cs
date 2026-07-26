@@ -30,7 +30,7 @@ public sealed class OutboxUploaderTests : IDisposable
     }
 
     [Fact]
-    public async Task AuthenticationQuarantineIsRetriedOnlyAfterCredentialChanges()
+    public async Task AuthenticationQuarantineSurvivesRestartUntilCredentialChanges()
     {
         var handler = new QueueHandler(
             new HttpResponseMessage(HttpStatusCode.Unauthorized)
@@ -44,11 +44,19 @@ public sealed class OutboxUploaderTests : IDisposable
         var fixture = await CreateFixtureAsync(handler);
 
         var rejected = await fixture.Uploader.UploadOneAsync("worker-a", default);
-        var unchanged = await fixture.Uploader.UploadOneAsync("worker-a", default);
+        var restartedUploader = new OutboxUploader(
+            fixture.Repository,
+            new EncryptedOutboxProtector(new XorTestProtector()),
+            fixture.Settings,
+            new HttpClient(handler),
+            fixture.Time,
+            new FixedBackoff(TimeSpan.FromSeconds(30)));
+
+        var unchanged = await restartedUploader.UploadOneAsync("worker-a", default);
         fixture.Settings.Value = new ServerSettings(
             new Uri("https://example.invalid/"),
             "replacement-token");
-        var recovered = await fixture.Uploader.UploadOneAsync("worker-a", default);
+        var recovered = await restartedUploader.UploadOneAsync("worker-a", default);
         var row = await fixture.Repository.GetOutboxAsync("outbox-1", default);
 
         Assert.Equal(UploadDisposition.Quarantined, rejected.Disposition);

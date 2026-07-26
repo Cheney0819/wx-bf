@@ -186,6 +186,10 @@ public interface IDataSyncRepository : IAsyncDisposable
         IReadOnlyCollection<int> statusCodes,
         CancellationToken cancellationToken);
 
+    Task<int> RequeueAuthenticationFailuresIfCredentialChangedAsync(
+        string credentialFingerprint,
+        CancellationToken cancellationToken);
+
     Task RecordRuntimeEventAsync(
         string eventType,
         string payloadJson,
