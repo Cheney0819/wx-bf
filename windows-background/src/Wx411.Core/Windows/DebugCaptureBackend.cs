@@ -841,8 +841,10 @@ public sealed class DebugCaptureBackend : ICallpointCaptureBackend, IDisposable
     private BreakpointRestoreStatus RestoreBreakpoints()
     {
         var status = BreakpointRestoreStatus.Restored;
-        foreach (var breakpoint in _breakpoints.ToArray().Reverse())
+        var breakpoints = _breakpoints.ToArray();
+        for (var index = breakpoints.Length - 1; index >= 0; index--)
         {
+            var breakpoint = breakpoints[index];
             var current = RestoreBreakpointWithStatus(breakpoint);
             if (current == BreakpointRestoreStatus.ProcessExited)
                 status = current;
