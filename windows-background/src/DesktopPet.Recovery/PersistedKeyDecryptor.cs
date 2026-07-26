@@ -54,7 +54,7 @@ public sealed class PersistedKeyDecryptor
         var keyIds = _vault.ListIds();
         var outputs = new List<string>();
         var recovered = new List<RecoveredDatabase>();
-        var unresolved = new List<DatabaseSource>();
+        var unresolvedRequired = new List<DatabaseSource>();
         var hasValidatedKey = false;
         var failureCount = 0;
 
@@ -181,7 +181,8 @@ public sealed class PersistedKeyDecryptor
             }
             finally
             {
-                if (!resolvedThisDatabase) unresolved.Add(source);
+                if (!resolvedThisDatabase && source.IsRequired)
+                    unresolvedRequired.Add(source);
             }
         }
 
@@ -205,7 +206,7 @@ public sealed class PersistedKeyDecryptor
                     .DistinctBy(item => item.GenerationId, StringComparer.Ordinal)
                     .ToArray()),
                 databases.Count),
-            Array.AsReadOnly(unresolved.ToArray()));
+            Array.AsReadOnly(unresolvedRequired.ToArray()));
     }
 
     private static bool IsParentTraversal(string relativePath) =>

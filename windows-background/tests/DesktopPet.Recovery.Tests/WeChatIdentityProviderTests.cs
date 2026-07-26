@@ -63,6 +63,33 @@ public sealed class WeChatIdentityProviderTests : IDisposable
                 : StringComparer.Ordinal);
     }
 
+    [Fact]
+    public void MultipleInteractiveProcessesAreAmbiguousInsteadOfChoosingLowestPid()
+    {
+        var executable = typeof(WeChatIdentityProviderTests).Assembly.Location;
+        var processes = new[]
+        {
+            new WeChatProcessCandidate(41, 7, executable),
+            new WeChatProcessCandidate(42, 7, executable),
+        };
+
+        var exception = Assert.Throws<AmbiguousWeChatProcessException>(() =>
+            WeChatIdentityProvider.SelectInteractiveProcess(processes));
+
+        Assert.Equal("ambiguous_data_root", exception.Code);
+    }
+
+    [Fact]
+    public void OneInteractiveProcessRemainsSelectable()
+    {
+        var executable = typeof(WeChatIdentityProviderTests).Assembly.Location;
+        var expected = new WeChatProcessCandidate(42, 7, executable);
+
+        var selected = WeChatIdentityProvider.SelectInteractiveProcess([expected]);
+
+        Assert.Equal(expected, selected);
+    }
+
     public void Dispose()
     {
         if (Directory.Exists(_root)) Directory.Delete(_root, recursive: true);

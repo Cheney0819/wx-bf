@@ -63,6 +63,19 @@ public sealed class RecoveryCycle : IRecoveryCycle
         {
             processRuntime = _identityProvider.ResolveActiveProcess();
         }
+        catch (AmbiguousWeChatProcessException exception)
+        {
+            var ambiguous = new WeChatDataRootResolution(
+                DataRoot: null,
+                resolution.CandidateCount,
+                DatabaseCount: 0,
+                exception.Code);
+            await _preflightTelemetry.PublishDataRootResultAsync(
+                ambiguous,
+                wechatLoggedIn: true,
+                cancellationToken);
+            return RecoveryAction.Wait(exception.Code);
+        }
         catch (Exception exception) when (exception is
             InvalidOperationException or DirectoryNotFoundException)
         {

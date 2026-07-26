@@ -69,7 +69,12 @@ public sealed class PersistedKeyDecryptorTests : IDisposable
     {
         var fixture = await CreateFixtureAsync();
         var goodPath = CopyEncryptedFixture("message_0.db");
-        var badPath = Path.Combine(_root, "bad.db");
+        var badPath = Path.Combine(
+            _root,
+            "db_storage",
+            "message",
+            "message_1.db");
+        Directory.CreateDirectory(Path.GetDirectoryName(badPath)!);
         await File.WriteAllBytesAsync(badPath, new byte[32]);
         fixture.Vault.Store(Metadata(goodPath), CorrectKey());
 
@@ -89,6 +94,41 @@ public sealed class PersistedKeyDecryptorTests : IDisposable
         Assert.Equal("persisted_key_partial_failure", observation.FailureCode);
         Assert.Single(observation.UnresolvedRequiredDatabases);
         Assert.Equal(badPath, observation.UnresolvedRequiredDatabases[0].Path);
+    }
+
+    [Fact]
+    public async Task AuxiliaryFailureDoesNotRemainRestartEligible()
+    {
+        var fixture = await CreateFixtureAsync();
+        var requiredPath = CopyEncryptedFixture(
+            Path.Combine("db_storage", "message", "message_0.db"));
+        var auxiliaryPath = Path.Combine(
+            _root,
+            "db_storage",
+            "contact",
+            "contact.db");
+        Directory.CreateDirectory(Path.GetDirectoryName(auxiliaryPath)!);
+        await File.WriteAllBytesAsync(auxiliaryPath, new byte[32]);
+        fixture.Vault.Store(Metadata(requiredPath), CorrectKey());
+
+        var result = await fixture.Decryptor.TryDecryptAsync(
+            fixture.Epoch,
+            _root,
+            [
+                new DatabaseSource(
+                    auxiliaryPath,
+                    new FileInfo(auxiliaryPath).Length),
+                new DatabaseSource(
+                    requiredPath,
+                    new FileInfo(requiredPath).Length),
+            ],
+            Path.Combine(_root, "output"),
+            new Progress<RecoveryProgress>(),
+            default);
+
+        Assert.True(result.HasValidatedKey);
+        Assert.Single(result.OutputPaths);
+        Assert.Empty(result.UnresolvedRequiredDatabases);
     }
 
     [Fact]
@@ -215,8 +255,8 @@ public sealed class PersistedKeyDecryptorTests : IDisposable
 
     private string CopyEncryptedFixture(string name)
     {
-        Directory.CreateDirectory(_root);
         var path = Path.Combine(_root, name);
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         File.Copy(Path.Combine(AppContext.BaseDirectory, "sqlcipher4_raw_key.db"), path);
         return path;
     }

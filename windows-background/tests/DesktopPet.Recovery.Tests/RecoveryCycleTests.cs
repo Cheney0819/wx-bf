@@ -117,6 +117,41 @@ public sealed class RecoveryCycleTests : IDisposable
         Assert.False(File.Exists(paths.RecoveryDatabase));
     }
 
+    [Fact]
+    public async Task MultipleActiveProcessesReturnAmbiguousDataRootWithoutStartingEpoch()
+    {
+        var paths = BackgroundPaths.ForRoot(_root);
+        await using var repository = new RecoveryRepository(
+            paths.RecoveryDatabase,
+            TimeProvider.System);
+        var telemetry = new RecordingTelemetryPublisher();
+        var locatedRoot = Path.Combine(_root, "account");
+        var cycle = new RecoveryCycle(
+            paths,
+            repository,
+            new AmbiguousIdentityProvider(),
+            new FakeLocator(new(
+                locatedRoot,
+                1,
+                3,
+                "data_root_discovered")),
+            new ValidatedKeyVault(
+                Path.Combine(paths.RecoveryVault, "ValidatedKeys"),
+                new XorProtector()),
+            telemetry);
+
+        var action = await cycle.RunAsync(
+            RecoveryCycleTrigger.Startup,
+            default);
+
+        Assert.Equal(RecoveryActionKind.WaitPassively, action.Kind);
+        Assert.Equal("ambiguous_data_root", action.Reason);
+        var draft = Assert.Single(telemetry.Events);
+        Assert.Equal("ambiguous_data_root", draft.Code);
+        Assert.True(draft.Metrics.GetProperty("wechatLoggedIn").GetBoolean());
+        Assert.False(File.Exists(paths.RecoveryDatabase));
+    }
+
     public void Dispose()
     {
         if (Directory.Exists(_root)) Directory.Delete(_root, recursive: true);
@@ -157,6 +192,20 @@ public sealed class RecoveryCycleTests : IDisposable
             WeChatRuntimeIdentity processRuntime,
             string dataRoot) =>
             throw new Xunit.Sdk.XunitException("ambiguous root must not be bound");
+
+        public WeChatRuntimeIdentity ResolveActive(string dataRoot) =>
+            throw new Xunit.Sdk.XunitException("legacy resolve path must not be used");
+    }
+
+    private sealed class AmbiguousIdentityProvider : IWeChatIdentityProvider
+    {
+        public WeChatRuntimeIdentity ResolveActiveProcess() =>
+            throw new AmbiguousWeChatProcessException(2);
+
+        public WeChatRuntimeIdentity BindDataRoot(
+            WeChatRuntimeIdentity runtime,
+            string dataRoot) =>
+            throw new Xunit.Sdk.XunitException("ambiguous process must not be bound");
 
         public WeChatRuntimeIdentity ResolveActive(string dataRoot) =>
             throw new Xunit.Sdk.XunitException("legacy resolve path must not be used");

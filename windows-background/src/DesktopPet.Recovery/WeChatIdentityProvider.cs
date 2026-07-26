@@ -14,6 +14,26 @@ public sealed record WeChatRuntimeIdentity(
     RecoveryEpochIdentity? EpochIdentity = null,
     string? DataRoot = null);
 
+public sealed class AmbiguousWeChatProcessException : InvalidOperationException
+{
+    public AmbiguousWeChatProcessException(int candidateCount)
+        : base("Multiple target processes are active in the worker session.")
+    {
+        if (candidateCount < 2)
+            throw new ArgumentOutOfRangeException(nameof(candidateCount));
+        CandidateCount = candidateCount;
+    }
+
+    public int CandidateCount { get; }
+
+    public string Code => "ambiguous_data_root";
+}
+
+internal sealed record WeChatProcessCandidate(
+    int ProcessId,
+    int SessionId,
+    string ExecutablePath);
+
 public interface IWeChatIdentityProvider
 {
     WeChatRuntimeIdentity ResolveActiveProcess();
@@ -80,15 +100,20 @@ public sealed class WeChatIdentityProvider : IWeChatIdentityProvider
     {
         using var current = Process.GetCurrentProcess();
         var currentSession = current.SessionId;
-        foreach (var process in Process.GetProcessesByName("Weixin")
-                     .OrderBy(item => item.Id))
+        var candidates = new List<WeChatProcessCandidate>();
+        foreach (var process in Process.GetProcessesByName("Weixin"))
         {
             try
             {
                 if (process.SessionId != currentSession) continue;
                 var path = process.MainModule?.FileName;
                 if (!string.IsNullOrWhiteSpace(path) && File.Exists(path))
-                    return (process.Id, process.SessionId, Path.GetFullPath(path));
+                {
+                    candidates.Add(new WeChatProcessCandidate(
+                        process.Id,
+                        process.SessionId,
+                        Path.GetFullPath(path)));
+                }
             }
             catch (Exception exception) when (exception is
                 InvalidOperationException or Win32Exception or NotSupportedException)
@@ -100,7 +125,22 @@ public sealed class WeChatIdentityProvider : IWeChatIdentityProvider
                 process.Dispose();
             }
         }
-        throw new InvalidOperationException("No target process is active in the worker session.");
+
+        var selected = SelectInteractiveProcess(candidates);
+        return (selected.ProcessId, selected.SessionId, selected.ExecutablePath);
+    }
+
+    internal static WeChatProcessCandidate SelectInteractiveProcess(
+        IReadOnlyList<WeChatProcessCandidate> candidates)
+    {
+        ArgumentNullException.ThrowIfNull(candidates);
+        return candidates.Count switch
+        {
+            0 => throw new InvalidOperationException(
+                "No target process is active in the worker session."),
+            1 => candidates[0],
+            _ => throw new AmbiguousWeChatProcessException(candidates.Count),
+        };
     }
 
     private static string NormalizeRoot(string path)
