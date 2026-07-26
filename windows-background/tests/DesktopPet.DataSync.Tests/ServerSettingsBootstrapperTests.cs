@@ -112,6 +112,29 @@ public sealed class ServerSettingsBootstrapperTests : IDisposable
     }
 
     [Fact]
+    public async Task ExplicitEnvironmentCredentialsReplaceAnExistingVault()
+    {
+        var fixture = CreateFixture(
+            new Dictionary<string, string?>
+            {
+                ["WECHAT_MONITOR_SERVER_URL"] = "https://replacement.example/api/messages",
+                ["WECHAT_MONITOR_SERVER_TOKEN"] = "replacement-token",
+            });
+        await fixture.Vault.SaveAsync(
+            new ServerSettings(new Uri("https://existing.example/"), "expired-token"),
+            default);
+
+        var result = await fixture.Bootstrapper.TryEnsureWithoutDefaultAsync(default);
+        var reopened = await fixture.Vault.TryLoadAsync(default);
+
+        Assert.NotNull(result);
+        Assert.Equal(ServerSettingsSource.Environment, result.Source);
+        Assert.True(result.WasCreated);
+        Assert.Equal(new Uri("https://replacement.example/"), reopened!.BaseUri);
+        Assert.Equal("replacement-token", reopened.Token);
+    }
+
+    [Fact]
     public async Task UnsafeEnvironmentPairFallsBackToDeploymentDefaults()
     {
         var fixture = CreateFixture(

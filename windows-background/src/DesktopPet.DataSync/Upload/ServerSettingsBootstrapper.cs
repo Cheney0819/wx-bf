@@ -70,6 +70,23 @@ public sealed class ServerSettingsBootstrapper
         await _gate.WaitAsync(cancellationToken);
         try
         {
+            var environment = TryReadEnvironment();
+            if (environment is not null)
+            {
+                var existing = await TryLoadExistingAsync(cancellationToken);
+                if (existing is not null && SettingsEqual(existing, environment))
+                {
+                    return new ServerSettingsBootstrapResult(
+                        existing,
+                        ServerSettingsSource.ExistingVault,
+                        WasCreated: false);
+                }
+
+                return await PersistAsync(
+                    environment,
+                    ServerSettingsSource.Environment,
+                    cancellationToken);
+            }
             return await EnsureCoreAsync(null, cancellationToken);
         }
         finally
@@ -105,8 +122,15 @@ public sealed class ServerSettingsBootstrapper
         }
         selected ??= fallback;
         if (selected is null) return null;
+        return await PersistAsync(selected, source, cancellationToken);
+    }
 
-        await _vault.SaveAsync(selected, cancellationToken);
+    private async Task<ServerSettingsBootstrapResult> PersistAsync(
+        ServerSettings settings,
+        ServerSettingsSource source,
+        CancellationToken cancellationToken)
+    {
+        await _vault.SaveAsync(settings, cancellationToken);
         var reopened = await _vault.TryLoadAsync(cancellationToken) ??
             throw new CryptographicException(
                 "Protected server settings were not persisted.");
@@ -115,6 +139,10 @@ public sealed class ServerSettingsBootstrapper
             source,
             WasCreated: true);
     }
+
+    private static bool SettingsEqual(ServerSettings left, ServerSettings right) =>
+        left.BaseUri == right.BaseUri &&
+        string.Equals(left.Token, right.Token, StringComparison.Ordinal);
 
     private async Task<ServerSettings?> TryLoadExistingAsync(
         CancellationToken cancellationToken)
