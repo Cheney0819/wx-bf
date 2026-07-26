@@ -7,6 +7,14 @@ using DesktopPet.DataSync.Persistence;
 
 namespace DesktopPet.DataSync;
 
+public sealed class IncompleteHandoffException : Exception
+{
+    public IncompleteHandoffException()
+        : base("Recovery handoff is waiting for all required databases.")
+    {
+    }
+}
+
 public sealed class HandoffManifestImporter
 {
     private const long MaximumManifestBytes = 1024 * 1024;
@@ -68,6 +76,8 @@ public sealed class HandoffManifestImporter
                 fullManifestPath,
                 manifest,
                 cancellationToken);
+            if (!validated.RequiredDatabasesComplete)
+                throw new IncompleteHandoffException();
             var result = await _repository.ImportHandoffAsync(validated, cancellationToken);
             await _acceptancePublisher.PublishAsync(
                 new HandoffAcceptedMarker(
@@ -89,7 +99,7 @@ public sealed class HandoffManifestImporter
         DatabaseReadyManifest manifest,
         CancellationToken cancellationToken)
     {
-        if (manifest.SchemaVersion != 1)
+        if (manifest.SchemaVersion != 2)
             throw new InvalidDataException("Unsupported Recovery handoff schema.");
         ValidateSha256(manifest.ManifestId, "manifest ID");
         if (string.IsNullOrWhiteSpace(manifest.EpochId) || manifest.EpochId.Length > 256)
@@ -149,7 +159,8 @@ public sealed class HandoffManifestImporter
         }
 
         var expectedManifestId = ComputeSha256(
-            manifest.EpochId + "|" + string.Join(
+            $"{manifest.EpochId}|requiredDatabasesComplete={manifest.RequiredDatabasesComplete}|" +
+            string.Join(
                 "|",
                 validated.Select(item =>
                     $"{item.GenerationId}:{item.RelativePath}:{item.Sha256}")));
@@ -160,7 +171,8 @@ public sealed class HandoffManifestImporter
             manifest.ManifestId,
             manifest.EpochId,
             manifest.CreatedAtUtc,
-            Array.AsReadOnly(validated.ToArray()));
+            Array.AsReadOnly(validated.ToArray()),
+            manifest.RequiredDatabasesComplete);
     }
 
     private static void ValidateSha256(string? value, string label)

@@ -28,7 +28,8 @@ public sealed record RecoveryAction(
     RecoveryActionKind Kind,
     IReadOnlyList<string> OutputPaths,
     IReadOnlyList<RecoveredDatabase> Databases,
-    string? Reason)
+    string? Reason,
+    bool RequiredDatabasesComplete = true)
 {
     public static RecoveryAction CaptureCurrent() =>
         new(RecoveryActionKind.CaptureCurrent, [], [], null);
@@ -41,6 +42,12 @@ public sealed record RecoveryAction(
 
     public static RecoveryAction Publish(
         IReadOnlyList<string> outputPaths,
-        IReadOnlyList<RecoveredDatabase> databases) =>
-        new(RecoveryActionKind.PublishOutputs, outputPaths, databases, null);
+        IReadOnlyList<RecoveredDatabase> databases,
+        bool requiredDatabasesComplete = true) =>
+        new(
+            RecoveryActionKind.PublishOutputs,
+            outputPaths,
+            databases,
+            Reason: null,
+            requiredDatabasesComplete);
 }

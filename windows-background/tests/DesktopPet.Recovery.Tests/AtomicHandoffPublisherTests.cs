@@ -47,6 +47,31 @@ public sealed class AtomicHandoffPublisherTests : IDisposable
     }
 
     [Fact]
+    public async Task CompletenessIsAuthenticatedByDistinctManifestIdentity()
+    {
+        var source = await WriteSourceAsync("one.sqlite", "database-one"u8.ToArray());
+        var recovered = Recovered('a', "message/message_0.db", source);
+        var publisher = CreatePublisher();
+
+        var partial = await publisher.PublishAsync(
+            "epoch-1",
+            [recovered],
+            requiredDatabasesComplete: false,
+            default);
+        var complete = await publisher.PublishAsync(
+            "epoch-1",
+            [recovered],
+            requiredDatabasesComplete: true,
+            default);
+
+        Assert.Equal(2, partial.SchemaVersion);
+        Assert.False(partial.RequiredDatabasesComplete);
+        Assert.True(complete.RequiredDatabasesComplete);
+        Assert.NotEqual(partial.ManifestId, complete.ManifestId);
+        Assert.Equal(2, Directory.EnumerateFiles(ReadyRoot(), "*.json").Count());
+    }
+
+    [Fact]
     public async Task HandoffGenerationIdIsDerivedFromEpochPathAndContent()
     {
         var source = await WriteSourceAsync("one.sqlite", "database-one"u8.ToArray());

@@ -1,4 +1,5 @@
 using System.Security.Cryptography;
+using System.Text.Json;
 using DesktopPet.Background.Contracts;
 using DesktopPet.Recovery.Persistence;
 using Wx411.Core;
@@ -206,15 +207,21 @@ public sealed class RecoveryCoordinatorTests : IDisposable
                 OutputPaths: [source],
                 FailureCode: "partial_success",
                 RecoveredDatabases: [recovered],
-                CandidateDatabaseCount: 18));
+                CandidateDatabaseCount: 18,
+                RequiredDatabasesComplete: false));
 
         var action = await fixture.Coordinator.RunEpochAsync(fixture.Epoch, default);
 
         Assert.Equal(RecoveryActionKind.PublishOutputs, action.Kind);
         Assert.Single(action.Databases);
-        Assert.Single(Directory.EnumerateFiles(
+        var manifestPath = Assert.Single(Directory.EnumerateFiles(
             Path.Combine(_root, "handoff", "ready"),
             "*.json"));
+        using var manifest = JsonDocument.Parse(await File.ReadAllTextAsync(manifestPath));
+        Assert.Equal(2, manifest.RootElement.GetProperty("schemaVersion").GetInt32());
+        Assert.False(manifest.RootElement
+            .GetProperty("requiredDatabasesComplete")
+            .GetBoolean());
         Assert.Contains(
             fixture.Telemetry.Events,
             draft => draft.EventName == "client_wechat_decrypt_export_result" &&

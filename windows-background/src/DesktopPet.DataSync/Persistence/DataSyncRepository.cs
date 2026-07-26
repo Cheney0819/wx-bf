@@ -301,6 +301,8 @@ public sealed class DataSyncRepository : IDataSyncRepository
         ArgumentNullException.ThrowIfNull(manifest);
         ValidateIdentifier(manifest.ManifestId, nameof(manifest));
         ValidateIdentifier(manifest.EpochId, nameof(manifest));
+        if (!manifest.RequiredDatabasesComplete)
+            throw new InvalidDataException("An incomplete handoff cannot enqueue parser work.");
         if (manifest.Databases.Count == 0)
             throw new ArgumentException("A handoff must contain at least one database.", nameof(manifest));
 

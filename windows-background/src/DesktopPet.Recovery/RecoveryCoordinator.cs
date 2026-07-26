@@ -74,7 +74,10 @@ public sealed class RecoveryCoordinator
                             reuse,
                             cancellationToken)
                         : reuse.OutputPaths.Count > 0
-                            ? RecoveryAction.Publish(reuse.OutputPaths, reuse.Databases)
+                            ? RecoveryAction.Publish(
+                                reuse.OutputPaths,
+                                reuse.Databases,
+                                requiredDatabasesComplete: false)
                             : RecoveryAction.Wait("required_databases_unresolved");
                     if (reuseAction.Kind == RecoveryActionKind.PublishOutputs)
                     {
@@ -84,6 +87,7 @@ public sealed class RecoveryCoordinator
                         var publication = await _handoffPublisher.PublishWithStatusAsync(
                             epoch.Id,
                             reuseAction.Databases,
+                            reuseAction.RequiredDatabasesComplete,
                             cancellationToken);
                         if (publication.WasPublished)
                         {
@@ -91,7 +95,11 @@ public sealed class RecoveryCoordinator
                                 "recovery_handoff_published",
                                 "info",
                                 "handoff_ready",
-                                new { databaseCount = reuseAction.Databases.Count },
+                                new
+                                {
+                                    databaseCount = reuseAction.Databases.Count,
+                                    reuseAction.RequiredDatabasesComplete,
+                                },
                                 cancellationToken);
                         }
                     }
@@ -258,6 +266,7 @@ public sealed class RecoveryCoordinator
                         var publication = await _handoffPublisher.PublishWithStatusAsync(
                             epoch.Id,
                             action.Databases,
+                            action.RequiredDatabasesComplete,
                             cancellationToken);
                         if (publication.WasPublished)
                         {
@@ -265,7 +274,11 @@ public sealed class RecoveryCoordinator
                                 "recovery_handoff_published",
                                 "info",
                                 "handoff_ready",
-                                new { databaseCount = action.Databases.Count },
+                                new
+                                {
+                                    databaseCount = action.Databases.Count,
+                                    action.RequiredDatabasesComplete,
+                                },
                                 cancellationToken);
                         }
                         return action;

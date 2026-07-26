@@ -45,11 +45,14 @@ public sealed class RecoveryStateMachine
         // while the remaining databases continue through later reconciliation.
         if (observation.OutputPaths.Count > 0)
         {
-            if (observation.HasValidatedKey)
+            if (observation.RequiredDatabasesComplete && observation.HasValidatedKey)
                 await _repository.MarkKeyAvailableAsync(epochId, cancellationToken);
-            else if (observation.HasPendingCapture)
+            else if (observation.RequiredDatabasesComplete && observation.HasPendingCapture)
                 await _repository.MarkPendingAvailableAsync(epochId, cancellationToken);
-            return RecoveryAction.Publish(observation.OutputPaths, observation.Databases);
+            return RecoveryAction.Publish(
+                observation.OutputPaths,
+                observation.Databases,
+                observation.RequiredDatabasesComplete);
         }
 
         if (observation.HasValidatedKey)

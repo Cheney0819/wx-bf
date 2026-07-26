@@ -44,6 +44,44 @@ public sealed class Rc9CaptureAdapterTests : IDisposable
     }
 
     [Fact]
+    public async Task PartialCapturePreservesUnmatchedAndFailedDatabasePaths()
+    {
+        var encrypted = await WriteAsync("data/message/message_0.db", "encrypted"u8.ToArray());
+        var requiredFailed = await WriteAsync("data/session/session.db", "required-failed"u8.ToArray());
+        var unmatched = await WriteAsync("data/contact/contact.db", "unmatched"u8.ToArray());
+        var failed = await WriteAsync("data/favorite/favorite.db", "failed"u8.ToArray());
+        var plaintext = await WriteAsync("output/message_0.sqlite", "plaintext"u8.ToArray());
+        var sources = new[]
+        {
+            new DatabaseSource(encrypted, new FileInfo(encrypted).Length),
+            new DatabaseSource(requiredFailed, new FileInfo(requiredFailed).Length),
+            new DatabaseSource(unmatched, new FileInfo(unmatched).Length),
+            new DatabaseSource(failed, new FileInfo(failed).Length),
+        };
+        var result = new CaptureRecoveryResult(
+            [plaintext],
+            [new DatabaseCaptureMatch(
+                encrypted,
+                new CipherProfileMatch(SqlCipher4.Profile, [1]),
+                "raw",
+                "sqlite3_key_equiv")],
+            [unmatched],
+            [failed, requiredFailed],
+            []);
+        var adapter = CreateAdapter(
+            sources,
+            () => [],
+            (_, _, _, _, _, _) => Task.FromResult(result));
+
+        var observation = await adapter.CaptureAsync(Epoch(), default);
+
+        Assert.Equal([unmatched], observation.UnmatchedDatabasePaths);
+        Assert.Equal([failed, requiredFailed], observation.FailedDatabasePaths);
+        Assert.False(observation.RequiredDatabasesComplete);
+        Assert.Single(observation.Databases);
+    }
+
+    [Fact]
     public async Task BoundRuntimeTargetsExactPidThenUsesConstrainedRestartScan()
     {
         var encrypted = await WriteAsync("data/message/message_0.db", "encrypted"u8.ToArray());

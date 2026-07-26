@@ -177,7 +177,12 @@ public sealed class Rc9CaptureAdapter : IRecoveryCaptureAdapter
                         result.LoadedPendingCaptureTicketIds.Count > 0,
                     OutputPaths: [],
                     FailureCode: "capture_result_mapping_failed",
-                    CandidateDatabaseCount: databases.Count);
+                    CandidateDatabaseCount: databases.Count,
+                    UnmatchedDatabasePaths: result.UnmatchedDatabasePaths,
+                    FailedDatabasePaths: result.FailedDatabasePaths,
+                    RequiredDatabasesComplete: RequiredDatabasesComplete(
+                        databases,
+                        result));
             }
 
             return new CaptureObservation(
@@ -187,7 +192,10 @@ public sealed class Rc9CaptureAdapter : IRecoveryCaptureAdapter
                 result.OutputPaths,
                 FailureCode: null,
                 recovered,
-                databases.Count);
+                databases.Count,
+                result.UnmatchedDatabasePaths,
+                result.FailedDatabasePaths,
+                RequiredDatabasesComplete(databases, result));
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -200,6 +208,19 @@ public sealed class Rc9CaptureAdapter : IRecoveryCaptureAdapter
                 HasPendingAfter(context, pendingBefore, scopeMatches),
                 databases.Count);
         }
+    }
+
+    private static bool RequiredDatabasesComplete(
+        IReadOnlyList<DatabaseSource> databases,
+        CaptureRecoveryResult result)
+    {
+        var requiredPaths = databases
+            .Where(database => database.IsRequired)
+            .Select(database => Path.GetFullPath(database.Path))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        return result.UnmatchedDatabasePaths
+                .Concat(result.FailedDatabasePaths)
+                .All(path => !requiredPaths.Contains(Path.GetFullPath(path)));
     }
 
     private void Initialize(

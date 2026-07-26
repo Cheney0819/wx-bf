@@ -89,6 +89,13 @@ public sealed class DataSyncRuntime : IDataSyncRuntime
             {
                 throw;
             }
+            catch (IncompleteHandoffException)
+            {
+                await RecordEventAsync(
+                    "datasync_handoff_deferred",
+                    "required_databases_incomplete",
+                    cancellationToken);
+            }
             catch (Exception exception) when (exception is
                 InvalidDataException or IOException or UnauthorizedAccessException or
                 System.Security.Cryptography.CryptographicException or JsonException)

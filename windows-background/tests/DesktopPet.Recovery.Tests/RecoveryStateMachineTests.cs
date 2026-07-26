@@ -89,6 +89,30 @@ public sealed class RecoveryStateMachineTests : IDisposable
     }
 
     [Fact]
+    public async Task IncompleteReadableOutputDoesNotSuppressLaterRestart()
+    {
+        await using var fixture = await CreateFixtureAsync(restarts: 0);
+
+        var action = await fixture.Machine.ObserveAsync(
+            fixture.Epoch.Id,
+            new CaptureObservation(
+                HasValidatedKey: true,
+                HasPendingCapture: false,
+                OutputPaths: ["/generation/message_0.db"],
+                FailureCode: "partial_success",
+                RequiredDatabasesComplete: false),
+            default);
+
+        Assert.Equal(RecoveryActionKind.PublishOutputs, action.Kind);
+        Assert.False((await fixture.Repository.GetEpochAsync(
+            fixture.Epoch.Id,
+            default))!.ActiveRestartSuppressed);
+        Assert.True(await fixture.Repository.TryConsumeRestartAsync(
+            fixture.Epoch.Id,
+            default));
+    }
+
+    [Fact]
     public async Task BeginAllowsPassiveCaptureWithoutRestoringRestartBudget()
     {
         await using var fixture = await CreateFixtureAsync(restarts: 0);

@@ -43,11 +43,37 @@ public sealed class AtomicHandoffPublisher
         string epochId,
         IReadOnlyList<RecoveredDatabase> databases,
         CancellationToken cancellationToken) =>
-        (await PublishWithStatusAsync(epochId, databases, cancellationToken)).Manifest;
+        (await PublishWithStatusAsync(
+            epochId,
+            databases,
+            requiredDatabasesComplete: true,
+            cancellationToken)).Manifest;
+
+    public async Task<DatabaseReadyManifest> PublishAsync(
+        string epochId,
+        IReadOnlyList<RecoveredDatabase> databases,
+        bool requiredDatabasesComplete,
+        CancellationToken cancellationToken) =>
+        (await PublishWithStatusAsync(
+            epochId,
+            databases,
+            requiredDatabasesComplete,
+            cancellationToken)).Manifest;
 
     public async Task<HandoffPublicationResult> PublishWithStatusAsync(
         string epochId,
         IReadOnlyList<RecoveredDatabase> databases,
+        CancellationToken cancellationToken) =>
+        await PublishWithStatusAsync(
+            epochId,
+            databases,
+            requiredDatabasesComplete: true,
+            cancellationToken);
+
+    public async Task<HandoffPublicationResult> PublishWithStatusAsync(
+        string epochId,
+        IReadOnlyList<RecoveredDatabase> databases,
+        bool requiredDatabasesComplete,
         CancellationToken cancellationToken)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(epochId);
@@ -91,7 +117,10 @@ public sealed class AtomicHandoffPublisher
                 actualSourceHash));
         }
 
-        var manifestId = ManifestId(epochId, items);
+        var manifestId = ManifestId(
+            epochId,
+            items,
+            requiredDatabasesComplete);
         var manifestPath = Path.Combine(_readyRoot, manifestId + ".json");
         if (File.Exists(manifestPath))
         {
@@ -101,8 +130,13 @@ public sealed class AtomicHandoffPublisher
                 var existing = JsonSerializer.Deserialize<DatabaseReadyManifest>(
                     existingBytes,
                     JsonOptions) ?? throw new InvalidDataException("Existing handoff manifest is invalid.");
-                if (existing.SchemaVersion != 1 || existing.ManifestId != manifestId || existing.EpochId != epochId)
+                if (existing.SchemaVersion != 2 ||
+                    existing.ManifestId != manifestId ||
+                    existing.EpochId != epochId ||
+                    existing.RequiredDatabasesComplete != requiredDatabasesComplete)
+                {
                     throw new InvalidDataException("Existing handoff manifest identity is invalid.");
+                }
                 return new HandoffPublicationResult(existing, WasPublished: false);
             }
             finally
@@ -112,11 +146,12 @@ public sealed class AtomicHandoffPublisher
         }
 
         var manifest = new DatabaseReadyManifest(
-            SchemaVersion: 1,
+            SchemaVersion: 2,
             manifestId,
             epochId,
             _timeProvider.GetUtcNow(),
-            Array.AsReadOnly(items.ToArray()));
+            Array.AsReadOnly(items.ToArray()),
+            requiredDatabasesComplete);
         var json = JsonSerializer.SerializeToUtf8Bytes(manifest, JsonOptions);
         try
         {
@@ -180,10 +215,11 @@ public sealed class AtomicHandoffPublisher
 
     private static string ManifestId(
         string epochId,
-        IReadOnlyList<DatabaseReadyItem> items)
+        IReadOnlyList<DatabaseReadyItem> items,
+        bool requiredDatabasesComplete)
     {
         var material = Encoding.UTF8.GetBytes(
-            epochId + "|" + string.Join(
+            $"{epochId}|requiredDatabasesComplete={requiredDatabasesComplete}|" + string.Join(
                 "|",
                 items.Select(item =>
                     $"{item.GenerationId}:{item.RelativePath}:{item.Sha256}")));

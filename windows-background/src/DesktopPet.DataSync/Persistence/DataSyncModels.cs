@@ -51,7 +51,8 @@ public sealed record ValidatedHandoffManifest(
     string ManifestId,
     string EpochId,
     DateTimeOffset CreatedAtUtc,
-    IReadOnlyList<ValidatedHandoffDatabase> Databases);
+    IReadOnlyList<ValidatedHandoffDatabase> Databases,
+    bool RequiredDatabasesComplete);
 
 public sealed record HandoffImportResult(
     string ManifestId,

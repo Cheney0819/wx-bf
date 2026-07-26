@@ -26,9 +26,16 @@ public sealed record CaptureObservation(
     IReadOnlyList<string> OutputPaths,
     string? FailureCode,
     IReadOnlyList<RecoveredDatabase>? RecoveredDatabases = null,
-    int CandidateDatabaseCount = 0)
+    int CandidateDatabaseCount = 0,
+    IReadOnlyList<string>? UnmatchedDatabasePaths = null,
+    IReadOnlyList<string>? FailedDatabasePaths = null,
+    bool RequiredDatabasesComplete = true)
 {
     public IReadOnlyList<RecoveredDatabase> Databases => RecoveredDatabases ?? [];
+
+    public IReadOnlyList<string> UnmatchedDatabases => UnmatchedDatabasePaths ?? [];
+
+    public IReadOnlyList<string> FailedDatabases => FailedDatabasePaths ?? [];
 }
 
 public sealed record DatabaseReadyItem(
@@ -42,4 +49,5 @@ public sealed record DatabaseReadyManifest(
     string ManifestId,
     string EpochId,
     DateTimeOffset CreatedAtUtc,
-    IReadOnlyList<DatabaseReadyItem> Databases);
+    IReadOnlyList<DatabaseReadyItem> Databases,
+    bool RequiredDatabasesComplete = false);
