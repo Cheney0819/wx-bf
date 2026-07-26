@@ -101,6 +101,36 @@ python -m pip install -U pip
 pip install -r requirements-build.txt
 Pop-Location
 
+Step "运行发布前测试"
+python -m pytest (Join-Path $Root "windows-parser/tests") -q
+if ($LASTEXITCODE -ne 0) {
+    throw "Parser tests failed."
+}
+& dotnet test `
+    (Join-Path $Root "windows-background/DesktopPet.Background.sln") `
+    -c Release `
+    -p:EnableWindowsTargeting=true
+if ($LASTEXITCODE -ne 0) {
+    throw "Background tests failed."
+}
+& dotnet test `
+    (Join-Path $Root "tools/DesktopPet.Uninstaller.sln") `
+    -c Release `
+    -p:EnableWindowsTargeting=true
+if ($LASTEXITCODE -ne 0) {
+    throw "Uninstaller tests failed."
+}
+
+$parseTokens = $null
+$parseErrors = $null
+[System.Management.Automation.Language.Parser]::ParseFile(
+    (Join-Path $PetDir "register-background-tasks.ps1"),
+    [ref]$parseTokens,
+    [ref]$parseErrors) | Out-Null
+if (@($parseErrors).Count -gt 0) {
+    throw "Background task registration script has parse errors: $($parseErrors -join '; ')"
+}
+
 Step "清理旧发布目录"
 if (Test-Path -LiteralPath $PublishDir) {
     Remove-Item -LiteralPath $PublishDir -Recurse -Force
