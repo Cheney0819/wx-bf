@@ -41,7 +41,6 @@ public static class Program
 
         using (instance)
         {
-            var knownRoots = KnownDataRoots();
             var dataRootLocator = new WeChatDataRootLocator();
             var protector = new DpapiSecretProtector();
             var snapshot = new CriticalRecoverySnapshotStore(
@@ -55,16 +54,20 @@ public static class Program
             var validatedKeyVault = new ValidatedKeyVault(
                 Path.Combine(paths.RecoveryVault, "ValidatedKeys"),
                 protector);
+            var telemetryPublisher = new AtomicTelemetryPublisher(
+                Path.Combine(paths.HandoffRoot, "Telemetry", "ready"),
+                TimeProvider.System);
             var cycle = new RecoveryCycle(
                 paths,
                 repository,
                 new WeChatIdentityProvider(),
                 dataRootLocator,
-                validatedKeyVault);
+                validatedKeyVault,
+                telemetryPublisher);
             var worker = new RecoveryWorker(
                 startup,
                 cycle,
-                [new ProcessStartWatcher(), new KnownRootDatabaseWatcher(knownRoots)],
+                [new ProcessStartWatcher(), new SelectedRootDatabaseWatcher(dataRootLocator)],
                 RecoveryWorkerOptions.Default,
                 TimeProvider.System);
             var runMode = commandMode == WorkerCommandMode.Once
@@ -78,17 +81,5 @@ public static class Program
             await host.RunAsync();
             return 0;
         }
-    }
-
-    private static IReadOnlyList<string> KnownDataRoots()
-    {
-        var roots = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        if (!string.IsNullOrWhiteSpace(profile))
-            roots.Add(Path.Combine(profile, "Documents", "xwechat_files"));
-        var documents = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
-        if (!string.IsNullOrWhiteSpace(documents))
-            roots.Add(Path.Combine(documents, "xwechat_files"));
-        return Array.AsReadOnly(roots.OrderBy(path => path, StringComparer.OrdinalIgnoreCase).ToArray());
     }
 }

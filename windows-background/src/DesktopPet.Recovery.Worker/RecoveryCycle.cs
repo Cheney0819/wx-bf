@@ -1,4 +1,5 @@
 using System.Runtime.Versioning;
+using DesktopPet.Background.Contracts;
 using DesktopPet.Background.Infrastructure;
 using DesktopPet.Recovery.Persistence;
 using DesktopPet.Recovery.Security;
@@ -14,6 +15,8 @@ public sealed class RecoveryCycle : IRecoveryCycle
     private readonly WeChatIdentityProvider _identityProvider;
     private readonly IWeChatDataRootLocator _dataRootLocator;
     private readonly ValidatedKeyVault _validatedKeyVault;
+    private readonly IOperationalTelemetryPublisher _telemetryPublisher;
+    private readonly RecoveryPreflightTelemetry _preflightTelemetry;
     private readonly IProgress<RecoveryProgress> _progress;
 
     public RecoveryCycle(
@@ -22,6 +25,7 @@ public sealed class RecoveryCycle : IRecoveryCycle
         WeChatIdentityProvider identityProvider,
         IWeChatDataRootLocator dataRootLocator,
         ValidatedKeyVault validatedKeyVault,
+        IOperationalTelemetryPublisher telemetryPublisher,
         IProgress<RecoveryProgress>? progress = null)
     {
         ArgumentNullException.ThrowIfNull(paths);
@@ -29,11 +33,14 @@ public sealed class RecoveryCycle : IRecoveryCycle
         ArgumentNullException.ThrowIfNull(identityProvider);
         ArgumentNullException.ThrowIfNull(dataRootLocator);
         ArgumentNullException.ThrowIfNull(validatedKeyVault);
+        ArgumentNullException.ThrowIfNull(telemetryPublisher);
         _paths = paths;
         _repository = repository;
         _identityProvider = identityProvider;
         _dataRootLocator = dataRootLocator;
         _validatedKeyVault = validatedKeyVault;
+        _telemetryPublisher = telemetryPublisher;
+        _preflightTelemetry = new RecoveryPreflightTelemetry(telemetryPublisher);
         _progress = progress ?? NullProgress<RecoveryProgress>.Instance;
     }
 
@@ -41,19 +48,34 @@ public sealed class RecoveryCycle : IRecoveryCycle
         RecoveryCycleTrigger trigger,
         CancellationToken cancellationToken)
     {
+        var resolution = await _dataRootLocator.LocateAsync(cancellationToken);
+        if (!resolution.Found)
+        {
+            await _preflightTelemetry.PublishDataRootResultAsync(
+                resolution,
+                wechatLoggedIn: false,
+                cancellationToken);
+            return RecoveryAction.Wait(resolution.Code);
+        }
+
         WeChatRuntimeIdentity runtime;
         try
         {
-            var resolution = await _dataRootLocator.LocateAsync(cancellationToken);
-            if (!resolution.Found)
-                return RecoveryAction.Wait("target_not_running_or_data_root_unavailable");
             runtime = _identityProvider.ResolveActive(resolution.DataRoot!);
         }
         catch (Exception exception) when (exception is
             InvalidOperationException or DirectoryNotFoundException)
         {
-            return RecoveryAction.Wait("target_not_running_or_data_root_unavailable");
+            await _preflightTelemetry.PublishDataRootResultAsync(
+                resolution,
+                wechatLoggedIn: false,
+                cancellationToken);
+            return RecoveryAction.Wait("target_not_running");
         }
+        await _preflightTelemetry.PublishDataRootResultAsync(
+            resolution,
+            wechatLoggedIn: true,
+            cancellationToken);
 
         var epoch = await _repository.BeginOrLoadEpochAsync(
             runtime.EpochIdentity,
@@ -77,15 +99,12 @@ public sealed class RecoveryCycle : IRecoveryCycle
             _paths.HandoffReady,
             stagingRoot,
             TimeProvider.System);
-        var telemetryPublisher = new AtomicTelemetryPublisher(
-            Path.Combine(_paths.HandoffRoot, "Telemetry", "ready"),
-            TimeProvider.System);
         var coordinator = new RecoveryCoordinator(
             _repository,
             captureAdapter,
             new WindowsAppProcessController(),
             publisher,
-            telemetryPublisher,
+            _telemetryPublisher,
             persistedKeyAdapter,
             telemetryPublishTimeout: TimeSpan.FromSeconds(2));
         var allowLiveCapture = trigger is
