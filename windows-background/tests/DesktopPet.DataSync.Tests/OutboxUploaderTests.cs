@@ -169,16 +169,22 @@ public sealed class OutboxUploaderTests : IDisposable
     [Fact]
     public async Task CancellationPreservesCommittedLeaseForRestartRecovery()
     {
+        var requestStarted = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
         var handler = new QueueHandler(async (_, cancellationToken) =>
         {
+            requestStarted.SetResult();
             await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
             return new HttpResponseMessage(HttpStatusCode.OK);
         });
         var fixture = await CreateFixtureAsync(handler);
-        using var cancellation = new CancellationTokenSource(TimeSpan.FromMilliseconds(100));
+        using var cancellation = new CancellationTokenSource();
 
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
-            fixture.Uploader.UploadOneAsync("worker-a", cancellation.Token));
+        var upload = fixture.Uploader.UploadOneAsync("worker-a", cancellation.Token);
+        await requestStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        cancellation.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => upload);
         var row = await fixture.Repository.GetOutboxAsync("outbox-1", default);
 
         Assert.Equal(OutboxState.Leased, row!.State);
