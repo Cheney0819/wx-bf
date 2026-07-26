@@ -132,14 +132,16 @@ public sealed class RecoveryCoordinator
                         var observationCode = StableCodeOrDefault(
                             observation.FailureCode,
                             "capture_failed");
-                        if (observation.HasValidatedKey || observation.HasPendingCapture)
+                        if (observation.HasValidatedKey || observation.HasPendingCapture || observation.OutputPaths.Count > 0)
                         {
                             await PublishTelemetryBestEffortAsync(
                                 "recovery_capture_succeeded",
                                 "info",
                                 observation.HasValidatedKey
                                     ? "key_validated"
-                                    : "pending_capture_available",
+                                    : observation.HasPendingCapture
+                                        ? "pending_capture_available"
+                                        : "partial_outputs_available",
                                 new
                                 {
                                     databaseCount = observation.Databases.Count,

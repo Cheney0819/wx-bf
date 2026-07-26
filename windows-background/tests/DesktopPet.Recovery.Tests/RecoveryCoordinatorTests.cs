@@ -136,6 +136,38 @@ public sealed class RecoveryCoordinatorTests : IDisposable
     }
 
     [Fact]
+    public async Task ReadablePartialOutputsPublishImmediatelyWhileRemainingDatabasesStayPending()
+    {
+        var source = await WriteStagingAsync("partial.sqlite", "partial"u8.ToArray());
+        var recovered = new RecoveredDatabase(
+            new string('d', 64),
+            "message/message_partial.db",
+            source,
+            await Sha256Async(source));
+        await using var fixture = await CreateFixtureAsync(
+            new CaptureObservation(
+                HasValidatedKey: false,
+                HasPendingCapture: false,
+                OutputPaths: [source],
+                FailureCode: "partial_success",
+                RecoveredDatabases: [recovered],
+                CandidateDatabaseCount: 18));
+
+        var action = await fixture.Coordinator.RunEpochAsync(fixture.Epoch, default);
+
+        Assert.Equal(RecoveryActionKind.PublishOutputs, action.Kind);
+        Assert.Single(action.Databases);
+        Assert.Single(Directory.EnumerateFiles(
+            Path.Combine(_root, "handoff", "ready"),
+            "*.json"));
+        Assert.Contains(
+            fixture.Telemetry.Events,
+            draft => draft.EventName == "client_wechat_decrypt_export_result" &&
+                      draft.Code == "partial_success");
+        Assert.Equal(0, fixture.Process.RestartCount);
+    }
+
+    [Fact]
     public async Task OversizedFailureCodeFallsBackBeforeTelemetryPublication()
     {
         var oversized = new string('a', 33);
