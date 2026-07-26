@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.IO;
 using DesktopPet.Background.Launcher;
 
 namespace DesktopPet.Wpf;
