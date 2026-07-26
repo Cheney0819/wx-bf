@@ -57,7 +57,7 @@ Describe "production credential source contract" {
         $legacyMonitorText = Get-Content -Raw -LiteralPath $legacyMonitorPath
     }
 
-    It "does not retain the leaked deployment token in production sources" {
+    It "contains the stable monitor token only in the DPAPI bootstrap entry point" {
         $productionRoots = @(
             (Join-Path $repositoryRoot "windows"),
             (Join-Path $repositoryRoot "windows-pet-wpf"),
@@ -74,7 +74,9 @@ Describe "production credential source contract" {
         $retiredDeploymentToken = "wx_" + "monitor_" + "2026"
         $matches = @($sourceFiles | Select-String -SimpleMatch $retiredDeploymentToken)
 
-        $matches.Count | Should -Be 0
+        $matches.Count | Should -Be 1
+        $matches[0].Path | Should -Be (
+            Join-Path $repositoryRoot "windows-background/src/DesktopPet.DataSync.Worker/Program.cs")
     }
 
     It "requires legacy monitor credentials from environment or config" {

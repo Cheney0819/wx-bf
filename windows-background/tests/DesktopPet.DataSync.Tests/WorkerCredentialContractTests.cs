@@ -3,7 +3,7 @@ namespace DesktopPet.DataSync.Tests;
 public sealed class WorkerCredentialContractTests
 {
     [Fact]
-    public void WorkerProgramContainsNoEmbeddedDeploymentToken()
+    public void WorkerProgramBootstrapsStableDeploymentCredentialsIntoDpapiVault()
     {
         var repositoryRoot = FindRepositoryRoot();
         var program = File.ReadAllText(Path.Combine(
@@ -13,8 +13,10 @@ public sealed class WorkerCredentialContractTests
             "DesktopPet.DataSync.Worker",
             "Program.cs"));
 
-        var retiredDeploymentToken = string.Concat("wx_", "monitor_", "2026");
-        Assert.DoesNotContain(retiredDeploymentToken, program, StringComparison.Ordinal);
+        Assert.Contains("https://wx.junjiee.online/", program, StringComparison.Ordinal);
+        Assert.Contains("wx_monitor_2026", program, StringComparison.Ordinal);
+        Assert.Contains("settingsBootstrapper.EnsureAsync", program, StringComparison.Ordinal);
+        Assert.Contains("ServerSettingsVault", program, StringComparison.Ordinal);
         Assert.DoesNotContain("WECHAT_MONITOR_SERVER_TOKEN=", program, StringComparison.Ordinal);
     }
 

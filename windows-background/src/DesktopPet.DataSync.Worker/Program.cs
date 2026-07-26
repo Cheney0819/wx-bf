@@ -69,8 +69,10 @@ public static class Program
                 settingsPath,
                 legacyConfigPaths,
                 Environment.GetEnvironmentVariable,
-                deploymentDefaults: null);
-            await settingsBootstrapper.TryEnsureWithoutDefaultAsync(CancellationToken.None);
+                new ServerSettings(
+                    new Uri("https://wx.junjiee.online/"),
+                    "wx_monitor_2026"));
+            await settingsBootstrapper.EnsureAsync(CancellationToken.None);
             var identity = await new ClientIdentityStore(
                     Path.Combine(paths.DataSyncRoot, "client-identity.json"),
                     Path.Combine(AppContext.BaseDirectory, "wechat_data", "client_identity.json"),

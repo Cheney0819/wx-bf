@@ -89,7 +89,7 @@ public sealed class ServerSettingsBootstrapperTests : IDisposable
         Assert.Equal(ServerSettingsSource.DeploymentDefault, result.Source);
         Assert.True(result.WasCreated);
         Assert.Equal(new Uri("https://wx.junjiee.online/"), result.Settings.BaseUri);
-        Assert.Equal("deployment-token", result.Settings.Token);
+        Assert.Equal("wx_monitor_2026", result.Settings.Token);
     }
 
     [Fact]
@@ -191,7 +191,7 @@ public sealed class ServerSettingsBootstrapperTests : IDisposable
         var vault = new ServerSettingsVault(settingsPath, new XorProtector());
         var defaults = new ServerSettings(
             new Uri("https://wx.junjiee.online/"),
-            "deployment-token");
+            "wx_monitor_2026");
         var bootstrapper = new ServerSettingsBootstrapper(
             vault,
             settingsPath,
