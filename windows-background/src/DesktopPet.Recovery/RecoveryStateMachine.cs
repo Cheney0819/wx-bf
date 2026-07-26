@@ -35,6 +35,14 @@ public sealed class RecoveryStateMachine
 
         if (string.Equals(
                 observation.FailureCode,
+                "breakpoint_restore_failed",
+                StringComparison.Ordinal))
+        {
+            return RecoveryAction.Relaunch("breakpoint_restore_failed");
+        }
+
+        if (string.Equals(
+                observation.FailureCode,
                 "unsupported_module",
                 StringComparison.Ordinal))
         {

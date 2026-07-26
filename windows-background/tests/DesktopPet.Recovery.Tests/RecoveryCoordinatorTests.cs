@@ -192,6 +192,20 @@ public sealed class RecoveryCoordinatorTests : IDisposable
     }
 
     [Fact]
+    public async Task BreakpointRestoreFailureRelaunchesWithoutStartingAnotherCapture()
+    {
+        await using var fixture = await CreateFixtureAsync(
+            new CaptureObservation(false, false, [], "breakpoint_restore_failed"));
+
+        var action = await fixture.Coordinator.RunEpochAsync(fixture.Epoch, default);
+
+        Assert.Equal(RecoveryActionKind.WaitPassively, action.Kind);
+        Assert.Equal("breakpoint_restore_relaunch_completed", action.Reason);
+        Assert.Equal(1, fixture.Process.RestartCount);
+        Assert.Equal(1, fixture.Capture.CallCount);
+    }
+
+    [Fact]
     public async Task ReadablePartialOutputsPublishImmediatelyWhileRemainingDatabasesStayPending()
     {
         var source = await WriteStagingAsync("partial.sqlite", "partial"u8.ToArray());

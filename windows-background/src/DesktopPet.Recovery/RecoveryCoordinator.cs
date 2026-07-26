@@ -205,6 +205,37 @@ public sealed class RecoveryCoordinator
                         }
                         break;
 
+                    case RecoveryActionKind.RelaunchProcess:
+                        current = await RequireActiveEpochAsync(epoch.Id, cancellationToken);
+                        await PublishTelemetryBestEffortAsync(
+                            "recovery_restart_started",
+                            "warning",
+                            "breakpoint_restore_relaunch",
+                            new { restartCount = current.RestartCount },
+                            cancellationToken);
+                        try
+                        {
+                            await _processController.RestartAsync(cancellationToken);
+                        }
+                        catch (Exception) when (!cancellationToken.IsCancellationRequested)
+                        {
+                            await PublishTelemetryBestEffortAsync(
+                                "recovery_restart_failed",
+                                "error",
+                                "breakpoint_restore_relaunch_failed",
+                                new { restartCount = current.RestartCount },
+                                CancellationToken.None);
+                            throw;
+                        }
+                        await PublishTelemetryBestEffortAsync(
+                            "recovery_restart_completed",
+                            "info",
+                            "breakpoint_restore_relaunch_completed",
+                            new { restartCount = current.RestartCount },
+                            cancellationToken);
+                        return RecoveryAction.Wait(
+                            "breakpoint_restore_relaunch_completed");
+
                     case RecoveryActionKind.RestartAndCapture:
                         current = await RequireActiveEpochAsync(epoch.Id, cancellationToken);
                         await PublishTelemetryBestEffortAsync(

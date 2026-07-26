@@ -20,6 +20,7 @@ public enum RecoveryActionKind
 {
     CaptureCurrent,
     RestartAndCapture,
+    RelaunchProcess,
     WaitPassively,
     PublishOutputs,
 }
@@ -36,6 +37,9 @@ public sealed record RecoveryAction(
 
     public static RecoveryAction RestartAndCapture() =>
         new(RecoveryActionKind.RestartAndCapture, [], [], null);
+
+    public static RecoveryAction Relaunch(string reason) =>
+        new(RecoveryActionKind.RelaunchProcess, [], [], reason);
 
     public static RecoveryAction Wait(string? reason = null) =>
         new(RecoveryActionKind.WaitPassively, [], [], reason);
