@@ -19,6 +19,7 @@ MAXIMUM_CONTACTS = 5000
 MAXIMUM_FAVORITES = 1000
 MAXIMUM_NOTICES = 1000
 MAXIMUM_MEDIA_BYTES = 5 * 1024 * 1024
+MAXIMUM_CURSOR_CHARACTERS = 64 * 1024
 PARSER_SOFT_TIMEOUT_SECONDS = 120
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
@@ -48,6 +49,7 @@ class ParserJob:
     output_root: Path
     databases: tuple[ParserDatabaseInput, ...]
     maximum_messages: int
+    cursor: str | None = None
 
 
 class CancellationState:
@@ -104,6 +106,7 @@ def load_job(job_path: Path) -> ParserJob:
             "maximumMessages",
         },
         "job_members_invalid",
+        optional={"cursor"},
     )
     if document["schemaVersion"] != SCHEMA_VERSION:
         raise ParserContractError("job_schema_unsupported")
@@ -128,6 +131,9 @@ def load_job(job_path: Path) -> ParserJob:
         or not 1 <= maximum_messages <= MAXIMUM_MESSAGES
     ):
         raise ParserContractError("maximum_messages_invalid")
+    cursor = document.get("cursor")
+    if cursor is not None:
+        cursor = _bounded_cursor(cursor, "cursor_invalid")
     raw_databases = document["databases"]
     if not isinstance(raw_databases, list) or not 1 <= len(raw_databases) <= MAXIMUM_DATABASES:
         raise ParserContractError("database_count_invalid")
@@ -173,6 +179,7 @@ def load_job(job_path: Path) -> ParserJob:
         output_root,
         tuple(databases),
         maximum_messages,
+        cursor,
     )
 
 
@@ -220,13 +227,30 @@ def _reject_duplicate_members(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def _require_object_members(value: Any, expected: set[str], code: str) -> None:
-    if not isinstance(value, dict) or set(value) != expected:
+def _require_object_members(
+    value: Any,
+    expected: set[str],
+    code: str,
+    *,
+    optional: set[str] | None = None,
+) -> None:
+    optional = optional or set()
+    if (
+        not isinstance(value, dict)
+        or not expected.issubset(value)
+        or set(value) - expected - optional
+    ):
         raise ParserContractError(code)
 
 
 def _bounded_text(value: Any, code: str) -> str:
     if not isinstance(value, str) or not value.strip() or len(value) > 256:
+        raise ParserContractError(code)
+    return value
+
+
+def _bounded_cursor(value: Any, code: str) -> str:
+    if not isinstance(value, str) or not value.strip() or len(value) > MAXIMUM_CURSOR_CHARACTERS:
         raise ParserContractError(code)
     return value
 
@@ -279,7 +303,9 @@ def _validate_result_counts(document: dict[str, Any]) -> None:
         "favorites",
         "notices",
     }
-    _require_object_members(document, expected, "result_members_invalid")
+    _require_object_members(document, expected, "result_members_invalid", optional={"nextCursor"})
+    if "nextCursor" in document and document["nextCursor"] is not None:
+        _bounded_cursor(document["nextCursor"], "next_cursor_invalid")
     limits = {
         "messages": MAXIMUM_MESSAGES,
         "contacts": MAXIMUM_CONTACTS,

@@ -122,22 +122,23 @@ public sealed class IncrementalOutboxWriter
             }
         }
 
-        await _observer.BeforeParseCompletionAsync(cancellationToken);
-        await using (var complete = connection.CreateCommand())
+        if (result.NextCursor is null)
         {
+            await _observer.BeforeParseCompletionAsync(cancellationToken);
+            await using var complete = connection.CreateCommand();
             complete.Transaction = transaction;
             complete.CommandText = """
-                UPDATE parse_job
-                SET state = 'completed',
-                    lease_owner = NULL,
-                    lease_until_utc = NULL,
-                    failure_code = NULL,
-                    updated_at_utc = $now
-                WHERE id = $id
-                  AND source_set_id = $source_set_id
-                  AND state = 'leased'
-                  AND lease_owner = $lease_owner;
-                """;
+                    UPDATE parse_job
+                    SET state = 'completed',
+                        lease_owner = NULL,
+                        lease_until_utc = NULL,
+                        failure_code = NULL,
+                        updated_at_utc = $now
+                    WHERE id = $id
+                      AND source_set_id = $source_set_id
+                      AND state = 'leased'
+                      AND lease_owner = $lease_owner;
+                    """;
             complete.Parameters.AddWithValue("$now", _timeProvider.GetUtcNow().ToString("O"));
             complete.Parameters.AddWithValue("$id", job.Id);
             complete.Parameters.AddWithValue("$source_set_id", job.SourceSetId);

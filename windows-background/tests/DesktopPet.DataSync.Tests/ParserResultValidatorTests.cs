@@ -22,6 +22,22 @@ public sealed class ParserResultValidatorTests : IDisposable
         Assert.Single(result.Favorites);
     }
 
+    [Fact]
+    public async Task OptionalNextCursorIsAcceptedAndPreserved()
+    {
+        var valid = JsonSerializer.SerializeToElement(ParserResultTestData.Document());
+        var document = valid.EnumerateObject().ToDictionary(
+            property => property.Name,
+            property => (object?)property.Value);
+        document["nextCursor"] = "opaque-cursor";
+        var resultPath = await ParserResultTestData.WriteAsync(_root, document);
+
+        var result = await new ParserResultValidator()
+            .ValidateAsync(resultPath, "job-1", "source-1", default);
+
+        Assert.Equal("opaque-cursor", result.NextCursor);
+    }
+
     [Theory]
     [InlineData("wrong-job", "source-1")]
     [InlineData("job-1", "wrong-source")]

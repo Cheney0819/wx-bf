@@ -9,6 +9,7 @@ namespace DesktopPet.DataSync;
 
 public sealed class ParserJobBuilder
 {
+    private const int MaximumCursorCharacters = 64 * 1024;
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
@@ -171,6 +172,8 @@ public sealed class ParserJobBuilder
         {
             throw new InvalidDataException("Existing parser job identity changed.");
         }
+        if (manifest.Cursor is not null)
+            ValidateCursor(manifest.Cursor);
 
         var expectedInputs = inputs.OrderBy(item => item.Ordinal).ToArray();
         for (var index = 0; index < expectedInputs.Length; index++)
@@ -199,6 +202,46 @@ public sealed class ParserJobBuilder
             outputRoot,
             jobManifestPath,
             manifest);
+    }
+
+    public async Task<BuiltParserJob> AdvanceCursorAsync(
+        BuiltParserJob built,
+        string nextCursor,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(built);
+        ValidateCursor(nextCursor);
+        if (string.Equals(built.Manifest.Cursor, nextCursor, StringComparison.Ordinal))
+            throw new InvalidDataException("Parser continuation cursor did not advance.");
+
+        ValidateSegment(built.Manifest.JobId, nameof(built));
+        var expectedJobRoot = Path.GetFullPath(Path.Combine(_jobsRoot, built.Manifest.JobId));
+        var expectedInputRoot = Path.Combine(expectedJobRoot, "input");
+        var expectedOutputRoot = Path.Combine(expectedJobRoot, "output");
+        var expectedManifestPath = Path.Combine(expectedJobRoot, "job.json");
+        if (Path.GetFullPath(built.JobRoot) != expectedJobRoot ||
+            Path.GetFullPath(built.InputRoot) != expectedInputRoot ||
+            Path.GetFullPath(built.OutputRoot) != expectedOutputRoot ||
+            Path.GetFullPath(built.JobManifestPath) != expectedManifestPath ||
+            Path.GetFullPath(built.Manifest.InputRoot) != expectedInputRoot ||
+            Path.GetFullPath(built.Manifest.OutputRoot) != expectedOutputRoot)
+        {
+            throw new InvalidDataException("Parser continuation job paths are invalid.");
+        }
+
+        var manifest = built.Manifest with { Cursor = nextCursor };
+        var json = JsonSerializer.SerializeToUtf8Bytes(manifest, JsonOptions);
+        try
+        {
+            await AtomicFile.ReplaceAsync(expectedManifestPath, json, cancellationToken);
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(json);
+        }
+
+        File.Delete(Path.Combine(expectedOutputRoot, "result.json"));
+        return built with { Manifest = manifest };
     }
 
     private static async Task MaterializeAsync(
@@ -308,6 +351,17 @@ public sealed class ParserJobBuilder
     {
         if (value.Length != 64 || value.Any(character => !Uri.IsHexDigit(character)))
             throw new ArgumentException("Value must be a SHA-256 hex string.", parameterName);
+    }
+
+    private static void ValidateCursor(string cursor)
+    {
+        if (string.IsNullOrWhiteSpace(cursor) ||
+            cursor.Length > MaximumCursorCharacters ||
+            cursor.Any(character =>
+                !(char.IsAsciiLetterOrDigit(character) || character is '-' or '_')))
+        {
+            throw new InvalidDataException("Parser continuation cursor is invalid.");
+        }
     }
 
     private static void ValidateSegment(string value, string parameterName)

@@ -31,8 +31,8 @@ public sealed class EndToEndDataSyncTests : IDisposable
     private static readonly IReadOnlyDictionary<string, string> ExpectedRequestIds =
         new Dictionary<string, string>(StringComparer.Ordinal)
         {
-            ["/api/contacts"] = "bd62f82a71e82b006980ca6ee8f2dd3718752da71de111b7a647c0f3ed5df175",
-            ["/api/favorites"] = "f7fdd7dfa9a8618fd8facb8544ae97ec1c04136024a39857f897c48553f4c455",
+            ["/api/contacts"] = "efb5c5fb98a62330f45a58dcb5a47d10c0847d52652ea72bf18571a3af628814",
+            ["/api/favorites"] = "a96faee34efa2dc7cfa5777b7826944525a1ceb88811c1c4c63daabcc609b277",
             ["/api/messages"] = "2f48440fb87d32f2b38c9b6a91a0b78783b30aa610c4c85c8a33d553022ca0c7",
         };
 
@@ -40,6 +40,27 @@ public sealed class EndToEndDataSyncTests : IDisposable
         Path.GetTempPath(),
         "desktop-pet-datasync-e2e-tests",
         Guid.NewGuid().ToString("N"));
+
+    [Fact]
+    public void PackagedParserInstallUsesBackgroundSiblingAndLocalFallbackRemainsAvailable()
+    {
+        var packaged = Path.Combine(_root, "Background", "DataSync");
+        var siblingManifest = Path.Combine(_root, "Background", "Parser", "parser-install.json");
+        Directory.CreateDirectory(Path.GetDirectoryName(siblingManifest)!);
+        File.WriteAllText(siblingManifest, "{}");
+
+        Assert.Equal(
+            Path.GetFullPath(siblingManifest),
+            Program.ResolveParserInstallPath(packaged));
+
+        var local = Path.Combine(_root, "local", "DataSync");
+        var localManifest = Path.Combine(local, "Parser", "parser-install.json");
+        Directory.CreateDirectory(Path.GetDirectoryName(localManifest)!);
+        File.WriteAllText(localManifest, "{}");
+        Assert.Equal(
+            Path.GetFullPath(localManifest),
+            Program.ResolveParserInstallPath(local));
+    }
 
     [Fact]
     public async Task ProductionHandoffReachesLoopbackServerDurablyAcrossRestarts()
@@ -264,6 +285,76 @@ public sealed class EndToEndDataSyncTests : IDisposable
             payload.RootElement.ToString());
         Assert.Equal("process_cleanup", metrics.GetProperty("stageCode").GetString());
         Assert.Equal("parser_cleanup_timeout", metrics.GetProperty("failureCode").GetString());
+    }
+
+    [Fact]
+    public async Task RuntimeProcessesParserContinuationPagesBeforeCompletingTheJob()
+    {
+        if (OperatingSystem.IsWindows()) return;
+        var paths = TestPaths();
+        var time = new AdjustableTimeProvider(DateTimeOffset.Parse("2026-07-26T00:00:00Z"));
+        var identity = new ClientIdentityDocument(1, LegacySessionId, LegacySource, time.GetUtcNow());
+        var staging = await CopyReadableFixtureToStagingAsync(paths.StagingRoot);
+        await PublishRecoveryHandoffAsync(paths, staging);
+        var parser = await CreatePagedParserArtifactAsync(paths.ParserRoot);
+        var protector = new EncryptedOutboxProtector(new XorTestProtector());
+        await using var repository = await OpenRepositoryAsync(paths.SyncDatabase, time, protector);
+        var runtime = CreateRuntime(
+            paths,
+            parser,
+            repository,
+            protector,
+            new MissingSettingsProvider(),
+            new HttpClient(),
+            time,
+            identity);
+
+        await runtime.ReconcileHandoffsAsync(default);
+
+        Assert.True(await runtime.ProcessOneParserJobAsync(default));
+        Assert.False(await runtime.ProcessOneParserJobAsync(default));
+        Assert.Equal(2, await repository.CountExportedItemsAsync(default));
+        Assert.Equal(2, await repository.CountOutboxAsync(default));
+        Assert.Empty(Directory.EnumerateDirectories(Path.Combine(paths.DataSyncRoot, "Jobs")));
+    }
+
+    [Fact]
+    public async Task RuntimeRejectsARepeatedCursorBeforeCommittingTheRepeatedPage()
+    {
+        if (OperatingSystem.IsWindows()) return;
+        var paths = TestPaths();
+        var time = new AdjustableTimeProvider(DateTimeOffset.Parse("2026-07-26T00:00:00Z"));
+        var identity = new ClientIdentityDocument(1, LegacySessionId, LegacySource, time.GetUtcNow());
+        var staging = await CopyReadableFixtureToStagingAsync(paths.StagingRoot);
+        var manifest = await PublishRecoveryHandoffAsync(paths, staging);
+        var sourceSetId = Hash(string.Join(
+            "|",
+            manifest.Databases
+                .OrderBy(item => item.RelativePath, StringComparer.Ordinal)
+                .Select(item => $"{item.RelativePath}:{item.GenerationId}")));
+        var parseJobId = Hash($"desktop-pet-datasync-parse-job-v1|{sourceSetId}");
+        var parser = await CreatePagedParserArtifactAsync(paths.ParserRoot, repeatCursor: true);
+        var protector = new EncryptedOutboxProtector(new XorTestProtector());
+        await using var repository = await OpenRepositoryAsync(paths.SyncDatabase, time, protector);
+        var runtime = CreateRuntime(
+            paths,
+            parser,
+            repository,
+            protector,
+            new MissingSettingsProvider(),
+            new HttpClient(),
+            time,
+            identity);
+
+        await runtime.ReconcileHandoffsAsync(default);
+
+        Assert.True(await runtime.ProcessOneParserJobAsync(default));
+        Assert.Equal(
+            ParseJobState.Leased,
+            (await repository.GetParseJobAsync(parseJobId, default))!.State);
+        Assert.Equal(1, await repository.CountExportedItemsAsync(default));
+        Assert.Equal(1, await repository.CountOutboxAsync(default));
+        Assert.True(Directory.Exists(Path.Combine(paths.DataSyncRoot, "Jobs", parseJobId)));
     }
 
     [Theory]
@@ -524,6 +615,96 @@ public sealed class EndToEndDataSyncTests : IDisposable
         await File.WriteAllTextAsync(
             executable,
             $"#!/bin/sh\nexec \"{python}\" \"{parserScript}\" \"$@\"\n");
+        File.SetUnixFileMode(
+            executable,
+            UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        var sha256 = await Sha256Async(executable);
+        var installManifest = Path.Combine(parserRoot, "parser-install.json");
+        await File.WriteAllTextAsync(
+            installManifest,
+            JsonSerializer.Serialize(new
+            {
+                schemaVersion = 1,
+                executablePath = "wx_parser.exe",
+                sha256,
+            }));
+        return new ParserArtifact(installManifest, sha256);
+    }
+
+    private static async Task<ParserArtifact> CreatePagedParserArtifactAsync(
+        string parserRoot,
+        bool repeatCursor = false)
+    {
+        if (OperatingSystem.IsWindows())
+            throw new PlatformNotSupportedException("Local source-wrapper fixture is Unix-only.");
+        Directory.CreateDirectory(parserRoot);
+        var executable = Path.Combine(parserRoot, "wx_parser.exe");
+        var python = FindExecutable("python3");
+        var script = Path.Combine(parserRoot, "paged_parser.py");
+        if (repeatCursor)
+            await File.WriteAllTextAsync(Path.Combine(parserRoot, "repeat-cursor"), "1");
+        await File.WriteAllTextAsync(script, """
+            import json
+            import pathlib
+            import sqlite3
+            import sys
+
+            job_path = pathlib.Path(sys.argv[sys.argv.index("--job") + 1])
+            job = json.loads(job_path.read_text(encoding="utf-8"))
+            has_cursor = bool(job.get("cursor"))
+            if has_cursor:
+                with sqlite3.connect(job_path.parents[2] / "sync.db") as connection:
+                    state = connection.execute(
+                        "SELECT state FROM parse_job WHERE id = ?",
+                        (job["jobId"],),
+                    ).fetchone()[0]
+                if state != "leased":
+                    raise RuntimeError("continuation job is not leased")
+            local_id = 2 if has_cursor else 1
+            result = {
+                "schemaVersion": 1,
+                "jobId": job["jobId"],
+                "sourceSetId": job["sourceSetId"],
+                "messages": [{
+                    "wxid": "alice",
+                    "local_id": local_id,
+                    "content": "page-" + str(local_id),
+                    "create_time": local_id,
+                    "is_sender": False,
+                    "nickname": "alice",
+                    "sender": "alice",
+                    "avatar": "",
+                    "msg_type": 1,
+                    "msg_sub_type": 0,
+                    "media_type": "",
+                    "media_mime": "",
+                    "media_name": "",
+                    "media_data": "",
+                    "media_sha256": ""
+                }],
+                "contacts": [],
+                "favorites": [],
+                "notices": []
+            }
+            repeat_cursor = pathlib.Path(__file__).with_name("repeat-cursor").exists()
+            if not has_cursor or repeat_cursor:
+                result["nextCursor"] = "cursor-one"
+            output_root = pathlib.Path(job["outputRoot"])
+            output_root.mkdir(parents=True, exist_ok=True)
+            (output_root / "result.json").write_text(
+                json.dumps(result, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            print(json.dumps({
+                "schemaVersion": 1,
+                "resultPath": str(output_root / "result.json"),
+                "jobId": job["jobId"],
+                "sourceSetId": job["sourceSetId"],
+            }, separators=(",", ":")))
+            """);
+        await File.WriteAllTextAsync(
+            executable,
+            $"#!/bin/sh\nexec \"{python}\" \"{script}\" \"$@\"\n");
         File.SetUnixFileMode(
             executable,
             UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);

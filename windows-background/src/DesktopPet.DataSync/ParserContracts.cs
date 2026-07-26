@@ -10,7 +10,8 @@ public sealed record ParserJobManifest(
     string InputRoot,
     string OutputRoot,
     IReadOnlyList<ParserDatabaseInput> Databases,
-    int MaximumMessages);
+    int MaximumMessages,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Cursor = null);
 
 public sealed record ParserDatabaseInput(
     string GenerationId,
@@ -77,7 +78,8 @@ public sealed record ParserResultDocument(
     IReadOnlyList<ParsedMessage> Messages,
     IReadOnlyList<ParsedContact> Contacts,
     IReadOnlyList<ParsedFavorite> Favorites,
-    IReadOnlyList<ParserNotice> Notices);
+    IReadOnlyList<ParserNotice> Notices,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? NextCursor = null);
 
 public sealed record ParsedMessage(
     [property: JsonPropertyName("wxid")] string Wxid,

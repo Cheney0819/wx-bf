@@ -88,10 +88,7 @@ public static class Program
                 TimeProvider.System);
             var jobsRoot = Path.Combine(paths.DataSyncRoot, "Jobs");
             var builder = new ParserJobBuilder(jobsRoot);
-            var parserInstall = Path.Combine(
-                AppContext.BaseDirectory,
-                "Parser",
-                "parser-install.json");
+            var parserInstall = ResolveParserInstallPath(AppContext.BaseDirectory);
             var supervisor = new ParserProcessSupervisor(parserInstall);
             var validator = new ParserResultValidator();
             var writer = new IncrementalOutboxWriter(
@@ -160,5 +157,21 @@ public static class Program
             await host.RunAsync();
             return 0;
         }
+    }
+
+    internal static string ResolveParserInstallPath(string baseDirectory)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(baseDirectory);
+        var fullBaseDirectory = Path.GetFullPath(baseDirectory);
+        var siblingManifest = Path.GetFullPath(Path.Combine(
+            fullBaseDirectory,
+            "..",
+            "Parser",
+            "parser-install.json"));
+        if (File.Exists(siblingManifest)) return siblingManifest;
+        return Path.GetFullPath(Path.Combine(
+            fullBaseDirectory,
+            "Parser",
+            "parser-install.json"));
     }
 }

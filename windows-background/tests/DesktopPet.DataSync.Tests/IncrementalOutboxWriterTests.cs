@@ -70,6 +70,79 @@ public sealed class IncrementalOutboxWriterTests : IDisposable
     }
 
     [Fact]
+    public async Task PartialPageCommitsOutboxButLeavesJobLeasedUntilFinalPage()
+    {
+        var valid = JsonSerializer.SerializeToElement(ParserResultTestData.Document());
+        var firstDocument = valid.EnumerateObject().ToDictionary(
+            property => property.Name,
+            property => property.Name switch
+            {
+                "contacts" or "favorites" => (object?)Array.Empty<object>(),
+                "messages" => new[] { ParserResultTestData.Message(1, "first") },
+                _ => property.Value,
+            });
+        firstDocument["nextCursor"] = "opaque-cursor";
+        var fixture = await CreateFixtureAsync(document: firstDocument);
+
+        await fixture.Writer.CommitAsync(fixture.Job, fixture.Result, default);
+
+        Assert.Equal(ParseJobState.Leased, (await fixture.Repository.GetParseJobAsync(
+            fixture.Job.Id,
+            default))!.State);
+        Assert.Equal(1, await fixture.Repository.CountExportedItemsAsync(default));
+
+        var secondDocument = valid.EnumerateObject().ToDictionary(
+            property => property.Name,
+            property => property.Name switch
+            {
+                "contacts" or "favorites" => (object?)Array.Empty<object>(),
+                "messages" => new[] { ParserResultTestData.Message(2, "second") },
+                _ => property.Value,
+            });
+        var secondPath = await ParserResultTestData.WriteAsync(_root, secondDocument);
+        var secondResult = await new ParserResultValidator().ValidateAsync(
+            secondPath,
+            fixture.Job.Id,
+            fixture.Job.SourceSetId,
+            default);
+
+        await fixture.Writer.CommitAsync(fixture.Job, secondResult, default);
+
+        Assert.Equal(ParseJobState.Completed, (await fixture.Repository.GetParseJobAsync(
+            fixture.Job.Id,
+            default))!.State);
+        Assert.Equal(2, await fixture.Repository.CountExportedItemsAsync(default));
+        await fixture.Repository.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task MutableContactAndFavoriteFieldsCreateNewExportsButStablePayloadDoesNot()
+    {
+        var protector = new EncryptedOutboxProtector(new XorTestProtector());
+        await using var repository = new DataSyncRepository(
+            Path.Combine(_root, "mutable-items.db"),
+            TimeProvider.System,
+            protector);
+        await repository.InitializeAsync(default);
+        var writer = new IncrementalOutboxWriter(
+            repository,
+            protector,
+            new ClientIdentityDocument(
+                1,
+                "client-cs-existing",
+                "client_cs",
+                DateTimeOffset.Parse("2026-07-01T00:00:00Z")),
+            TimeProvider.System);
+
+        await CommitMutableItemsAsync(repository, writer, "job-a", "source-a", "remark", "title");
+        await CommitMutableItemsAsync(repository, writer, "job-b", "source-b", "remark", "title");
+        Assert.Equal(2, await repository.CountExportedItemsAsync(default));
+
+        await CommitMutableItemsAsync(repository, writer, "job-c", "source-c", "changed", "changed");
+        Assert.Equal(4, await repository.CountExportedItemsAsync(default));
+    }
+
+    [Fact]
     public async Task EveryBusinessPayloadCarriesStableClientIdentity()
     {
         var fixture = await CreateFixtureAsync();
@@ -179,7 +252,7 @@ public sealed class IncrementalOutboxWriterTests : IDisposable
             property => property.Name switch
             {
                 "messages" or "favorites" => (object?)Array.Empty<object>(),
-                "contacts" => wxids.Select(Contact).ToArray(),
+                "contacts" => wxids.Select(wxid => Contact(wxid)).ToArray(),
                 _ => property.Value,
             });
         var resultPath = await ParserResultTestData.WriteAsync(_root, document);
@@ -192,13 +265,64 @@ public sealed class IncrementalOutboxWriterTests : IDisposable
         await writer.CommitAsync(job, result, default);
     }
 
-    private static object Contact(string wxid) => new
+    private async Task CommitMutableItemsAsync(
+        DataSyncRepository repository,
+        IncrementalOutboxWriter writer,
+        string jobId,
+        string sourceSetId,
+        string remark,
+        string favoriteTitle)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var job = new ParseJob(
+            jobId,
+            sourceSetId,
+            ParseJobState.Leased,
+            "worker-a",
+            now.AddMinutes(3),
+            1,
+            now,
+            now);
+        await repository.EnqueueParseJobAsync(job, default);
+        var valid = JsonSerializer.SerializeToElement(ParserResultTestData.Document(jobId, sourceSetId));
+        var contact = Contact("alice", remark);
+        var favorite = new
+        {
+            source_table = "Favorites",
+            source_id = "7",
+            title = favoriteTitle,
+            summary = "summary",
+            item_type = "link",
+            item_sub_type = "",
+            source_updated_at = 1L,
+            data_json = new Dictionary<string, object?> { ["title"] = favoriteTitle },
+        };
+        var document = valid.EnumerateObject().ToDictionary(
+            property => property.Name,
+            property => property.Name switch
+            {
+                "messages" => (object?)Array.Empty<object>(),
+                "contacts" => new[] { contact },
+                "favorites" => new[] { favorite },
+                _ => property.Value,
+            });
+        var resultPath = await ParserResultTestData.WriteAsync(_root, document);
+        var result = await new ParserResultValidator().ValidateAsync(
+            resultPath,
+            jobId,
+            sourceSetId,
+            default);
+
+        await writer.CommitAsync(job, result, default);
+    }
+
+    private static object Contact(string wxid, string remark = "") => new
     {
         wxid,
         alias = "",
-        remark = "",
+        remark,
         nick_name = wxid,
-        display_name = wxid,
+        display_name = remark.Length > 0 ? remark : wxid,
         avatar = "",
         source_updated_at = 0L,
         extra_json = (object?)null,

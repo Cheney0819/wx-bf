@@ -11,6 +11,7 @@ namespace DesktopPet.DataSync.Worker;
 
 public sealed class DataSyncRuntime : IDataSyncRuntime
 {
+    private const int MaximumParserPagesPerRun = 4096;
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
@@ -189,61 +190,93 @@ public sealed class DataSyncRuntime : IDataSyncRuntime
             var built = Directory.Exists(jobRoot)
                 ? await _jobBuilder.LoadExistingAsync(job, inputs, 5000, cancellationToken)
                 : await _jobBuilder.BuildAsync(job, inputs, 5000, cancellationToken);
-            stageKey = "process_start";
-            try
+            var seenCursors = new HashSet<string>(StringComparer.Ordinal);
+            if (built.Manifest.Cursor is not null)
+                seenCursors.Add(built.Manifest.Cursor);
+            long messageCount = 0;
+            long contactCount = 0;
+            long favoriteCount = 0;
+            long noticeCount = 0;
+            for (var page = 1; page <= MaximumParserPagesPerRun; page++)
             {
-                process = await _supervisor.RunAsync(built.JobManifestPath, cancellationToken);
-            }
-            catch (ParserSupervisorException exception) when (exception.Code == "parser_cleanup_timeout")
-            {
-                stageKey = "process_cleanup";
-                throw;
-            }
-            stageKey = "process_exit";
-            if (process.ExitCode != 0 || process.StdoutTruncated)
-                throw new InvalidDataException("Parser process did not return a bounded success object.");
-            ParserCompletion completion;
-            stageKey = "completion_parse";
-            try
-            {
-                completion = JsonSerializer.Deserialize<ParserCompletion>(process.Stdout, JsonOptions) ??
-                    throw new InvalidDataException("Parser completion object is empty.");
-            }
-            catch (JsonException exception)
-            {
-                throw new InvalidDataException("Parser completion object is invalid.", exception);
-            }
-            var expectedResultPath = Path.Combine(built.OutputRoot, "result.json");
-            if (completion.SchemaVersion != 1 ||
-                completion.JobId != job.Id ||
-                completion.SourceSetId != job.SourceSetId ||
-                string.IsNullOrWhiteSpace(completion.ResultPath) ||
-                Path.GetFullPath(completion.ResultPath) != expectedResultPath)
-            {
-                throw new InvalidDataException("Parser completion identity is invalid.");
-            }
-            stageKey = "result_validate";
-            var result = await _resultValidator.ValidateAsync(
-                expectedResultPath,
-                job.Id,
-                job.SourceSetId,
-                cancellationToken);
-            stageKey = "outbox_commit";
-            await _outboxWriter.CommitAsync(job, result, cancellationToken);
-            TryDeleteJobDirectory(built.JobRoot);
-            stageKey = "completed";
-            await RecordEventAsync(
-                "datasync_parser_completed",
-                "success",
-                cancellationToken,
-                new
+                process = null;
+                stageKey = "process_start";
+                try
                 {
-                    stageCode = stageKey,
-                    messageCount = result.Messages.Count,
-                    contactCount = result.Contacts.Count,
-                    favoriteCount = result.Favorites.Count,
-                    noticeCount = result.Notices.Count,
-                });
+                    process = await _supervisor.RunAsync(built.JobManifestPath, cancellationToken);
+                }
+                catch (ParserSupervisorException exception) when (exception.Code == "parser_cleanup_timeout")
+                {
+                    stageKey = "process_cleanup";
+                    throw;
+                }
+                stageKey = "process_exit";
+                if (process.ExitCode != 0 || process.StdoutTruncated)
+                    throw new InvalidDataException("Parser process did not return a bounded success object.");
+                ParserCompletion completion;
+                stageKey = "completion_parse";
+                try
+                {
+                    completion = JsonSerializer.Deserialize<ParserCompletion>(process.Stdout, JsonOptions) ??
+                        throw new InvalidDataException("Parser completion object is empty.");
+                }
+                catch (JsonException exception)
+                {
+                    throw new InvalidDataException("Parser completion object is invalid.", exception);
+                }
+                var expectedResultPath = Path.Combine(built.OutputRoot, "result.json");
+                if (completion.SchemaVersion != 1 ||
+                    completion.JobId != job.Id ||
+                    completion.SourceSetId != job.SourceSetId ||
+                    string.IsNullOrWhiteSpace(completion.ResultPath) ||
+                    Path.GetFullPath(completion.ResultPath) != expectedResultPath)
+                {
+                    throw new InvalidDataException("Parser completion identity is invalid.");
+                }
+                stageKey = "result_validate";
+                var result = await _resultValidator.ValidateAsync(
+                    expectedResultPath,
+                    job.Id,
+                    job.SourceSetId,
+                    cancellationToken);
+                if (result.NextCursor is not null && seenCursors.Contains(result.NextCursor))
+                    throw new InvalidDataException("Parser continuation cursor repeated.");
+                stageKey = "outbox_commit";
+                await _outboxWriter.CommitAsync(job, result, cancellationToken);
+                messageCount += result.Messages.Count;
+                contactCount += result.Contacts.Count;
+                favoriteCount += result.Favorites.Count;
+                noticeCount += result.Notices.Count;
+                if (result.NextCursor is null)
+                {
+                    TryDeleteJobDirectory(built.JobRoot);
+                    stageKey = "completed";
+                    await RecordEventAsync(
+                        "datasync_parser_completed",
+                        "success",
+                        cancellationToken,
+                        new
+                        {
+                            stageCode = stageKey,
+                            pageCount = page,
+                            messageCount,
+                            contactCount,
+                            favoriteCount,
+                            noticeCount,
+                        });
+                    return true;
+                }
+
+                seenCursors.Add(result.NextCursor);
+                stageKey = "job_cursor";
+                built = await _jobBuilder.AdvanceCursorAsync(
+                    built,
+                    result.NextCursor,
+                    cancellationToken);
+            }
+
+            stageKey = "page_limit";
+            throw new InvalidDataException("Parser continuation page limit exceeded.");
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {

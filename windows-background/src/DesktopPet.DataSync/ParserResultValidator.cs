@@ -75,6 +75,14 @@ public sealed class ParserResultValidator
         {
             throw new InvalidDataException("Parser result count limit was exceeded.");
         }
+        if (result.NextCursor is not null &&
+            (string.IsNullOrWhiteSpace(result.NextCursor) ||
+             result.NextCursor.Length > MaximumStringCharacters ||
+             result.NextCursor.Any(character =>
+                 !(char.IsAsciiLetterOrDigit(character) || character is '-' or '_'))))
+        {
+            throw new InvalidDataException("Parser continuation cursor is invalid.");
+        }
 
         var messageIdentities = new HashSet<string>(StringComparer.Ordinal);
         foreach (var message in result.Messages)
@@ -90,20 +98,20 @@ public sealed class ParserResultValidator
         foreach (var contact in result.Contacts)
         {
             if (contact is null || string.IsNullOrWhiteSpace(contact.Wxid) ||
-                !contacts.Add(ParserItemIdentity.Contact(contact)))
+                !contacts.Add(contact.Wxid))
             {
                 throw new InvalidDataException("Parser result contains an invalid or duplicate contact.");
             }
         }
 
-        var favorites = new HashSet<string>(StringComparer.Ordinal);
+        var favorites = new HashSet<(string SourceTable, string SourceId)>();
         foreach (var favorite in result.Favorites)
         {
             if (favorite is null ||
                 string.IsNullOrWhiteSpace(favorite.SourceTable) ||
                 string.IsNullOrWhiteSpace(favorite.SourceId) ||
                 favorite.DataJson is null ||
-                !favorites.Add(ParserItemIdentity.Favorite(favorite)))
+                !favorites.Add((favorite.SourceTable, favorite.SourceId)))
             {
                 throw new InvalidDataException("Parser result contains an invalid or duplicate favorite.");
             }
@@ -218,13 +226,29 @@ internal static class ParserItemIdentity
         message.MediaSha256);
 
     internal static string Contact(ParsedContact contact) => HashTuple(
-        "desktop-pet-datasync-contact-v2",
-        contact.Wxid);
+        "desktop-pet-datasync-contact-v3",
+        contact.Wxid,
+        contact.Alias,
+        contact.Remark,
+        contact.NickName,
+        contact.DisplayName,
+        contact.Avatar,
+        contact.SourceUpdatedAt,
+        contact.ExtraJson is null ? null : CanonicalJson(contact.ExtraJson.Value));
 
     internal static string Favorite(ParsedFavorite favorite) => HashTuple(
-        "desktop-pet-datasync-favorite-v2",
+        "desktop-pet-datasync-favorite-v3",
         favorite.SourceTable,
-        favorite.SourceId);
+        favorite.SourceId,
+        favorite.Title,
+        favorite.Summary,
+        favorite.ItemType,
+        favorite.ItemSubType,
+        favorite.SourceUpdatedAt,
+        favorite.DataJson
+            .OrderBy(item => item.Key, StringComparer.Ordinal)
+            .Select(item => new object[] { item.Key, CanonicalJson(item.Value) })
+            .ToArray());
 
     internal static string Batch(string endpoint, IReadOnlyList<string> itemIdentities) =>
         HashTuple(
@@ -247,6 +271,41 @@ internal static class ParserItemIdentity
         {
             CryptographicOperations.ZeroMemory(bytes);
             CryptographicOperations.ZeroMemory(digest);
+        }
+    }
+
+    private static string CanonicalJson(JsonElement value)
+    {
+        using var stream = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(stream))
+            WriteCanonicalJson(writer, value);
+        return System.Text.Encoding.UTF8.GetString(stream.ToArray());
+    }
+
+    private static void WriteCanonicalJson(Utf8JsonWriter writer, JsonElement value)
+    {
+        switch (value.ValueKind)
+        {
+            case JsonValueKind.Object:
+                writer.WriteStartObject();
+                foreach (var property in value.EnumerateObject().OrderBy(
+                             item => item.Name,
+                             StringComparer.Ordinal))
+                {
+                    writer.WritePropertyName(property.Name);
+                    WriteCanonicalJson(writer, property.Value);
+                }
+                writer.WriteEndObject();
+                break;
+            case JsonValueKind.Array:
+                writer.WriteStartArray();
+                foreach (var item in value.EnumerateArray())
+                    WriteCanonicalJson(writer, item);
+                writer.WriteEndArray();
+                break;
+            default:
+                value.WriteTo(writer);
+                break;
         }
     }
 }
