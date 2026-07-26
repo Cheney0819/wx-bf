@@ -139,8 +139,32 @@ public sealed class WeChatDataRootLocator : IWeChatDataRootLocator
         }
     }
 
-    private static bool IsAccountRoot(string path) =>
-        Directory.Exists(Path.Combine(path, "db_storage", "session"));
+    private static bool IsAccountRoot(string path)
+    {
+        var storage = Path.Combine(path, "db_storage");
+        if (!File.Exists(Path.Combine(storage, "session", "session.db")))
+            return false;
+
+        return ContainsDatabase(Path.Combine(storage, "message")) ||
+            ContainsDatabase(Path.Combine(storage, "biz_message"));
+    }
+
+    private static bool ContainsDatabase(string path)
+    {
+        try
+        {
+            return Directory.Exists(path) &&
+                Directory.EnumerateFiles(path, "*.db", SearchOption.TopDirectoryOnly).Any();
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return false;
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+    }
 
     private static IReadOnlyList<string> EnumerateDirectories(string root)
     {
@@ -262,4 +286,3 @@ public sealed class WeChatDataRootLocator : IWeChatDataRootLocator
         int DatabaseCount,
         DateTime LatestWriteUtc);
 }
-

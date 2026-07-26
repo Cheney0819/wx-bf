@@ -63,6 +63,22 @@ public sealed class WeChatDataRootLocatorTests : IDisposable
     }
 
     [Fact]
+    public async Task NewerSessionOnlyDirectoryDoesNotReplaceCompleteAccount()
+    {
+        var container = Path.Combine(_root, "xwechat_files");
+        var complete = CreateAccount(container, "complete", 3);
+        var incomplete = CreateAccount(container, "incomplete", 1);
+        SetDatabaseTimes(complete, DateTime.UtcNow.AddMinutes(-5));
+        SetDatabaseTimes(incomplete, DateTime.UtcNow);
+        var locator = new WeChatDataRootLocator([_root], []);
+
+        var result = await locator.LocateAsync(default);
+
+        Assert.Equal(Path.GetFullPath(complete), result.DataRoot);
+        Assert.Equal(3, result.DatabaseCount);
+    }
+
+    [Fact]
     public async Task FiniteDriveSearchFindsNestedCloudAccount()
     {
         var account = CreateAccount(
@@ -114,4 +130,3 @@ public sealed class WeChatDataRootLocatorTests : IDisposable
         }
     }
 }
-
