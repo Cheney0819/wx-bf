@@ -23,10 +23,43 @@ public sealed class OutboxUploaderTests : IDisposable
         var result = await fixture.Uploader.UploadOneAsync("worker-a", default);
         var row = await fixture.Repository.GetOutboxAsync("outbox-1", default);
 
-        Assert.Equal(UploadDisposition.Offline, result.Disposition);
+        Assert.Equal(UploadDisposition.CredentialMissing, result.Disposition);
         Assert.Equal(OutboxState.Pending, row!.State);
         Assert.Equal(0, row.AttemptCount);
         await fixture.Repository.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task AuthenticationQuarantineIsRetriedOnlyAfterCredentialChanges()
+    {
+        var handler = new QueueHandler(
+            new HttpResponseMessage(HttpStatusCode.Unauthorized)
+            {
+                Content = new StringContent("bad token"),
+            },
+            new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent("{\"ok\":true,\"added\":0}"),
+            });
+        var fixture = await CreateFixtureAsync(handler);
+
+        var rejected = await fixture.Uploader.UploadOneAsync("worker-a", default);
+        var unchanged = await fixture.Uploader.UploadOneAsync("worker-a", default);
+        fixture.Settings.Value = new ServerSettings(
+            new Uri("https://example.invalid/"),
+            "replacement-token");
+        var recovered = await fixture.Uploader.UploadOneAsync("worker-a", default);
+        var row = await fixture.Repository.GetOutboxAsync("outbox-1", default);
+
+        Assert.Equal(UploadDisposition.Quarantined, rejected.Disposition);
+        Assert.Equal(UploadDisposition.Idle, unchanged.Disposition);
+        Assert.Equal(UploadDisposition.Acknowledged, recovered.Disposition);
+        Assert.Equal(OutboxState.Acknowledged, row!.State);
+        Assert.Equal(2, handler.RequestBodies.Count);
+        using var retryBody = JsonDocument.Parse(handler.RequestBodies[1]);
+        Assert.Equal(
+            "replacement-token",
+            retryBody.RootElement.GetProperty("token").GetString());
     }
 
     [Fact]

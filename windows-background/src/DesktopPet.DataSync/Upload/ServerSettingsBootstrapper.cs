@@ -23,7 +23,7 @@ public sealed class ServerSettingsBootstrapper
     private readonly string _settingsPath;
     private readonly IReadOnlyList<string> _legacyConfigPaths;
     private readonly Func<string, string?> _readEnvironment;
-    private readonly ServerSettings _deploymentDefaults;
+    private readonly ServerSettings? _deploymentDefaults;
     private readonly SemaphoreSlim _gate = new(1, 1);
 
     public ServerSettingsBootstrapper(
@@ -31,13 +31,12 @@ public sealed class ServerSettingsBootstrapper
         string settingsPath,
         IEnumerable<string> legacyConfigPaths,
         Func<string, string?> readEnvironment,
-        ServerSettings deploymentDefaults)
+        ServerSettings? deploymentDefaults)
     {
         ArgumentNullException.ThrowIfNull(vault);
         ArgumentException.ThrowIfNullOrWhiteSpace(settingsPath);
         ArgumentNullException.ThrowIfNull(legacyConfigPaths);
         ArgumentNullException.ThrowIfNull(readEnvironment);
-        ArgumentNullException.ThrowIfNull(deploymentDefaults);
         _vault = vault;
         _settingsPath = Path.GetFullPath(settingsPath);
         _legacyConfigPaths = legacyConfigPaths
@@ -55,42 +54,66 @@ public sealed class ServerSettingsBootstrapper
         await _gate.WaitAsync(cancellationToken);
         try
         {
-            var existing = await TryLoadExistingAsync(cancellationToken);
-            if (existing is not null)
-            {
-                return new ServerSettingsBootstrapResult(
-                    existing,
-                    ServerSettingsSource.ExistingVault,
-                    WasCreated: false);
-            }
-
-            var source = ServerSettingsSource.DeploymentDefault;
-            var selected = TryReadEnvironment();
-            if (selected is not null)
-            {
-                source = ServerSettingsSource.Environment;
-            }
-            else
-            {
-                selected = await TryReadLegacyAsync(cancellationToken);
-                if (selected is not null)
-                    source = ServerSettingsSource.LegacyJson;
-            }
-            selected ??= _deploymentDefaults;
-
-            await _vault.SaveAsync(selected, cancellationToken);
-            var reopened = await _vault.TryLoadAsync(cancellationToken) ??
-                throw new CryptographicException(
-                    "Protected server settings were not persisted.");
-            return new ServerSettingsBootstrapResult(
-                reopened,
-                source,
-                WasCreated: true);
+            var result = await EnsureCoreAsync(_deploymentDefaults, cancellationToken);
+            return result ?? throw new InvalidOperationException(
+                "No server credentials are configured.");
         }
         finally
         {
             _gate.Release();
         }
+    }
+
+    public async Task<ServerSettingsBootstrapResult?> TryEnsureWithoutDefaultAsync(
+        CancellationToken cancellationToken)
+    {
+        await _gate.WaitAsync(cancellationToken);
+        try
+        {
+            return await EnsureCoreAsync(null, cancellationToken);
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    private async Task<ServerSettingsBootstrapResult?> EnsureCoreAsync(
+        ServerSettings? fallback,
+        CancellationToken cancellationToken)
+    {
+        var existing = await TryLoadExistingAsync(cancellationToken);
+        if (existing is not null)
+        {
+            return new ServerSettingsBootstrapResult(
+                existing,
+                ServerSettingsSource.ExistingVault,
+                WasCreated: false);
+        }
+
+        var source = ServerSettingsSource.DeploymentDefault;
+        var selected = TryReadEnvironment();
+        if (selected is not null)
+        {
+            source = ServerSettingsSource.Environment;
+        }
+        else
+        {
+            selected = await TryReadLegacyAsync(cancellationToken);
+            if (selected is not null)
+                source = ServerSettingsSource.LegacyJson;
+        }
+        selected ??= fallback;
+        if (selected is null) return null;
+
+        await _vault.SaveAsync(selected, cancellationToken);
+        var reopened = await _vault.TryLoadAsync(cancellationToken) ??
+            throw new CryptographicException(
+                "Protected server settings were not persisted.");
+        return new ServerSettingsBootstrapResult(
+            reopened,
+            source,
+            WasCreated: true);
     }
 
     private async Task<ServerSettings?> TryLoadExistingAsync(

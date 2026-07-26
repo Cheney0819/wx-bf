@@ -93,6 +93,25 @@ public sealed class ServerSettingsBootstrapperTests : IDisposable
     }
 
     [Fact]
+    public async Task MissingMigrationSourcesRemainUnconfiguredWithoutDeploymentSecret()
+    {
+        var settingsPath = Path.Combine(_root, "server-settings.dpapi");
+        var vault = new ServerSettingsVault(settingsPath, new XorProtector());
+        var bootstrapper = new ServerSettingsBootstrapper(
+            vault,
+            settingsPath,
+            [],
+            _ => null,
+            new ServerSettings(new Uri("https://unused.invalid/"), "unused"));
+
+        var result = await bootstrapper.TryEnsureWithoutDefaultAsync(default);
+
+        Assert.Null(result);
+        Assert.False(File.Exists(settingsPath));
+        Assert.Null(await vault.TryLoadAsync(default));
+    }
+
+    [Fact]
     public async Task UnsafeEnvironmentPairFallsBackToDeploymentDefaults()
     {
         var fixture = CreateFixture(

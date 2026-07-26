@@ -182,6 +182,10 @@ public interface IDataSyncRepository : IAsyncDisposable
         string summary,
         CancellationToken cancellationToken);
 
+    Task<int> RequeueQuarantinedOutboxAsync(
+        IReadOnlyCollection<int> statusCodes,
+        CancellationToken cancellationToken);
+
     Task RecordRuntimeEventAsync(
         string eventType,
         string payloadJson,

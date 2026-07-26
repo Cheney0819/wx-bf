@@ -271,7 +271,15 @@ public sealed class DataSyncRuntime : IDataSyncRuntime
         try
         {
             var result = await _uploader.UploadOneAsync(workerId, cancellationToken);
-            if (ShouldEmitUploadOutcome(result))
+            if (result.Disposition == UploadDisposition.CredentialMissing)
+            {
+                await RecordLocalDiagnosticAsync(
+                    _repository,
+                    "datasync_credential_missing",
+                    "credential_missing",
+                    cancellationToken);
+            }
+            else if (ShouldEmitUploadOutcome(result))
             {
                 var eventType = result.Disposition switch
                 {

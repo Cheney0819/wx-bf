@@ -550,6 +550,37 @@ public sealed class DataSyncRepository : IDataSyncRepository
             setAcknowledged: false,
             cancellationToken);
 
+    public async Task<int> RequeueQuarantinedOutboxAsync(
+        IReadOnlyCollection<int> statusCodes,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(statusCodes);
+        if (statusCodes.Count == 0 || statusCodes.Any(code => code is < 100 or > 599))
+            throw new ArgumentException("At least one valid HTTP status code is required.", nameof(statusCodes));
+
+        var parameters = statusCodes
+            .Distinct()
+            .Select((code, index) => (Name: $"$status_{index}", Code: code))
+            .ToArray();
+        var now = _timeProvider.GetUtcNow().ToString("O");
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"""
+            UPDATE outbox
+            SET state = 'pending',
+                lease_owner = NULL,
+                lease_until_utc = NULL,
+                next_attempt_at_utc = $now,
+                updated_at_utc = $now
+            WHERE state = 'quarantined'
+              AND last_status_code IN ({string.Join(", ", parameters.Select(item => item.Name))});
+            """;
+        command.Parameters.AddWithValue("$now", now);
+        foreach (var parameter in parameters)
+            command.Parameters.AddWithValue(parameter.Name, parameter.Code);
+        return await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
     public async Task RecordRuntimeEventAsync(
         string eventType,
         string payloadJson,
