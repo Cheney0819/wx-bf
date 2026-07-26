@@ -36,3 +36,18 @@ Describe "installer worker lifecycle contract" {
         $setupText | Should -Match "StopProcessTree"
     }
 }
+
+Describe "silent worker executable contract" {
+    BeforeAll {
+        $backgroundRoot = Join-Path $PSScriptRoot "..\..\windows-background\src"
+        $recoveryProject = Get-Content -Raw -LiteralPath (
+            Join-Path $backgroundRoot "DesktopPet.Recovery.Worker\DesktopPet.Recovery.Worker.csproj")
+        $dataSyncProject = Get-Content -Raw -LiteralPath (
+            Join-Path $backgroundRoot "DesktopPet.DataSync.Worker\DesktopPet.DataSync.Worker.csproj")
+    }
+
+    It "uses the Windows GUI subsystem for both production workers" {
+        $recoveryProject | Should -Match "<OutputType>WinExe</OutputType>"
+        $dataSyncProject | Should -Match "<OutputType>WinExe</OutputType>"
+    }
+}

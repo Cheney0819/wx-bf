@@ -1,6 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <OutputType>Exe</OutputType>
+    <OutputType>WinExe</OutputType>
     <AssemblyName>DesktopPet.DataSync.Worker</AssemblyName>
     <ApplicationManifest>worker.manifest</ApplicationManifest>
   </PropertyGroup>
