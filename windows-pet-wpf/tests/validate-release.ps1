@@ -33,13 +33,13 @@ $forbiddenNames = @(
     "--monitor-only",
     "server"
 )
-$forbidden = Get-ChildItem -LiteralPath $root -File -Recurse |
+$forbidden = @(Get-ChildItem -LiteralPath $root -File -Recurse |
     Where-Object {
         $relative = $_.FullName.Substring($root.Length).TrimStart('\', '/')
         $forbiddenNames | Where-Object {
             $relative -like "*$_*"
         }
-    }
+    })
 if ($forbidden.Count -gt 0) {
     throw "Release contains forbidden files: $($forbidden.FullName -join ', ')"
 }
