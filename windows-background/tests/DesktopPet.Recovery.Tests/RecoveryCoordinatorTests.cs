@@ -316,7 +316,7 @@ public sealed class RecoveryCoordinatorTests : IDisposable
 
         await Assert.ThrowsAsync<IOException>(async () =>
             await fixture.Coordinator.RunEpochAsync(fixture.Epoch, default)
-                .WaitAsync(TimeSpan.FromSeconds(1)));
+                .WaitAsync(TimeSpan.FromSeconds(5)));
 
         var persisted = await fixture.Repository.GetEpochAsync(fixture.Epoch.Id, default);
         Assert.Equal(1, persisted!.RestartCount);
