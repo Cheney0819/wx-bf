@@ -353,11 +353,11 @@ git commit -m "build: package background workers separately"
 - Modify: `windows-pet-wpf/DesktopPet.Wpf.csproj`
 - Modify: `windows-pet-wpf/DesktopPetSetup.iss`
 - Modify: `.github/workflows/build-windows.yml`
-- Create: `.github/workflows/verify-release-scope.ps1`
+- Create: `tools/verify-release-scope.ps1`
 
 **Interfaces:**
 - 工作流在 Windows Runner 上运行全部 .NET/Python 测试、发布验证、Inno 编译和产物哈希核对。
-- `verify-release-scope.ps1` 检查 `git diff --name-only $BaseSha $HeadSha` 和当前工作树，任何 `server/` 路径直接失败。
+- `verify-release-scope.ps1` 检查 `git diff --name-status $BaseSha $HeadSha`、当前工作树和目标树；允许删除 `server/`，但新增、修改或保留任何 `server/` 路径都会失败。
 
 - [ ] **Step 1: 写失败的 scope 检查**
 
@@ -366,7 +366,7 @@ git commit -m "build: package background workers separately"
 - [ ] **Step 2: 运行失败检查**
 
 ```powershell
-& .github/workflows/verify-release-scope.ps1 -BaseSha HEAD~1 -HeadSha HEAD
+& tools/verify-release-scope.ps1 -BaseSha HEAD~1 -HeadSha HEAD
 ```
 
 Expected: 当前功能分支含后端路径时失败，防止直接推送它。
@@ -391,7 +391,7 @@ Expected: 全部通过；Windows Runner 再完成 Inno 和安装器静态检查�
 - [ ] **Step 5: 提交**
 
 ```bash
-git add windows-pet-wpf/DesktopPet.Wpf.csproj windows-pet-wpf/DesktopPetSetup.iss .github/workflows/build-windows.yml .github/workflows/verify-release-scope.ps1
+git add windows-pet-wpf/DesktopPet.Wpf.csproj windows-pet-wpf/DesktopPetSetup.iss .github/workflows/build-windows.yml tools/verify-release-scope.ps1
 git commit -m "ci: build scoped Windows worker release"
 ```
 
