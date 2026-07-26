@@ -35,6 +35,52 @@ Describe "installer worker lifecycle contract" {
         $setupText | Should -Match "wx_parser\.exe"
         $setupText | Should -Match "StopProcessTree"
     }
+
+    It "deletes legacy plaintext credentials and decrypt executable during upgrades" {
+        $setupText | Should -Match "(?m)^\[InstallDelete\]\s*$"
+        foreach ($legacyFile in @(
+            '{app}\monitor_config.json',
+            '{app}\wechat_data\monitor_config.json',
+            '{app}\Background\DataSync\monitor_config.json',
+            '{app}\wx_decrypt.exe'
+        )) {
+            $entry = 'Type: files; Name: "' + $legacyFile + '"'
+            $setupText | Should -Match ([regex]::Escape($entry))
+        }
+    }
+}
+
+Describe "production credential source contract" {
+    BeforeAll {
+        $repositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+        $legacyMonitorPath = Join-Path $repositoryRoot "windows\WeChatMonitor.cs"
+        $legacyMonitorText = Get-Content -Raw -LiteralPath $legacyMonitorPath
+    }
+
+    It "does not retain the leaked deployment token in production sources" {
+        $productionRoots = @(
+            (Join-Path $repositoryRoot "windows"),
+            (Join-Path $repositoryRoot "windows-pet-wpf"),
+            (Join-Path $repositoryRoot "windows-background\src"),
+            (Join-Path $repositoryRoot "windows-parser")
+        )
+        $sourceFiles = Get-ChildItem -LiteralPath $productionRoots -File -Recurse |
+            Where-Object {
+                $_.FullName -notmatch '[\\/](?:bin|obj|tests)[\\/]' -and
+                $_.Extension -in @(
+                    ".cs", ".json", ".ps1", ".psm1", ".iss", ".py",
+                    ".xml", ".props", ".targets", ".yml", ".yaml", ".txt")
+            }
+        $matches = @($sourceFiles | Select-String -SimpleMatch "wx_monitor_2026")
+
+        $matches.Count | Should -Be 0
+    }
+
+    It "requires legacy monitor credentials from environment or config" {
+        $legacyMonitorText | Should -Match "WECHAT_MONITOR_SERVER_TOKEN"
+        $legacyMonitorText | Should -Match "monitor_config\.json"
+        $legacyMonitorText | Should -Match "throw new InvalidOperationException"
+    }
 }
 
 Describe "silent worker executable contract" {

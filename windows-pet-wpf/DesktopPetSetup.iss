@@ -36,6 +36,12 @@ Name: "autorun"; Description: "开机自动启动"; GroupDescription: "附加任
 [Files]
 Source: "bin\Release\net8.0-windows\win-x64\publish\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
+[InstallDelete]
+Type: files; Name: "{app}\monitor_config.json"
+Type: files; Name: "{app}\wechat_data\monitor_config.json"
+Type: files; Name: "{app}\Background\DataSync\monitor_config.json"
+Type: files; Name: "{app}\wx_decrypt.exe"
+
 [Icons]
 Name: "{autoprograms}\桌宠"; Filename: "{app}\DesktopPet.Wpf.exe"
 Name: "{autodesktop}\桌宠"; Filename: "{app}\DesktopPet.Wpf.exe"; Tasks: desktopicon

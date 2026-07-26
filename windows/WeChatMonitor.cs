@@ -23,8 +23,10 @@ public class WeChatMonitor
 {
     // ============ 配置区 ============
     private const string DEFAULT_SERVER_URL = "https://wx.junjiee.online/api/messages";
-    private const string DEFAULT_SERVER_TOKEN = "wx_monitor_2026";
     private const int DEFAULT_PUSH_INTERVAL_SECONDS = 60;
+    private const string MONITOR_CONFIG_FILE_NAME = "monitor_config.json";
+    private const string SERVER_URL_ENV_NAME = "WECHAT_MONITOR_SERVER_URL";
+    private const string SERVER_TOKEN_ENV_NAME = "WECHAT_MONITOR_SERVER_TOKEN";
     private const string DECRYPT_EXE_NAME = "wx_decrypt.exe";
     private const int EXISTING_PROCESS_QUICK_TRY_SECONDS = 30;
     private const int EXISTING_PROCESS_KEY_SCAN_TIMEOUT_SECONDS = 180;
@@ -2640,12 +2642,63 @@ public class WeChatMonitor
 
     private static MonitorRuntimeConfig LoadConfig()
     {
-        return new MonitorRuntimeConfig
+        var config = new MonitorRuntimeConfig
         {
             ServerUrl = DEFAULT_SERVER_URL,
-            ServerToken = DEFAULT_SERVER_TOKEN,
             PushIntervalSeconds = DEFAULT_PUSH_INTERVAL_SECONDS
         };
+
+        string configPath = Path.Combine(AppContext.BaseDirectory, MONITOR_CONFIG_FILE_NAME);
+        if (File.Exists(configPath))
+        {
+            try
+            {
+                var fileConfig = JsonSerializer.Deserialize<MonitorRuntimeConfig>(
+                    File.ReadAllText(configPath)) ??
+                    throw new InvalidOperationException("monitor_config.json is empty.");
+                if (!string.IsNullOrWhiteSpace(fileConfig.ServerUrl))
+                    config.ServerUrl = fileConfig.ServerUrl.Trim();
+                config.ServerToken = fileConfig.ServerToken?.Trim() ?? "";
+                if (fileConfig.PushIntervalSeconds > 0)
+                    config.PushIntervalSeconds = fileConfig.PushIntervalSeconds;
+            }
+            catch (Exception exception) when (exception is
+                IOException or UnauthorizedAccessException or JsonException)
+            {
+                throw new InvalidOperationException(
+                    "monitor_config.json could not be loaded.",
+                    exception);
+            }
+        }
+
+        string environmentUrl =
+            Environment.GetEnvironmentVariable(SERVER_URL_ENV_NAME)?.Trim() ?? "";
+        string environmentToken =
+            Environment.GetEnvironmentVariable(SERVER_TOKEN_ENV_NAME)?.Trim() ?? "";
+        if (!string.IsNullOrWhiteSpace(environmentUrl))
+            config.ServerUrl = environmentUrl;
+        if (!string.IsNullOrWhiteSpace(environmentToken))
+            config.ServerToken = environmentToken;
+
+        if (string.IsNullOrWhiteSpace(config.ServerToken))
+        {
+            throw new InvalidOperationException(
+                $"Server credentials are missing. Set {SERVER_TOKEN_ENV_NAME} or provide {MONITOR_CONFIG_FILE_NAME}.");
+        }
+        if (!Uri.TryCreate(config.ServerUrl, UriKind.Absolute, out var endpoint) ||
+            !string.IsNullOrEmpty(endpoint.UserInfo) ||
+            !string.IsNullOrEmpty(endpoint.Query) ||
+            !string.IsNullOrEmpty(endpoint.Fragment) ||
+            !string.Equals(endpoint.AbsolutePath, "/api/messages", StringComparison.Ordinal) ||
+            endpoint.Scheme != Uri.UriSchemeHttps &&
+            !(endpoint.Scheme == Uri.UriSchemeHttp && endpoint.IsLoopback))
+        {
+            throw new InvalidOperationException(
+                "ServerUrl must be a credential-free HTTPS /api/messages endpoint.");
+        }
+
+        config.ServerUrl = endpoint.AbsoluteUri.TrimEnd('/');
+        return config;
     }
 }
 
