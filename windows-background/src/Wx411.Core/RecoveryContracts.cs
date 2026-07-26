@@ -1,6 +1,11 @@
 namespace Wx411.Core;
 
-public sealed record RecoveryProcessSelection(int? Pid, string Name, bool ScanAll = false);
+public sealed record RecoveryProcessSelection(
+    int? Pid,
+    string Name,
+    bool ScanAll = false,
+    int? SessionId = null,
+    string? ExecutablePath = null);
 
 public sealed record RecoveryProgress(int Percent, string Message, string? Log);
 

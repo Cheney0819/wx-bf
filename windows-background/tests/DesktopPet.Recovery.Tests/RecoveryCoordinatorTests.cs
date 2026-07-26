@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using DesktopPet.Background.Contracts;
 using DesktopPet.Recovery.Persistence;
+using Wx411.Core;
 
 namespace DesktopPet.Recovery.Tests;
 
@@ -62,6 +63,9 @@ public sealed class RecoveryCoordinatorTests : IDisposable
         Assert.Equal(
             ["capture", "restart", "capture", "process_start"],
             fixture.Events);
+        Assert.Equal(
+            [RecoveryCaptureTarget.BoundProcess, RecoveryCaptureTarget.RestartedProcess],
+            fixture.Capture.Targets);
     }
 
     [Fact]
@@ -170,6 +174,23 @@ public sealed class RecoveryCoordinatorTests : IDisposable
     }
 
     [Fact]
+    public async Task UnsupportedModuleStopsWithoutConsumingRestartBudget()
+    {
+        await using var fixture = await CreateFixtureAsync(
+            new CaptureObservation(false, false, [], "unsupported_module"));
+
+        var action = await fixture.Coordinator.RunEpochAsync(fixture.Epoch, default);
+
+        Assert.Equal(RecoveryActionKind.WaitPassively, action.Kind);
+        Assert.Equal("unsupported_module", action.Reason);
+        Assert.Equal(1, fixture.Capture.CallCount);
+        Assert.Equal(0, fixture.Process.RestartCount);
+        Assert.Equal(0, (await fixture.Repository.GetEpochAsync(
+            fixture.Epoch.Id,
+            default))!.RestartCount);
+    }
+
+    [Fact]
     public async Task ReadablePartialOutputsPublishImmediatelyWhileRemainingDatabasesStayPending()
     {
         var source = await WriteStagingAsync("partial.sqlite", "partial"u8.ToArray());
@@ -250,6 +271,71 @@ public sealed class RecoveryCoordinatorTests : IDisposable
             1,
             fixture.Telemetry.Events.Count(draft =>
                 draft.EventName == "recovery_handoff_published"));
+    }
+
+    [Fact]
+    public async Task PartialPersistedOutputPublishesThenCapturesUnresolvedDatabases()
+    {
+        var source = await WriteStagingAsync("reused-partial.sqlite", "reused-partial"u8.ToArray());
+        var sha256 = await Sha256Async(source);
+        var reuse = new FakeReuseAdapter(new PersistedDecryptResult(
+            new CaptureObservation(
+                true,
+                false,
+                [source],
+                "persisted_key_partial_failure",
+                [new RecoveredDatabase(
+                    new string('e', 64),
+                    "message/message_partial.db",
+                    source,
+                    sha256)],
+                CandidateDatabaseCount: 2),
+            [new DatabaseSource("message/message_unresolved.db", 1)]));
+        await using var fixture = await CreateFixtureAsync(
+            reuse,
+            Zero(),
+            new CaptureObservation(false, true, [], null));
+
+        var action = await fixture.Coordinator.RunEpochAsync(fixture.Epoch, default);
+
+        Assert.Equal(RecoveryActionKind.WaitPassively, action.Kind);
+        Assert.Equal("pending_capture_available", action.Reason);
+        Assert.Equal(2, fixture.Capture.CallCount);
+        Assert.Equal(1, fixture.Process.RestartCount);
+        Assert.Equal(
+            [RecoveryCaptureTarget.BoundProcess, RecoveryCaptureTarget.RestartedProcess],
+            fixture.Capture.Targets);
+        Assert.Single(Directory.EnumerateFiles(
+            Path.Combine(_root, "handoff", "ready"),
+            "*.json"));
+    }
+
+    [Fact]
+    public async Task IncompletePersistedKeyWithoutOutputKeepsRestartEligible()
+    {
+        var reuse = new FakeReuseAdapter(new PersistedDecryptResult(
+            new CaptureObservation(
+                HasValidatedKey: true,
+                HasPendingCapture: false,
+                OutputPaths: [],
+                FailureCode: "persisted_key_export_failed",
+                CandidateDatabaseCount: 1),
+            [new DatabaseSource("message/message_unresolved.db", 1)]));
+        await using var fixture = await CreateFixtureAsync(
+            reuse,
+            Zero(),
+            new CaptureObservation(false, true, [], null));
+
+        var action = await fixture.Coordinator.RunEpochAsync(fixture.Epoch, default);
+
+        Assert.Equal(RecoveryActionKind.WaitPassively, action.Kind);
+        Assert.Equal("pending_capture_available", action.Reason);
+        Assert.Equal(2, fixture.Capture.CallCount);
+        Assert.Equal(1, fixture.Process.RestartCount);
+        Assert.Equal(
+            [RecoveryCaptureTarget.BoundProcess, RecoveryCaptureTarget.RestartedProcess],
+            fixture.Capture.Targets);
+        Assert.False(Directory.Exists(Path.Combine(_root, "handoff", "ready")));
     }
 
     [Fact]
@@ -484,6 +570,8 @@ public sealed class RecoveryCoordinatorTests : IDisposable
 
         public int CallCount { get; private set; }
 
+        public List<RecoveryCaptureTarget> Targets { get; } = [];
+
         public Exception? Exception { get; set; }
 
         public int? BlockCallNumber { get; set; }
@@ -493,9 +581,16 @@ public sealed class RecoveryCoordinatorTests : IDisposable
 
         public Task<CaptureObservation> CaptureAsync(
             RecoveryEpoch epoch,
+            CancellationToken cancellationToken) =>
+            CaptureAsync(epoch, RecoveryCaptureTarget.BoundProcess, cancellationToken);
+
+        public Task<CaptureObservation> CaptureAsync(
+            RecoveryEpoch epoch,
+            RecoveryCaptureTarget target,
             CancellationToken cancellationToken)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            Targets.Add(target);
             CallCount++;
             events.Add("capture");
             if (Exception is not null) throw Exception;
@@ -551,18 +646,26 @@ public sealed class RecoveryCoordinatorTests : IDisposable
         }
     }
 
-    private sealed class FakeReuseAdapter(CaptureObservation observation)
-        : IRecoveryKeyReuseAdapter
+    private sealed class FakeReuseAdapter : IRecoveryKeyReuseAdapter
     {
+        private readonly PersistedDecryptResult _result;
+
+        public FakeReuseAdapter(PersistedDecryptResult result) => _result = result;
+
+        public FakeReuseAdapter(CaptureObservation observation)
+            : this(new PersistedDecryptResult(observation, []))
+        {
+        }
+
         public int CallCount { get; private set; }
 
-        public Task<CaptureObservation> TryDecryptAsync(
+        public Task<PersistedDecryptResult> TryDecryptAsync(
             RecoveryEpoch epoch,
             CancellationToken cancellationToken)
         {
             cancellationToken.ThrowIfCancellationRequested();
             CallCount++;
-            return Task.FromResult(observation);
+            return Task.FromResult(_result);
         }
     }
 

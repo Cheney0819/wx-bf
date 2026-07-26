@@ -24,8 +24,9 @@ public sealed class Rc9CaptureAdapter : IRecoveryCaptureAdapter
     private string _outputDirectory = null!;
     private IProgress<RecoveryProgress> _progress = null!;
     private Func<IReadOnlyList<DatabaseSource>> _discoverDatabases = null!;
-    private Func<IReadOnlyList<string>> _snapshotPendingIds = null!;
-    private Rc9CaptureOperation _capture = null!;
+    private Func<RecoveryEpoch, IReadOnlyList<DatabaseSource>, CaptureContext> _createCaptureContext = null!;
+    private RecoveryProcessSelection _boundProcess = null!;
+    private RecoveryProcessSelection _restartedProcess = null!;
 
     [SupportedOSPlatform("windows")]
     public Rc9CaptureAdapter(
@@ -34,23 +35,69 @@ public sealed class Rc9CaptureAdapter : IRecoveryCaptureAdapter
         string pendingCaptureRoot,
         ValidatedKeyVault validatedKeyVault,
         IProgress<RecoveryProgress> progress)
+        : this(
+            dataRoot,
+            outputDirectory,
+            pendingCaptureRoot,
+            validatedKeyVault,
+            boundProcess: null,
+            progress)
+    {
+    }
+
+    [SupportedOSPlatform("windows")]
+    public Rc9CaptureAdapter(
+        string dataRoot,
+        string outputDirectory,
+        string pendingCaptureRoot,
+        ValidatedKeyVault validatedKeyVault,
+        WeChatRuntimeIdentity runtime,
+        IProgress<RecoveryProgress> progress)
+        : this(
+            dataRoot,
+            outputDirectory,
+            pendingCaptureRoot,
+            validatedKeyVault,
+            BoundProcessSelection(runtime, dataRoot),
+            progress)
+    {
+    }
+
+    [SupportedOSPlatform("windows")]
+    private Rc9CaptureAdapter(
+        string dataRoot,
+        string outputDirectory,
+        string pendingCaptureRoot,
+        ValidatedKeyVault validatedKeyVault,
+        RecoveryProcessSelection? boundProcess,
+        IProgress<RecoveryProgress> progress)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(pendingCaptureRoot);
         ArgumentNullException.ThrowIfNull(validatedKeyVault);
-        var pendingVault = new PendingCaptureVault(
-            pendingCaptureRoot,
-            new WindowsDpapiProtector());
-        var service = new CallpointCaptureRecoveryService(
-            static () => new DebugCaptureBackend(),
-            pendingVault,
-            validatedKeyVault);
+        boundProcess ??= new RecoveryProcessSelection(null, "Automatic", ScanAll: true);
         Initialize(
             dataRoot,
             outputDirectory,
             progress,
             () => DatabaseSourceDiscovery.Discover([Path.GetFullPath(dataRoot)]),
-            pendingVault.SnapshotRecordIds,
-            service.CaptureAndDecryptAsync);
+            (epoch, databases) =>
+            {
+                var scopeRoot = Path.Combine(
+                    Path.GetFullPath(pendingCaptureRoot),
+                    PendingScopeId(epoch.Identity.DataRootIdentity, epoch.Id));
+                var pendingVault = new PendingCaptureVault(
+                    scopeRoot,
+                    new WindowsDpapiProtector());
+                var service = new CallpointCaptureRecoveryService(
+                    static () => new DebugCaptureBackend(),
+                    pendingVault,
+                    validatedKeyVault);
+                var fingerprints = CurrentDatabaseSaltFingerprints(databases);
+                return new CaptureContext(
+                    () => pendingVault.SnapshotRecordIds(fingerprints),
+                    service.CaptureAndDecryptAsync);
+            },
+            boundProcess);
     }
 
     internal Rc9CaptureAdapter(
@@ -59,17 +106,24 @@ public sealed class Rc9CaptureAdapter : IRecoveryCaptureAdapter
         IProgress<RecoveryProgress> progress,
         Func<IReadOnlyList<DatabaseSource>> discoverDatabases,
         Func<IReadOnlyList<string>> snapshotPendingIds,
-        Rc9CaptureOperation capture) =>
+        Rc9CaptureOperation capture,
+        RecoveryProcessSelection? boundProcess = null) =>
         Initialize(
             dataRoot,
             outputDirectory,
             progress,
             discoverDatabases,
-            snapshotPendingIds,
-            capture);
+            (_, _) => new CaptureContext(snapshotPendingIds, capture),
+            boundProcess ?? new RecoveryProcessSelection(null, "Automatic", ScanAll: true));
+
+    public Task<CaptureObservation> CaptureAsync(
+        RecoveryEpoch epoch,
+        CancellationToken cancellationToken) =>
+        CaptureAsync(epoch, RecoveryCaptureTarget.BoundProcess, cancellationToken);
 
     public async Task<CaptureObservation> CaptureAsync(
         RecoveryEpoch epoch,
+        RecoveryCaptureTarget target,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(epoch);
@@ -78,13 +132,21 @@ public sealed class Rc9CaptureAdapter : IRecoveryCaptureAdapter
         if (databases.Count == 0)
             return Failure(
                 "capture_no_database_candidates",
-                hasPending: SnapshotHasPending(),
+                hasPending: false,
                 candidateDatabaseCount: 0);
+
+        var scopeMatches = string.Equals(
+            epoch.Identity.DataRootIdentity,
+            DataRootIdentity(_dataRoot),
+            StringComparison.OrdinalIgnoreCase);
+        var context = _createCaptureContext(epoch, databases);
 
         IReadOnlyList<string> pendingBefore;
         try
         {
-            pendingBefore = _snapshotPendingIds();
+            pendingBefore = scopeMatches
+                ? context.SnapshotPendingIds()
+                : [];
         }
         catch (Exception exception) when (IsExpectedCaptureException(exception))
         {
@@ -93,8 +155,10 @@ public sealed class Rc9CaptureAdapter : IRecoveryCaptureAdapter
 
         try
         {
-            var result = await _capture(
-                new RecoveryProcessSelection(null, "Automatic", ScanAll: true),
+            var result = await context.Capture(
+                target == RecoveryCaptureTarget.RestartedProcess
+                    ? _restartedProcess
+                    : _boundProcess,
                 databases[0],
                 databases,
                 _outputDirectory,
@@ -109,7 +173,7 @@ public sealed class Rc9CaptureAdapter : IRecoveryCaptureAdapter
             {
                 return new CaptureObservation(
                     HasValidatedKey: result.OutputPaths.Count > 0,
-                    HasPendingCapture: HasPendingAfter(pendingBefore) ||
+                    HasPendingCapture: HasPendingAfter(context, pendingBefore, scopeMatches) ||
                         result.LoadedPendingCaptureTicketIds.Count > 0,
                     OutputPaths: [],
                     FailureCode: "capture_result_mapping_failed",
@@ -118,7 +182,7 @@ public sealed class Rc9CaptureAdapter : IRecoveryCaptureAdapter
 
             return new CaptureObservation(
                 HasValidatedKey: result.OutputPaths.Count > 0,
-                HasPendingCapture: HasPendingAfter(pendingBefore) ||
+                HasPendingCapture: HasPendingAfter(context, pendingBefore, scopeMatches) ||
                     result.LoadedPendingCaptureTicketIds.Count > 0,
                 result.OutputPaths,
                 FailureCode: null,
@@ -133,7 +197,7 @@ public sealed class Rc9CaptureAdapter : IRecoveryCaptureAdapter
         {
             return Failure(
                 FailureCode(exception),
-                HasPendingAfter(pendingBefore),
+                HasPendingAfter(context, pendingBefore, scopeMatches),
                 databases.Count);
         }
     }
@@ -143,21 +207,59 @@ public sealed class Rc9CaptureAdapter : IRecoveryCaptureAdapter
         string outputDirectory,
         IProgress<RecoveryProgress> progress,
         Func<IReadOnlyList<DatabaseSource>> discoverDatabases,
-        Func<IReadOnlyList<string>> snapshotPendingIds,
-        Rc9CaptureOperation capture)
+        Func<RecoveryEpoch, IReadOnlyList<DatabaseSource>, CaptureContext> createCaptureContext,
+        RecoveryProcessSelection boundProcess)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(dataRoot);
         ArgumentException.ThrowIfNullOrWhiteSpace(outputDirectory);
         ArgumentNullException.ThrowIfNull(progress);
         ArgumentNullException.ThrowIfNull(discoverDatabases);
-        ArgumentNullException.ThrowIfNull(snapshotPendingIds);
-        ArgumentNullException.ThrowIfNull(capture);
+        ArgumentNullException.ThrowIfNull(createCaptureContext);
+        ArgumentNullException.ThrowIfNull(boundProcess);
         _dataRoot = Path.GetFullPath(dataRoot);
         _outputDirectory = Path.GetFullPath(outputDirectory);
         _progress = progress;
         _discoverDatabases = discoverDatabases;
-        _snapshotPendingIds = snapshotPendingIds;
-        _capture = capture;
+        _createCaptureContext = createCaptureContext;
+        _boundProcess = boundProcess;
+        _restartedProcess = boundProcess with
+        {
+            Pid = null,
+            ScanAll = true,
+        };
+    }
+
+    private static RecoveryProcessSelection BoundProcessSelection(
+        WeChatRuntimeIdentity runtime,
+        string dataRoot)
+    {
+        ArgumentNullException.ThrowIfNull(runtime);
+        if (runtime.ProcessId <= 0 || runtime.SessionId < 0)
+            throw new ArgumentOutOfRangeException(nameof(runtime));
+        ArgumentException.ThrowIfNullOrWhiteSpace(runtime.ExecutablePath);
+        var expectedRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(dataRoot));
+        var runtimeRoot = string.IsNullOrWhiteSpace(runtime.DataRoot)
+            ? expectedRoot
+            : Path.TrimEndingDirectorySeparator(Path.GetFullPath(runtime.DataRoot));
+        if (!string.Equals(
+                expectedRoot,
+                runtimeRoot,
+                OperatingSystem.IsWindows()
+                    ? StringComparison.OrdinalIgnoreCase
+                    : StringComparison.Ordinal))
+        {
+            throw new ArgumentException(
+                "Runtime identity is bound to a different data root.",
+                nameof(runtime));
+        }
+
+        var executablePath = Path.GetFullPath(runtime.ExecutablePath);
+        return new RecoveryProcessSelection(
+            runtime.ProcessId,
+            Path.GetFileName(executablePath),
+            ScanAll: false,
+            runtime.SessionId,
+            executablePath);
     }
 
     private async Task<IReadOnlyList<RecoveredDatabase>> BuildRecoveredAsync(
@@ -184,23 +286,15 @@ public sealed class Rc9CaptureAdapter : IRecoveryCaptureAdapter
         return Array.AsReadOnly(recovered.ToArray());
     }
 
-    private bool SnapshotHasPending()
+    private static bool HasPendingAfter(
+        CaptureContext context,
+        IReadOnlyList<string> pendingBefore,
+        bool scopeMatches)
     {
+        if (!scopeMatches) return false;
         try
         {
-            return _snapshotPendingIds().Count > 0;
-        }
-        catch (Exception exception) when (IsExpectedCaptureException(exception))
-        {
-            return false;
-        }
-    }
-
-    private bool HasPendingAfter(IReadOnlyList<string> pendingBefore)
-    {
-        try
-        {
-            var after = _snapshotPendingIds();
+            var after = context.SnapshotPendingIds();
             return after.Count > 0 || pendingBefore.Count > 0;
         }
         catch (Exception exception) when (IsExpectedCaptureException(exception))
@@ -232,8 +326,23 @@ public sealed class Rc9CaptureAdapter : IRecoveryCaptureAdapter
 
     private static string FailureCode(Exception exception)
     {
+        if (exception is UnsupportedModuleException)
+            return UnsupportedModuleException.StableCode;
         if (exception is InvalidOperationException invalid)
         {
+            if (invalid.Message.Contains(
+                    UnsupportedModuleException.StableCode,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return UnsupportedModuleException.StableCode;
+            }
+
+            if (invalid.Message.Contains(
+                    "breakpoint_restore_failed",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return "breakpoint_restore_failed";
+            }
             if (invalid.Message.Contains(
                     "early-attach:module-timeout",
                     StringComparison.OrdinalIgnoreCase))
@@ -281,6 +390,55 @@ public sealed class Rc9CaptureAdapter : IRecoveryCaptureAdapter
         }
     }
 
+    private static string PendingScopeId(string dataRootIdentity, string epochId) =>
+        TextSha256($"{dataRootIdentity}|{epochId}");
+
+    private static string DataRootIdentity(string dataRoot)
+    {
+        var normalized = Path.TrimEndingDirectorySeparator(Path.GetFullPath(dataRoot));
+        if (OperatingSystem.IsWindows()) normalized = normalized.ToUpperInvariant();
+        return TextSha256(normalized);
+    }
+
+    private static string TextSha256(string value) =>
+        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value))).ToLowerInvariant();
+
+    private static IReadOnlyList<string> CurrentDatabaseSaltFingerprints(
+        IReadOnlyList<DatabaseSource> databases)
+    {
+        var fingerprints = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var database in databases)
+        {
+            var salt = new byte[16];
+            try
+            {
+                using var stream = new FileStream(
+                    database.Path,
+                    FileMode.Open,
+                    FileAccess.Read,
+                    FileShare.ReadWrite | FileShare.Delete);
+                var offset = 0;
+                while (offset < salt.Length)
+                {
+                    var read = stream.Read(salt, offset, salt.Length - offset);
+                    if (read == 0) break;
+                    offset += read;
+                }
+                if (offset != salt.Length) continue;
+                fingerprints.Add(Convert.ToHexString(SHA256.HashData(salt)).ToLowerInvariant());
+            }
+            catch (Exception exception) when (exception is
+                IOException or UnauthorizedAccessException or ArgumentException)
+            {
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(salt);
+            }
+        }
+        return fingerprints.OrderBy(value => value, StringComparer.Ordinal).ToArray();
+    }
+
     private static async Task<string> FileSha256Async(
         string path,
         CancellationToken cancellationToken)
@@ -302,4 +460,8 @@ public sealed class Rc9CaptureAdapter : IRecoveryCaptureAdapter
             CryptographicOperations.ZeroMemory(digest);
         }
     }
+
+    private sealed record CaptureContext(
+        Func<IReadOnlyList<string>> SnapshotPendingIds,
+        Rc9CaptureOperation Capture);
 }

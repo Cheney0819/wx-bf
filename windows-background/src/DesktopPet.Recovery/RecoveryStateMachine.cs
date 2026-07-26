@@ -33,6 +33,14 @@ public sealed class RecoveryStateMachine
             throw new InvalidOperationException("Recovery epoch does not exist.");
         if (!epoch.IsActive) return RecoveryAction.Wait("epoch_inactive");
 
+        if (string.Equals(
+                observation.FailureCode,
+                "unsupported_module",
+                StringComparison.Ordinal))
+        {
+            return RecoveryAction.Wait("unsupported_module");
+        }
+
         // A readable output is already a validated handoff unit. Publish it now,
         // while the remaining databases continue through later reconciliation.
         if (observation.OutputPaths.Count > 0)

@@ -10,7 +10,7 @@ public sealed class WeChatDataRootLocatorTests : IDisposable
         Guid.NewGuid().ToString("N"));
 
     [Fact]
-    public async Task SelectsMostRecentlyWrittenAccountWithoutFixedDatabaseCount()
+    public async Task MultipleUnboundAccountsReturnAmbiguousResult()
     {
         var container = Path.Combine(_root, "Documents", "xwechat_files");
         var accountWithEighteen = CreateAccount(container, "account-a", 18);
@@ -22,11 +22,67 @@ public sealed class WeChatDataRootLocatorTests : IDisposable
 
         var result = await locator.LocateAsync(default);
 
-        Assert.True(result.Found);
-        Assert.Equal(Path.GetFullPath(accountWithSix), result.DataRoot);
+        Assert.False(result.Found);
+        Assert.Null(result.DataRoot);
         Assert.Equal(2, result.CandidateCount);
-        Assert.Equal(6, result.DatabaseCount);
-        Assert.Equal("data_root_discovered", result.Code);
+        Assert.Equal(0, result.DatabaseCount);
+        Assert.Equal("ambiguous_data_root", result.Code);
+    }
+
+    [Fact]
+    public async Task IniRedirectedRootIsDiscoveredBeforeHeuristicSearch()
+    {
+        var appData = Path.Combine(_root, "appdata");
+        var redirected = CreateAccount(
+            Path.Combine(_root, "redirected-container"), "account", 4);
+        var config = Path.Combine(appData, "Tencent", "xwechat", "config");
+        Directory.CreateDirectory(config);
+        await File.WriteAllTextAsync(Path.Combine(config, "account.ini"), redirected);
+        var unrelatedSearchRoot = Path.Combine(_root, "empty-search-root");
+        Directory.CreateDirectory(unrelatedSearchRoot);
+
+        var previous = Environment.GetEnvironmentVariable("APPDATA");
+        Environment.SetEnvironmentVariable("APPDATA", appData);
+        try
+        {
+            var locator = new WeChatDataRootLocator([unrelatedSearchRoot], []);
+            var result = await locator.LocateAsync(default);
+
+            Assert.True(result.Found);
+            Assert.Equal(Path.GetFullPath(redirected), result.DataRoot);
+            Assert.Equal("data_root_discovered", result.Code);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("APPDATA", previous);
+        }
+    }
+
+    [Fact]
+    public async Task ActiveProcessDatabaseHandleSelectsOneAccount()
+    {
+        var container = Path.Combine(_root, "xwechat_files");
+        _ = CreateAccount(container, "account-a", 3);
+        var activeAccount = CreateAccount(container, "account-b", 3);
+        var locator = new WeChatDataRootLocator(
+            [_root],
+            [],
+            (pid, databasePath) =>
+                pid == 42 && databasePath.StartsWith(
+                    Path.GetFullPath(activeAccount) + Path.DirectorySeparatorChar,
+                    StringComparison.OrdinalIgnoreCase));
+        var runtime = new WeChatRuntimeIdentity(
+            ProcessId: 42,
+            SessionId: 7,
+            ExecutablePath: typeof(WeChatDataRootLocatorTests).Assembly.Location,
+            ExecutableIdentity: "fixture-executable");
+
+        var result = await locator.LocateAsync(runtime, default);
+
+        Assert.True(result.Found);
+        Assert.Equal(Path.GetFullPath(activeAccount), result.DataRoot);
+        Assert.Equal("data_root_bound_to_process", result.Code);
+        Assert.Equal(runtime, result.RuntimeIdentity);
     }
 
     [Theory]

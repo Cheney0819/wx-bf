@@ -27,7 +27,7 @@ public sealed class PersistedKeyRecoveryAdapter : IRecoveryKeyReuseAdapter
         _progress = progress;
     }
 
-    public Task<CaptureObservation> TryDecryptAsync(
+    public Task<PersistedDecryptResult> TryDecryptAsync(
         RecoveryEpoch epoch,
         CancellationToken cancellationToken)
     {

@@ -8,7 +8,14 @@ public sealed record ModuleIdentityValidation(
     string ActualVersion,
     string ActualSha256,
     ModuleCallpointProfile? Profile,
-    string? Error);
+    string? Error)
+{
+    public bool IsUnsupported =>
+        !IsValid &&
+        Profile is null &&
+        !string.IsNullOrWhiteSpace(ActualVersion) &&
+        !string.IsNullOrWhiteSpace(ActualSha256);
+}
 
 public static class PeCallpointLocator
 {
@@ -55,9 +62,10 @@ public static class PeCallpointLocator
 
         var knownVersion = CallpointProfiles.Supported.FirstOrDefault(candidate =>
             string.Equals(candidate.ModuleVersion, actualVersion, StringComparison.Ordinal));
-        var error = knownVersion is null
+        var detail = knownVersion is null
             ? $"module version mismatch: unsupported {actualVersion}"
             : $"module SHA-256 mismatch for {actualVersion}: expected {knownVersion.ModuleSha256}, actual {actualSha256}";
+        var error = $"{UnsupportedModuleException.StableCode}: {detail}";
         return new(false, actualVersion, actualSha256, null, error);
     }
 

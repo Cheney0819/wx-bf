@@ -73,6 +73,22 @@ public sealed class RecoveryStateMachineTests : IDisposable
     }
 
     [Fact]
+    public async Task UnsupportedModuleDoesNotConsumeRestartBudget()
+    {
+        await using var fixture = await CreateFixtureAsync(restarts: 0);
+
+        var action = await fixture.Machine.ObserveAsync(
+            fixture.Epoch.Id,
+            new CaptureObservation(false, false, [], "unsupported_module"),
+            default);
+
+        Assert.Equal(RecoveryActionKind.WaitPassively, action.Kind);
+        Assert.Equal("unsupported_module", action.Reason);
+        Assert.Equal(0, (await fixture.Repository.GetEpochAsync(
+            fixture.Epoch.Id, default))!.RestartCount);
+    }
+
+    [Fact]
     public async Task BeginAllowsPassiveCaptureWithoutRestoringRestartBudget()
     {
         await using var fixture = await CreateFixtureAsync(restarts: 0);

@@ -1,11 +1,24 @@
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using DesktopPet.Background.Contracts;
 using DesktopPet.Recovery.Persistence;
 using DesktopPet.Recovery.Security;
 using Wx411.Core;
 
 namespace DesktopPet.Recovery;
+
+public sealed record PersistedDecryptResult(
+    CaptureObservation Observation,
+    IReadOnlyList<DatabaseSource> UnresolvedRequiredDatabases)
+{
+    public bool HasValidatedKey => Observation.HasValidatedKey;
+    public bool HasPendingCapture => Observation.HasPendingCapture;
+    public IReadOnlyList<string> OutputPaths => Observation.OutputPaths;
+    public string? FailureCode => Observation.FailureCode;
+    public IReadOnlyList<RecoveredDatabase> Databases => Observation.Databases;
+    public int CandidateDatabaseCount => Observation.CandidateDatabaseCount;
+}
 
 public sealed class PersistedKeyDecryptor
 {
@@ -23,7 +36,7 @@ public sealed class PersistedKeyDecryptor
         _vault = vault;
     }
 
-    public async Task<CaptureObservation> TryDecryptAsync(
+    public async Task<PersistedDecryptResult> TryDecryptAsync(
         RecoveryEpoch epoch,
         string dataRoot,
         IReadOnlyList<DatabaseSource> databases,
@@ -41,12 +54,14 @@ public sealed class PersistedKeyDecryptor
         var keyIds = _vault.ListIds();
         var outputs = new List<string>();
         var recovered = new List<RecoveredDatabase>();
+        var unresolved = new List<DatabaseSource>();
         var hasValidatedKey = false;
         var failureCount = 0;
 
         foreach (var source in databases)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            var resolvedThisDatabase = false;
             try
             {
                 var fullPath = Path.GetFullPath(source.Path);
@@ -77,6 +92,7 @@ public sealed class PersistedKeyDecryptor
                         relativePath,
                         existing.OutputPath,
                         await FileSha256Async(existing.OutputPath, cancellationToken)));
+                    resolvedThisDatabase = true;
                     continue;
                 }
 
@@ -84,52 +100,69 @@ public sealed class PersistedKeyDecryptor
                 foreach (var keyId in keyIds)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
-                    using var stored = _vault.Load(keyId);
-                    var match = CipherProfileProbe.FindMatch(
-                        descriptor,
-                        stored.Key,
-                        cancellationToken);
-                    if (match is null) continue;
+                    ValidatedKeyRecord? stored = null;
+                    try
+                    {
+                        stored = _vault.Load(keyId);
+                    }
+                    catch (Exception exception) when (exception is
+                        IOException or UnauthorizedAccessException or
+                        ArgumentException or CryptographicException or
+                        InvalidDataException or JsonException)
+                    {
+                        _vault.Quarantine(keyId);
+                        continue;
+                    }
 
-                    hasValidatedKey = true;
-                    matchedThisDatabase = true;
-                    var exportKey = stored.Key.ToArray();
-                    var result = await _exporter.ExportAsync(
-                        new DatabaseExportRequest(
-                            fullPath,
-                            descriptor.Generation,
-                            exportKey,
-                            match.Profile,
-                            outputDirectory),
-                        progress,
-                        cancellationToken);
-                    if (result.Status == DatabaseExportStatus.Completed && result.OutputPath is not null)
+                    using (stored)
                     {
-                        outputs.Add(result.OutputPath);
-                        var outputSha256 = await FileSha256Async(
-                            result.OutputPath,
+                        var match = CipherProfileProbe.FindMatch(
+                            descriptor,
+                            stored.Key,
                             cancellationToken);
-                        recovered.Add(new RecoveredDatabase(
-                            generationId,
-                            relativePath,
-                            result.OutputPath,
-                            outputSha256));
-                        await _repository.RecordGenerationAsync(
-                            new DatabaseGenerationState(
-                                generationId,
-                                epoch.Id,
-                                relativePath,
-                                ContentFingerprint(descriptor.Generation),
-                                "completed",
+                        if (match is null) continue;
+
+                        hasValidatedKey = true;
+                        matchedThisDatabase = true;
+                        var exportKey = stored.Key.ToArray();
+                        var result = await _exporter.ExportAsync(
+                            new DatabaseExportRequest(
+                                fullPath,
+                                descriptor.Generation,
+                                exportKey,
+                                match.Profile,
+                                outputDirectory),
+                            progress,
+                            cancellationToken);
+                        if (result.Status == DatabaseExportStatus.Completed && result.OutputPath is not null)
+                        {
+                            outputs.Add(result.OutputPath);
+                            var outputSha256 = await FileSha256Async(
                                 result.OutputPath,
-                                DateTimeOffset.UtcNow),
-                            cancellationToken);
+                                cancellationToken);
+                            recovered.Add(new RecoveredDatabase(
+                                generationId,
+                                relativePath,
+                                result.OutputPath,
+                                outputSha256));
+                            await _repository.RecordGenerationAsync(
+                                new DatabaseGenerationState(
+                                    generationId,
+                                    epoch.Id,
+                                    relativePath,
+                                    ContentFingerprint(descriptor.Generation),
+                                    "completed",
+                                    result.OutputPath,
+                                    DateTimeOffset.UtcNow),
+                                cancellationToken);
+                            resolvedThisDatabase = true;
+                        }
+                        else
+                        {
+                            failureCount++;
+                        }
+                        break;
                     }
-                    else
-                    {
-                        failureCount++;
-                    }
-                    break;
                 }
 
                 if (!matchedThisDatabase && keyIds.Count > 0)
@@ -146,6 +179,10 @@ public sealed class PersistedKeyDecryptor
             {
                 failureCount++;
             }
+            finally
+            {
+                if (!resolvedThisDatabase) unresolved.Add(source);
+            }
         }
 
         var distinctOutputs = outputs
@@ -158,15 +195,17 @@ public sealed class PersistedKeyDecryptor
                 : !hasValidatedKey
                     ? "persisted_key_no_match"
                     : null;
-        return new CaptureObservation(
-            hasValidatedKey,
-            HasPendingCapture: false,
-            Array.AsReadOnly(distinctOutputs),
-            failureCode,
-            Array.AsReadOnly(recovered
-                .DistinctBy(item => item.GenerationId, StringComparer.Ordinal)
-                .ToArray()),
-            databases.Count);
+        return new PersistedDecryptResult(
+            new CaptureObservation(
+                hasValidatedKey,
+                HasPendingCapture: false,
+                Array.AsReadOnly(distinctOutputs),
+                failureCode,
+                Array.AsReadOnly(recovered
+                    .DistinctBy(item => item.GenerationId, StringComparer.Ordinal)
+                    .ToArray()),
+                databases.Count),
+            Array.AsReadOnly(unresolved.ToArray()));
     }
 
     private static bool IsParentTraversal(string relativePath) =>
@@ -192,7 +231,7 @@ public sealed class PersistedKeyDecryptor
     }
 
     private static string ContentFingerprint(DatabaseFileGeneration generation) =>
-        $"{generation.FileIdentity}|{generation.Length}|{generation.LastWriteTimeUtc.Ticks}";
+        $"{generation.FileIdentity}|{generation.Length}|{generation.LastWriteTimeUtc.Ticks}|{generation.WalFingerprint}|{generation.SharedMemoryFingerprint}";
 
     private static async Task<string> FileSha256Async(
         string path,

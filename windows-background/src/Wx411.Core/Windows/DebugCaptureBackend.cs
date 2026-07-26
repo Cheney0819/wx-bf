@@ -10,6 +10,7 @@ public sealed class DebugCaptureBackend : ICallpointCaptureBackend, IDisposable
     private const int MaxKeyBytes = 4096;
     private const int AttachRetryCount = 20;
     private const int AttachRetryDelayMs = 250;
+    private static readonly TimeSpan BreakpointRestoreTimeout = TimeSpan.FromSeconds(5);
     private const uint TrapFlag = 0x100;
     private IntPtr _hProcess = IntPtr.Zero;
     private IntPtr _moduleBase = IntPtr.Zero;
@@ -22,6 +23,7 @@ public sealed class DebugCaptureBackend : ICallpointCaptureBackend, IDisposable
     private readonly BreakpointRestorer _breakpointRestorer = new(new NativeBreakpointRestoreOperations());
     private int _attachedPid;
     private IProgress<CallpointCaptureStatus>? _cleanupProgress;
+    private CancellationToken _workerCancellationToken;
 
     public static bool IsSupported =>
         RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
@@ -213,6 +215,7 @@ public sealed class DebugCaptureBackend : ICallpointCaptureBackend, IDisposable
         CancellationToken ct)
     {
         var primaryCallpoint = callpoints[0];
+        _workerCancellationToken = ct;
         var attached = false;
         var earlyAttach = dllPath is null;
         var moduleClock = Stopwatch.StartNew();
@@ -421,15 +424,26 @@ public sealed class DebugCaptureBackend : ICallpointCaptureBackend, IDisposable
         }
         finally
         {
-            var restoreStatus = RestoreBreakpoints();
+            BreakpointRestoreStatus restoreStatus;
+            try
+            {
+                restoreStatus = RestoreBreakpoints();
+            }
+            finally
+            {
+                CloseProcessHandle();
+                _moduleBase = IntPtr.Zero;
+                _currentBpAddress = IntPtr.Zero;
+                _pendingRearms.Clear();
+                _attachedPid = 0;
+                _cleanupProgress = null;
+                _workerCancellationToken = default;
+            }
+
             if (attached && restoreStatus is BreakpointRestoreStatus.Restored or BreakpointRestoreStatus.ProcessExited)
                 NativeMethods.DebugActiveProcessStop((uint)pid);
-            CloseProcessHandle();
-            _moduleBase = IntPtr.Zero;
-            _currentBpAddress = IntPtr.Zero;
-            _pendingRearms.Clear();
-            _attachedPid = 0;
-            _cleanupProgress = null;
+            if (restoreStatus == BreakpointRestoreStatus.Fatal)
+                throw new BreakpointRestoreException(pid);
         }
     }
 
@@ -551,7 +565,10 @@ public sealed class DebugCaptureBackend : ICallpointCaptureBackend, IDisposable
                 NativeMethods.CONTEXT_CONTROL | NativeMethods.CONTEXT_INTEGER);
             if (!NativeMethods.GetThreadContext(hThread, contextBuffer.Pointer))
             {
-                RestoreBreakpoint(breakpoint);
+                if (RestoreBreakpoint(breakpoint) == BreakpointRestoreStatus.Fatal)
+                    return new BreakpointHitResult(
+                        Fail(callpoint, pid, "breakpoint_restore_failed"),
+                        true);
                 return new BreakpointHitResult(Fail(callpoint, pid, LastError("GetThreadContext")), true);
             }
 
@@ -614,7 +631,13 @@ public sealed class DebugCaptureBackend : ICallpointCaptureBackend, IDisposable
                 }
             }
 
-            RestoreBreakpoint(breakpoint);
+            if (RestoreBreakpoint(breakpoint) == BreakpointRestoreStatus.Fatal)
+            {
+                result?.Dispose();
+                return new BreakpointHitResult(
+                    Fail(callpoint, pid, "breakpoint_restore_failed"),
+                    true);
+            }
             ctx.Rip = unchecked((ulong)breakpoint.Address.ToInt64());
             if (keepListening)
             {
@@ -754,7 +777,11 @@ public sealed class DebugCaptureBackend : ICallpointCaptureBackend, IDisposable
             if (SetBreakpoint(callpoint, out error))
                 continue;
 
-            RestoreBreakpoints();
+            if (RestoreBreakpoints() == BreakpointRestoreStatus.Fatal)
+            {
+                error = "breakpoint_restore_failed";
+                return false;
+            }
             return false;
         }
 
@@ -841,21 +868,28 @@ public sealed class DebugCaptureBackend : ICallpointCaptureBackend, IDisposable
     private BreakpointRestoreStatus RestoreBreakpoints()
     {
         var status = BreakpointRestoreStatus.Restored;
+        var clock = Stopwatch.StartNew();
         var breakpoints = _breakpoints.ToArray();
         for (var index = breakpoints.Length - 1; index >= 0; index--)
         {
             var breakpoint = breakpoints[index];
-            var current = RestoreBreakpointWithStatus(breakpoint);
-            if (current == BreakpointRestoreStatus.ProcessExited)
+            var remaining = BreakpointRestoreTimeout - clock.Elapsed;
+            if (remaining <= TimeSpan.Zero) return BreakpointRestoreStatus.Fatal;
+            var current = RestoreBreakpointWithStatus(breakpoint, remaining);
+            if (current == BreakpointRestoreStatus.Fatal) status = current;
+            else if (current == BreakpointRestoreStatus.ProcessExited &&
+                     status == BreakpointRestoreStatus.Restored)
                 status = current;
         }
         return status;
     }
 
-    private void RestoreBreakpoint(ActiveBreakpoint breakpoint) =>
-        _ = RestoreBreakpointWithStatus(breakpoint);
+    private BreakpointRestoreStatus RestoreBreakpoint(ActiveBreakpoint breakpoint) =>
+        RestoreBreakpointWithStatus(breakpoint, BreakpointRestoreTimeout);
 
-    private BreakpointRestoreStatus RestoreBreakpointWithStatus(ActiveBreakpoint breakpoint)
+    private BreakpointRestoreStatus RestoreBreakpointWithStatus(
+        ActiveBreakpoint breakpoint,
+        TimeSpan timeout)
     {
         if (_hProcess == IntPtr.Zero)
             return BreakpointRestoreStatus.ProcessExited;
@@ -868,7 +902,8 @@ public sealed class DebugCaptureBackend : ICallpointCaptureBackend, IDisposable
             failure => _cleanupProgress?.Report(new CallpointCaptureStatus(
                 $"正在恢复 PID {failure.Pid} 的观察点…",
                 $"PID {failure.Pid}: 地址 0x{failure.Address:X}; 第 {failure.Attempts} 次恢复尚未通过回读验证，继续重试。")),
-            CancellationToken.None);
+            timeout,
+            _workerCancellationToken);
         if (result.ProcessHandle != _hProcess)
             _hProcess = result.ProcessHandle;
         if (result.Status is BreakpointRestoreStatus.Restored or BreakpointRestoreStatus.ProcessExited)
@@ -1031,5 +1066,13 @@ public sealed class DebugCaptureBackend : ICallpointCaptureBackend, IDisposable
         NotLoaded,
         Armed,
         Fatal,
+    }
+}
+
+internal sealed class BreakpointRestoreException : InvalidOperationException
+{
+    internal BreakpointRestoreException(int pid)
+        : base($"breakpoint_restore_failed: PID {pid} remained alive after the restore deadline.")
+    {
     }
 }

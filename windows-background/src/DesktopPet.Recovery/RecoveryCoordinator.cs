@@ -62,13 +62,20 @@ public sealed class RecoveryCoordinator
             var current = await RequireActiveEpochAsync(epoch.Id, cancellationToken);
             if (_keyReuseAdapter is not null)
             {
-                var reuse = await _keyReuseAdapter.TryDecryptAsync(current, cancellationToken);
+                var reuseResult = await _keyReuseAdapter.TryDecryptAsync(current, cancellationToken);
+                var reuse = reuseResult.Observation;
                 if (reuse.HasValidatedKey || reuse.HasPendingCapture || reuse.OutputPaths.Count > 0)
                 {
-                    var reuseAction = await _stateMachine.ObserveAsync(
-                        epoch.Id,
-                        reuse,
-                        cancellationToken);
+                    var requiredDatabasesComplete =
+                        reuseResult.UnresolvedRequiredDatabases.Count == 0;
+                    var reuseAction = requiredDatabasesComplete
+                        ? await _stateMachine.ObserveAsync(
+                            epoch.Id,
+                            reuse,
+                            cancellationToken)
+                        : reuse.OutputPaths.Count > 0
+                            ? RecoveryAction.Publish(reuse.OutputPaths, reuse.Databases)
+                            : RecoveryAction.Wait("required_databases_unresolved");
                     if (reuseAction.Kind == RecoveryActionKind.PublishOutputs)
                     {
                         await PublishDecryptResultBestEffortAsync(
@@ -88,10 +95,12 @@ public sealed class RecoveryCoordinator
                                 cancellationToken);
                         }
                     }
-                    return reuseAction;
+                    if (requiredDatabasesComplete || !allowLiveCapture)
+                        return reuseAction;
                 }
             }
             if (!allowLiveCapture) return RecoveryAction.Wait("key_reuse_only");
+            current = await RequireActiveEpochAsync(epoch.Id, cancellationToken);
             var action = _stateMachine.Begin(current);
             while (true)
             {
@@ -119,6 +128,7 @@ public sealed class RecoveryCoordinator
                         {
                             captureTask ??= _captureAdapter.CaptureAsync(
                                 current,
+                                RecoveryCaptureTarget.BoundProcess,
                                 cancellationToken);
                             observation = await captureTask;
                         }
@@ -207,6 +217,7 @@ public sealed class RecoveryCoordinator
                                     token.ThrowIfCancellationRequested();
                                     preparationTask = _captureAdapter.CaptureAsync(
                                         current,
+                                        RecoveryCaptureTarget.RestartedProcess,
                                         preparationCancellation.Token);
                                     return Task.CompletedTask;
                                 },

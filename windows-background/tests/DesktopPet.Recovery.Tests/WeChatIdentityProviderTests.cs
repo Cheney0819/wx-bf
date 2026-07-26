@@ -36,6 +36,33 @@ public sealed class WeChatIdentityProviderTests : IDisposable
         Assert.Equal(first.ExecutableVersion, second.ExecutableVersion);
     }
 
+    [Fact]
+    public void BindingDataRootPreservesProcessAndExecutableIdentity()
+    {
+        Directory.CreateDirectory(_root);
+        var executable = typeof(WeChatIdentityProviderTests).Assembly.Location;
+        var provider = new WeChatIdentityProvider();
+        var process = new WeChatRuntimeIdentity(
+            42,
+            7,
+            executable,
+            "fixture-executable");
+
+        var bound = provider.BindDataRoot(process, _root);
+
+        Assert.Equal(42, bound.ProcessId);
+        Assert.Equal(7, bound.SessionId);
+        Assert.Equal(executable, bound.ExecutablePath);
+        Assert.Equal("fixture-executable", bound.ExecutableIdentity);
+        Assert.Equal("fixture-executable", bound.EpochIdentity!.ExecutableVersion);
+        Assert.Equal(
+            Path.GetFullPath(_root),
+            bound.DataRoot,
+            OperatingSystem.IsWindows()
+                ? StringComparer.OrdinalIgnoreCase
+                : StringComparer.Ordinal);
+    }
+
     public void Dispose()
     {
         if (Directory.Exists(_root)) Directory.Delete(_root, recursive: true);

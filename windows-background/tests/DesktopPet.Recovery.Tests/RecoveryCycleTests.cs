@@ -79,6 +79,44 @@ public sealed class RecoveryCycleTests : IDisposable
         Assert.Equal(RecoveryHintKind.DatabaseChanged, hint.Kind);
     }
 
+    [Fact]
+    public async Task AmbiguousRootIsRecheckedWithActiveProcessIdentity()
+    {
+        var paths = BackgroundPaths.ForRoot(_root);
+        await using var repository = new RecoveryRepository(
+            paths.RecoveryDatabase,
+            TimeProvider.System);
+        var telemetry = new RecordingTelemetryPublisher();
+        var runtime = new WeChatRuntimeIdentity(
+            42,
+            7,
+            typeof(RecoveryCycleTests).Assembly.Location,
+            "fixture-executable");
+        var locator = new FakeLocator(new(
+            null,
+            2,
+            0,
+            "ambiguous_data_root"));
+        var cycle = new RecoveryCycle(
+            paths,
+            repository,
+            new FakeIdentityProvider(runtime),
+            locator,
+            new ValidatedKeyVault(
+                Path.Combine(paths.RecoveryVault, "ValidatedKeys"),
+                new XorProtector()),
+            telemetry);
+
+        var action = await cycle.RunAsync(
+            RecoveryCycleTrigger.Startup,
+            default);
+
+        Assert.Equal(RecoveryActionKind.WaitPassively, action.Kind);
+        Assert.Equal("ambiguous_data_root", action.Reason);
+        Assert.Equal(runtime, locator.ObservedRuntime);
+        Assert.False(File.Exists(paths.RecoveryDatabase));
+    }
+
     public void Dispose()
     {
         if (Directory.Exists(_root)) Directory.Delete(_root, recursive: true);
@@ -89,6 +127,8 @@ public sealed class RecoveryCycleTests : IDisposable
     {
         public WeChatDataRootResolution Result { get; set; } = result;
 
+        public WeChatRuntimeIdentity? ObservedRuntime { get; private set; }
+
         public string? CurrentDataRoot => Result.DataRoot;
 
         public Task<WeChatDataRootResolution> LocateAsync(
@@ -97,6 +137,29 @@ public sealed class RecoveryCycleTests : IDisposable
             cancellationToken.ThrowIfCancellationRequested();
             return Task.FromResult(Result);
         }
+
+        public Task<WeChatDataRootResolution> LocateAsync(
+            WeChatRuntimeIdentity runtime,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            ObservedRuntime = runtime;
+            return Task.FromResult(Result with { RuntimeIdentity = runtime });
+        }
+    }
+
+    private sealed class FakeIdentityProvider(WeChatRuntimeIdentity runtime)
+        : IWeChatIdentityProvider
+    {
+        public WeChatRuntimeIdentity ResolveActiveProcess() => runtime;
+
+        public WeChatRuntimeIdentity BindDataRoot(
+            WeChatRuntimeIdentity processRuntime,
+            string dataRoot) =>
+            throw new Xunit.Sdk.XunitException("ambiguous root must not be bound");
+
+        public WeChatRuntimeIdentity ResolveActive(string dataRoot) =>
+            throw new Xunit.Sdk.XunitException("legacy resolve path must not be used");
     }
 
     private sealed class RecordingTelemetryPublisher

@@ -34,6 +34,22 @@ public sealed record ModuleCallpointProfile(
     CodecHolderStrategy HolderStrategy,
     IReadOnlyList<CallpointDefinition> Callpoints);
 
+public sealed class UnsupportedModuleException : InvalidOperationException
+{
+    public const string StableCode = "unsupported_module";
+
+    public UnsupportedModuleException(string? detail = null)
+        : base(string.IsNullOrWhiteSpace(detail)
+            ? StableCode
+            : detail.StartsWith(StableCode, StringComparison.OrdinalIgnoreCase)
+                ? detail
+                : $"{StableCode}: {detail}")
+    {
+    }
+
+    public string Code => StableCode;
+}
+
 public static class CallpointProfiles
 {
     public const int MaxBreakpointsPerAttach = 4;

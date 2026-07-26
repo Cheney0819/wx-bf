@@ -55,6 +55,40 @@ public sealed class WindowsAppProcessControllerTests
     }
 
     [Fact]
+    public async Task BoundRuntimeSelectsOnlyItsSessionAndExecutableGroup()
+    {
+        var boundExecutable = Path.GetFullPath(
+            Path.Combine("opt", "bound", "Weixin.exe"));
+        var otherExecutable = Path.GetFullPath(
+            Path.Combine("opt", "other", "Weixin.exe"));
+        var operations = new FakeProcessOperations
+        {
+            Snapshots =
+            [
+                new AppProcessSnapshot(10, 7, otherExecutable, DateTimeOffset.UnixEpoch),
+                new AppProcessSnapshot(11, 7, otherExecutable, DateTimeOffset.UnixEpoch),
+                new AppProcessSnapshot(12, 7, boundExecutable, DateTimeOffset.UnixEpoch),
+                new AppProcessSnapshot(13, 7, boundExecutable, DateTimeOffset.UnixEpoch),
+                new AppProcessSnapshot(14, 8, boundExecutable, DateTimeOffset.UnixEpoch),
+            ],
+        };
+        var runtime = new WeChatRuntimeIdentity(
+            12,
+            7,
+            boundExecutable,
+            "fixture-executable");
+        var controller = new WindowsAppProcessController(
+            operations,
+            TimeSpan.FromSeconds(5),
+            runtime);
+
+        await controller.RestartAsync(default);
+
+        Assert.Equal([12, 13], operations.TerminatedProcessIds);
+        Assert.Equal(boundExecutable, operations.StartedExecutable);
+    }
+
+    [Fact]
     public async Task RestartWithoutInteractiveTargetFailsBeforeStarting()
     {
         var operations = new FakeProcessOperations { Snapshots = [] };

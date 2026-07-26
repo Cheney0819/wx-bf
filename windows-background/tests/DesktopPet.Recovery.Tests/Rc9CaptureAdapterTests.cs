@@ -44,6 +44,48 @@ public sealed class Rc9CaptureAdapterTests : IDisposable
     }
 
     [Fact]
+    public async Task BoundRuntimeTargetsExactPidThenUsesConstrainedRestartScan()
+    {
+        var encrypted = await WriteAsync("data/message/message_0.db", "encrypted"u8.ToArray());
+        var source = new DatabaseSource(encrypted, new FileInfo(encrypted).Length);
+        var selections = new List<RecoveryProcessSelection>();
+        var executable = Path.GetFullPath(Path.Combine(_root, "bin", "Weixin.exe"));
+        var bound = new RecoveryProcessSelection(
+            42,
+            "Weixin.exe",
+            ScanAll: false,
+            SessionId: 7,
+            ExecutablePath: executable);
+        var adapter = CreateAdapter(
+            [source],
+            () => [],
+            (selection, _, _, _, _, _) =>
+            {
+                selections.Add(selection);
+                throw new InvalidOperationException("fixture");
+            },
+            bound);
+
+        _ = await adapter.CaptureAsync(
+            Epoch(),
+            RecoveryCaptureTarget.BoundProcess,
+            default);
+        _ = await adapter.CaptureAsync(
+            Epoch(),
+            RecoveryCaptureTarget.RestartedProcess,
+            default);
+
+        Assert.Equal(42, selections[0].Pid);
+        Assert.False(selections[0].ScanAll);
+        Assert.Equal(7, selections[0].SessionId);
+        Assert.Equal(executable, selections[0].ExecutablePath);
+        Assert.Null(selections[1].Pid);
+        Assert.True(selections[1].ScanAll);
+        Assert.Equal(7, selections[1].SessionId);
+        Assert.Equal(executable, selections[1].ExecutablePath);
+    }
+
+    [Fact]
     public async Task ThrownCaptureWithPendingTicketSuppressesRestart()
     {
         var encrypted = await WriteAsync("data/message/message_0.db", "encrypted"u8.ToArray());
@@ -76,9 +118,30 @@ public sealed class Rc9CaptureAdapterTests : IDisposable
         Assert.Equal("capture_no_database_candidates", observation.FailureCode);
     }
 
+    [Fact]
+    public async Task PendingTicketFromAnotherEpochDoesNotSuppressCurrentCapture()
+    {
+        var encrypted = await WriteAsync("data/message/message_0.db", "encrypted"u8.ToArray());
+        var snapshots = new Queue<IReadOnlyList<string>>(
+            [[], [new string('c', 64)]]);
+        var adapter = CreateAdapter(
+            [new DatabaseSource(encrypted, new FileInfo(encrypted).Length)],
+            () => snapshots.Dequeue(),
+            (_, _, _, _, _, _) => throw new InvalidOperationException("localized text"));
+
+        var observation = await adapter.CaptureAsync(
+            Epoch("different-root-and-epoch"),
+            default);
+
+        Assert.False(observation.HasPendingCapture);
+        Assert.Equal("capture_no_result", observation.FailureCode);
+    }
+
     [Theory]
     [InlineData("early-attach:module-timeout", "capture_module_timeout")]
     [InlineData("early-attach:capture-timeout", "capture_callpoint_timeout")]
+    [InlineData("unsupported_module: fixture", "unsupported_module")]
+    [InlineData("breakpoint_restore_failed: fixture", "breakpoint_restore_failed")]
     public async Task EarlyAttachFailurePreservesStageCode(
         string failureMessage,
         string expectedCode)
@@ -97,19 +160,23 @@ public sealed class Rc9CaptureAdapterTests : IDisposable
     private Rc9CaptureAdapter CreateAdapter(
         IReadOnlyList<DatabaseSource> databases,
         Func<IReadOnlyList<string>> snapshotPendingIds,
-        Rc9CaptureOperation capture) =>
+        Rc9CaptureOperation capture,
+        RecoveryProcessSelection? boundProcess = null) =>
         new(
             Path.Combine(_root, "data"),
             Path.Combine(_root, "output"),
             new Progress<RecoveryProgress>(),
             () => databases,
             snapshotPendingIds,
-            capture);
+            capture,
+            boundProcess);
 
-    private static RecoveryEpoch Epoch() =>
+    private RecoveryEpoch Epoch(string? rootIdentity = null) =>
         new(
             "epoch-1",
-            new RecoveryEpochIdentity("4.1.0", "root-a"),
+            new RecoveryEpochIdentity(
+                "4.1.0",
+                rootIdentity ?? RootIdentity(Path.Combine(_root, "data"))),
             0,
             false,
             RecoveryMode.CapturingCurrentProcess,
@@ -117,6 +184,14 @@ public sealed class Rc9CaptureAdapterTests : IDisposable
             true,
             DateTimeOffset.UnixEpoch,
             DateTimeOffset.UnixEpoch);
+
+    private static string RootIdentity(string path)
+    {
+        var normalized = Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
+        if (OperatingSystem.IsWindows()) normalized = normalized.ToUpperInvariant();
+        return Convert.ToHexString(SHA256.HashData(
+            System.Text.Encoding.UTF8.GetBytes(normalized))).ToLowerInvariant();
+    }
 
     private async Task<string> WriteAsync(string relativePath, byte[] content)
     {

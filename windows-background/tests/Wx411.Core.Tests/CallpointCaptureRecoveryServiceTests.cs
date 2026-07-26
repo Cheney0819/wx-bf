@@ -230,6 +230,47 @@ public sealed class CallpointCaptureRecoveryServiceTests
     }
 
     [Fact]
+    public async Task UnsupportedLoadedModuleFailsBeforeCaptureBackendIsCreated()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"wx411-capture-service-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        var databasePath = Path.Combine(root, "message_0.db");
+        File.Copy(Path.Combine(AppContext.BaseDirectory, "sqlcipher4_raw_key.db"), databasePath);
+        var backendCreations = 0;
+        var service = new CallpointCaptureRecoveryService(
+            () =>
+            {
+                backendCreations++;
+                return new FakeCaptureBackend(null);
+            },
+            new PendingCaptureVault(Path.Combine(root, "vault"), new PassthroughProtector()),
+            validatedKeySink: null,
+            (_, _) => PeCallpointLocator.ValidateIdentity(
+                "9.9.9.9",
+                new string('0', 64)));
+        var selected = new DatabaseSource(databasePath, new FileInfo(databasePath).Length);
+
+        try
+        {
+            var exception = await Assert.ThrowsAsync<UnsupportedModuleException>(() =>
+                service.CaptureAndDecryptAsync(
+                    new RecoveryProcessSelection(7, "fixture"),
+                    selected,
+                    [selected],
+                    Path.Combine(root, "output"),
+                    new Progress<RecoveryProgress>(),
+                    CancellationToken.None));
+
+            Assert.Equal("unsupported_module", exception.Code);
+            Assert.Equal(0, backendCreations);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
     public void EnqueueNewCaptureTargetsAddsOnlyNewPidsInInputPriorityOrder()
     {
         var queue = new Queue<RecoveryProcessSelection>();

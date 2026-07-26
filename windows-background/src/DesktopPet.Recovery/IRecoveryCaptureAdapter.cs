@@ -3,16 +3,28 @@ using DesktopPet.Recovery.Persistence;
 
 namespace DesktopPet.Recovery;
 
+public enum RecoveryCaptureTarget
+{
+    BoundProcess,
+    RestartedProcess,
+}
+
 public interface IRecoveryCaptureAdapter
 {
     Task<CaptureObservation> CaptureAsync(
         RecoveryEpoch epoch,
         CancellationToken cancellationToken);
+
+    Task<CaptureObservation> CaptureAsync(
+        RecoveryEpoch epoch,
+        RecoveryCaptureTarget target,
+        CancellationToken cancellationToken) =>
+        CaptureAsync(epoch, cancellationToken);
 }
 
 public interface IRecoveryKeyReuseAdapter
 {
-    Task<CaptureObservation> TryDecryptAsync(
+    Task<PersistedDecryptResult> TryDecryptAsync(
         RecoveryEpoch epoch,
         CancellationToken cancellationToken);
 }

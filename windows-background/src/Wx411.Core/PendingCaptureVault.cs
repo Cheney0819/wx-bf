@@ -209,7 +209,26 @@ public sealed class PendingCaptureVault
     public IReadOnlyList<string> SnapshotRecordIds()
     {
         if (!Directory.Exists(_root)) return Array.Empty<string>();
-        var ids = _enumerateCaptureFiles(_root)
+        return SnapshotRecordIdsCore(_enumerateCaptureFiles(_root));
+    }
+
+    public IReadOnlyList<string> SnapshotRecordIds(
+        IEnumerable<string> databaseSaltFingerprints)
+    {
+        ArgumentNullException.ThrowIfNull(databaseSaltFingerprints);
+        if (!Directory.Exists(_root)) return Array.Empty<string>();
+        var directories = databaseSaltFingerprints
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .Select(DirectoryFor)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (directories.Count == 0) return Array.Empty<string>();
+        return SnapshotRecordIdsCore(_enumerateCaptureFiles(_root).Where(path =>
+            directories.Contains(Path.GetDirectoryName(Path.GetFullPath(path)) ?? string.Empty)));
+    }
+
+    private static IReadOnlyList<string> SnapshotRecordIdsCore(IEnumerable<string> paths)
+    {
+        var ids = paths
             .Select(path => Path.GetFileNameWithoutExtension(path) ?? string.Empty)
             .Where(id => id is { Length: 64 } && id.All(Uri.IsHexDigit))
             .Select(id => id.ToLowerInvariant())
