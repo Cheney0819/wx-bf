@@ -129,7 +129,8 @@ public sealed class EvidenceBundleService
             {
                 builder.Append(Convert.ToHexString(digest).ToLowerInvariant());
                 builder.Append("  ");
-                builder.AppendLine(entry.Key);
+                builder.Append(entry.Key);
+                builder.Append('\n');
             }
             finally
             {

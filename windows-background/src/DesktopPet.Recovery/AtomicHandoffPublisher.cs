@@ -153,7 +153,8 @@ public sealed class AtomicHandoffPublisher
         relativePath.Replace('\\', '/');
 
     private static bool IsParentTraversal(string relativePath) =>
-        relativePath.Split('/', StringSplitOptions.RemoveEmptyEntries)
+        NormalizeRelativePath(relativePath)
+            .Split('/', StringSplitOptions.RemoveEmptyEntries)
             .Any(segment => segment.Equals("..", StringComparison.Ordinal));
 
     private static bool IsPortableRooted(string path) =>

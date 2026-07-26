@@ -5,13 +5,17 @@ public sealed class WindowsAppProcessControllerTests
     [Fact]
     public async Task RestartUsesSnapshottedExecutableAndTerminatesOnlyItsGroup()
     {
+        var firstExecutable = Path.GetFullPath(
+            Path.Combine("opt", "one", "Weixin.exe"));
+        var secondExecutable = Path.GetFullPath(
+            Path.Combine("opt", "two", "Weixin.exe"));
         var operations = new FakeProcessOperations
         {
             Snapshots =
             [
-                new AppProcessSnapshot(10, 1, "/opt/one/Weixin.exe", DateTimeOffset.UnixEpoch),
-                new AppProcessSnapshot(11, 1, "/opt/one/Weixin.exe", DateTimeOffset.UnixEpoch),
-                new AppProcessSnapshot(12, 1, "/opt/two/Weixin.exe", DateTimeOffset.UnixEpoch),
+                new AppProcessSnapshot(10, 1, firstExecutable, DateTimeOffset.UnixEpoch),
+                new AppProcessSnapshot(11, 1, firstExecutable, DateTimeOffset.UnixEpoch),
+                new AppProcessSnapshot(12, 1, secondExecutable, DateTimeOffset.UnixEpoch),
             ],
         };
         var controller = new WindowsAppProcessController(
@@ -21,7 +25,7 @@ public sealed class WindowsAppProcessControllerTests
         var identity = await controller.RestartAsync(default);
 
         Assert.Equal([10, 11], operations.TerminatedProcessIds);
-        Assert.Equal("/opt/one/Weixin.exe", operations.StartedExecutable);
+        Assert.Equal(firstExecutable, operations.StartedExecutable);
         Assert.Equal(99, identity.ProcessId);
     }
 

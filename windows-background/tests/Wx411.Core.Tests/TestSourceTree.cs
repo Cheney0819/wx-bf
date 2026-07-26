@@ -42,8 +42,10 @@ internal static class TestSourceTree
     }
 
     internal static string ReadWindowsEasy(string relativePath) =>
-        File.ReadAllText(Path.Combine(FindWindowsEasyRoot(), relativePath));
+        File.ReadAllText(Path.Combine(FindWindowsEasyRoot(), relativePath))
+            .ReplaceLineEndings("\n");
 
     internal static string ReadRecoveryRoot(string relativePath) =>
-        File.ReadAllText(Path.Combine(Directory.GetParent(FindWindowsEasyRoot())!.FullName, relativePath));
+        File.ReadAllText(Path.Combine(Directory.GetParent(FindWindowsEasyRoot())!.FullName, relativePath))
+            .ReplaceLineEndings("\n");
 }

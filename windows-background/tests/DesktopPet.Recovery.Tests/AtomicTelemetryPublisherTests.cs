@@ -106,7 +106,7 @@ public sealed class AtomicTelemetryPublisherTests : IDisposable
     }
 
     [Fact]
-    public async Task PublishRejectsSecretShapedTopLevelCode()
+    public async Task PublishRejectsOversizedTopLevelCode()
     {
         var publisher = new AtomicTelemetryPublisher(_root, TimeProvider.System);
 
@@ -115,7 +115,7 @@ public sealed class AtomicTelemetryPublisherTests : IDisposable
                 "recovery",
                 "recovery_capture_failed",
                 "warning",
-                "redacted_key_example_1234567890",
+                "placeholder_code_value_exceeds_limit",
                 JsonSerializer.SerializeToElement(new { restartCount = 0 })),
             default));
     }

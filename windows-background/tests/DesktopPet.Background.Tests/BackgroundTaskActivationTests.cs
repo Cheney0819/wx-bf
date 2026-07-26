@@ -62,8 +62,9 @@ public sealed class BackgroundTaskActivationTests
         var results = await launcher.ActivateAllAsync(CancellationToken.None);
 
         Assert.Equal(
-            [BackgroundTaskNames.Recovery, BackgroundTaskNames.DataSync],
-            runner.TaskNames.OrderBy(static name => name));
+            new[] { BackgroundTaskNames.Recovery, BackgroundTaskNames.DataSync }
+                .OrderBy(static name => name, StringComparer.Ordinal),
+            runner.TaskNames.OrderBy(static name => name, StringComparer.Ordinal));
         Assert.All(results, result => Assert.True(result.Succeeded));
     }
 

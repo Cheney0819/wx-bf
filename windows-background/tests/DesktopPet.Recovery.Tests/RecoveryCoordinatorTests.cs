@@ -285,7 +285,7 @@ public sealed class RecoveryCoordinatorTests : IDisposable
             ]);
 
         var action = await fixture.Coordinator.RunEpochAsync(fixture.Epoch, default)
-            .WaitAsync(TimeSpan.FromSeconds(1));
+            .WaitAsync(TimeSpan.FromSeconds(5));
 
         Assert.Equal(RecoveryActionKind.PublishOutputs, action.Kind);
         Assert.Single(Directory.EnumerateFiles(

@@ -165,7 +165,12 @@ public sealed class DataSyncWorkerTests : IDisposable
             repository, eventType, "bounded_failure", default);
 
         Assert.Equal(0, await repository.CountOutboxAsync(default));
-        await using var connection = new SqliteConnection($"Data Source={databasePath}");
+        var connectionString = new SqliteConnectionStringBuilder
+        {
+            DataSource = databasePath,
+            Pooling = false,
+        }.ToString();
+        await using var connection = new SqliteConnection(connectionString);
         await connection.OpenAsync();
         await using var command = connection.CreateCommand();
         command.CommandText = "SELECT COUNT(*) FROM runtime_event WHERE event_type = $type;";
