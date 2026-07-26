@@ -45,9 +45,34 @@ public static class Program
                 paths.SyncDatabase,
                 TimeProvider.System,
                 outboxProtector);
-            var settings = new ServerSettingsVault(
-                Path.Combine(paths.DataSyncRoot, "server-settings.dpapi"),
-                protector);
+            var settingsPath = Path.Combine(
+                paths.DataSyncRoot,
+                "server-settings.dpapi");
+            var settings = new ServerSettingsVault(settingsPath, protector);
+            var legacyConfigPaths = new[]
+            {
+                Path.Combine(AppContext.BaseDirectory, "monitor_config.json"),
+                Path.GetFullPath(Path.Combine(
+                    AppContext.BaseDirectory,
+                    "..",
+                    "..",
+                    "monitor_config.json")),
+                Path.GetFullPath(Path.Combine(
+                    AppContext.BaseDirectory,
+                    "..",
+                    "..",
+                    "wechat_data",
+                    "monitor_config.json")),
+            };
+            var settingsBootstrapper = new ServerSettingsBootstrapper(
+                settings,
+                settingsPath,
+                legacyConfigPaths,
+                Environment.GetEnvironmentVariable,
+                new ServerSettings(
+                    new Uri("https://wx.junjiee.online/"),
+                    "wx_monitor_2026"));
+            await settingsBootstrapper.EnsureAsync(CancellationToken.None);
             var identity = await new ClientIdentityStore(
                     Path.Combine(paths.DataSyncRoot, "client-identity.json"),
                     Path.Combine(AppContext.BaseDirectory, "wechat_data", "client_identity.json"),
