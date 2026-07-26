@@ -42,6 +42,7 @@ public static class Program
         using (instance)
         {
             var knownRoots = KnownDataRoots();
+            var dataRootLocator = new WeChatDataRootLocator();
             var protector = new DpapiSecretProtector();
             var snapshot = new CriticalRecoverySnapshotStore(
                 paths.RecoveryCriticalSnapshot,
@@ -58,7 +59,7 @@ public static class Program
                 paths,
                 repository,
                 new WeChatIdentityProvider(),
-                knownRoots,
+                dataRootLocator,
                 validatedKeyVault);
             var worker = new RecoveryWorker(
                 startup,

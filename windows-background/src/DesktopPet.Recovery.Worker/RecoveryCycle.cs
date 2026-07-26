@@ -12,7 +12,7 @@ public sealed class RecoveryCycle : IRecoveryCycle
     private readonly BackgroundPaths _paths;
     private readonly RecoveryRepository _repository;
     private readonly WeChatIdentityProvider _identityProvider;
-    private readonly IReadOnlyList<string> _knownDataRoots;
+    private readonly IWeChatDataRootLocator _dataRootLocator;
     private readonly ValidatedKeyVault _validatedKeyVault;
     private readonly IProgress<RecoveryProgress> _progress;
 
@@ -20,19 +20,19 @@ public sealed class RecoveryCycle : IRecoveryCycle
         BackgroundPaths paths,
         RecoveryRepository repository,
         WeChatIdentityProvider identityProvider,
-        IReadOnlyList<string> knownDataRoots,
+        IWeChatDataRootLocator dataRootLocator,
         ValidatedKeyVault validatedKeyVault,
         IProgress<RecoveryProgress>? progress = null)
     {
         ArgumentNullException.ThrowIfNull(paths);
         ArgumentNullException.ThrowIfNull(repository);
         ArgumentNullException.ThrowIfNull(identityProvider);
-        ArgumentNullException.ThrowIfNull(knownDataRoots);
+        ArgumentNullException.ThrowIfNull(dataRootLocator);
         ArgumentNullException.ThrowIfNull(validatedKeyVault);
         _paths = paths;
         _repository = repository;
         _identityProvider = identityProvider;
-        _knownDataRoots = knownDataRoots;
+        _dataRootLocator = dataRootLocator;
         _validatedKeyVault = validatedKeyVault;
         _progress = progress ?? NullProgress<RecoveryProgress>.Instance;
     }
@@ -44,7 +44,10 @@ public sealed class RecoveryCycle : IRecoveryCycle
         WeChatRuntimeIdentity runtime;
         try
         {
-            runtime = _identityProvider.ResolveActive(_knownDataRoots);
+            var resolution = await _dataRootLocator.LocateAsync(cancellationToken);
+            if (!resolution.Found)
+                return RecoveryAction.Wait("target_not_running_or_data_root_unavailable");
+            runtime = _identityProvider.ResolveActive(resolution.DataRoot!);
         }
         catch (Exception exception) when (exception is
             InvalidOperationException or DirectoryNotFoundException)

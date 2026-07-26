@@ -3,7 +3,6 @@ using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using DesktopPet.Background.Contracts;
-using Wx411.Core;
 
 namespace DesktopPet.Recovery;
 
@@ -34,15 +33,17 @@ public sealed class WeChatIdentityProvider
             TextSha256(normalizedRoot));
     }
 
-    public WeChatRuntimeIdentity ResolveActive(IReadOnlyList<string> knownDataRoots)
+    public WeChatRuntimeIdentity ResolveActive(string dataRoot)
     {
-        ArgumentNullException.ThrowIfNull(knownDataRoots);
+        ArgumentException.ThrowIfNullOrWhiteSpace(dataRoot);
         var executablePath = ResolveInteractiveExecutable();
-        var dataRoot = SelectDataRoot(knownDataRoots);
+        var normalizedRoot = NormalizeRoot(dataRoot);
+        if (!Directory.Exists(normalizedRoot))
+            throw new DirectoryNotFoundException("The selected target data root is unavailable.");
         return new WeChatRuntimeIdentity(
-            CreateIdentity(executablePath, dataRoot),
+            CreateIdentity(executablePath, normalizedRoot),
             executablePath,
-            dataRoot);
+            normalizedRoot);
     }
 
     private static string ResolveInteractiveExecutable()
@@ -70,25 +71,6 @@ public sealed class WeChatIdentityProvider
             }
         }
         throw new InvalidOperationException("No target process is active in the worker session.");
-    }
-
-    private static string SelectDataRoot(IReadOnlyList<string> knownDataRoots)
-    {
-        var candidates = knownDataRoots
-            .Where(path => !string.IsNullOrWhiteSpace(path))
-            .Select(NormalizeRoot)
-            .Where(Directory.Exists)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .Select(path => new
-            {
-                Path = path,
-                DatabaseCount = DatabaseSourceDiscovery.Discover([path]).Count,
-            })
-            .OrderByDescending(item => item.DatabaseCount)
-            .ThenBy(item => item.Path, StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-        return candidates.FirstOrDefault()?.Path ??
-            throw new DirectoryNotFoundException("No configured target data root is available.");
     }
 
     private static string NormalizeRoot(string path)
