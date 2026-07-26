@@ -12,12 +12,15 @@ public sealed class ProcessShutdownServiceTests
         [
             new(10, null, @"C:\Pet\DesktopPet.Wpf.exe"),
             new(11, 10, @"C:\Pet\ffmpeg.exe"),
-            new(12, null, @"C:\Other\ffmpeg.exe")
+            new(12, null, @"C:\Other\ffmpeg.exe"),
+            new(13, null, @"C:\Pet\Background\Recovery\DesktopPet.Recovery.Worker.exe"),
+            new(14, null, @"C:\Pet\Background\DataSync\DesktopPet.DataSync.Worker.exe"),
+            new(15, null, @"C:\Pet\Background\Parser\wx_parser.exe")
         ]);
 
         new ProcessShutdownService(catalog).StopWithin(@"C:\Pet", TimeSpan.FromSeconds(1));
 
-        Assert.Equal([10, 11], catalog.KilledPids.Order());
+        Assert.Equal([10, 11, 13, 14, 15], catalog.KilledPids.Order());
     }
 
     [Fact]

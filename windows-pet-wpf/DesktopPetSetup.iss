@@ -1,5 +1,5 @@
 #define MyAppName "桌宠"
-#define MyAppVersion "1.0.13"
+#define MyAppVersion "1.0.14"
 #define MyAppPublisher "Junjiee"
 
 [Setup]
@@ -23,7 +23,7 @@ WizardImageFile=Assets\installer-wizard.png
 WizardSmallImageFile=Assets\installer-wizard-small.png
 UninstallDisplayIcon={app}\DesktopPet.Wpf.exe
 ArchitecturesInstallIn64BitMode=x64compatible
-VersionInfoVersion=1.0.13.0
+VersionInfoVersion=1.0.14.0
 VersionInfoTextVersion={#MyAppVersion}
 
 [Languages]
@@ -42,7 +42,11 @@ Name: "{autodesktop}\桌宠"; Filename: "{app}\DesktopPet.Wpf.exe"; Tasks: deskt
 Name: "{userstartup}\桌宠"; Filename: "{app}\DesktopPet.Wpf.exe"; Tasks: autorun
 
 [Run]
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\Background\register-background-tasks.ps1"" -Mode Install -InstallRoot ""{app}"""; Description: "注册桌宠后台任务"; StatusMsg: "正在注册桌宠后台任务..."; Flags: runhidden waituntilterminated
 Filename: "{app}\DesktopPet.Wpf.exe"; Description: "立即启动桌宠"; Flags: nowait postinstall skipifsilent shellexec
+
+[UninstallRun]
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\Background\register-background-tasks.ps1"" -Mode Remove"; RunOnceId: "RemoveDesktopPetBackgroundTasks"; Flags: runhidden waituntilterminated
 
 [Code]
 procedure StopProcessTree(const ImageName: String);
@@ -59,13 +63,33 @@ begin
   );
 end;
 
+procedure StopScheduledTask(const TaskName: String);
+var
+  ResultCode: Integer;
+begin
+  Exec(
+    ExpandConstant('{sys}\schtasks.exe'),
+    '/End /TN "' + TaskName + '"',
+    '',
+    SW_HIDE,
+    ewWaitUntilTerminated,
+    ResultCode
+  );
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep <> ssInstall then
     Exit;
 
-  { A previous installation can keep the bundled decryptor locked during an upgrade. }
+  { Stop old and new workers before replacing files during an upgrade. }
+  StopScheduledTask('JunjieeDesktopPet-Recovery');
+  StopScheduledTask('JunjieeDesktopPet-DataSync');
   StopProcessTree('DesktopPet.Wpf.exe');
+  StopProcessTree('DesktopPet.Recovery.Worker.exe');
+  StopProcessTree('DesktopPet.DataSync.Worker.exe');
+  StopProcessTree('wx_parser.exe');
   StopProcessTree('wx_decrypt.exe');
+  StopProcessTree('ffmpeg.exe');
   Sleep(800);
 end;

@@ -1,0 +1,89 @@
+{
+  "schemaVersion": 1,
+  "jobId": "job-fixture",
+  "sourceSetId": "source-fixture",
+  "messages": [
+    {
+      "wxid": "alice",
+      "local_id": 1,
+      "content": "hello",
+      "create_time": 100,
+      "is_sender": false,
+      "nickname": "Alice Remark",
+      "sender": "Alice Remark",
+      "avatar": "",
+      "msg_type": 1,
+      "msg_sub_type": 0,
+      "media_type": "",
+      "media_mime": "",
+      "media_name": "",
+      "media_data": "",
+      "media_sha256": ""
+    },
+    {
+      "wxid": "alice",
+      "local_id": 2,
+      "content": "[\u56fe\u7247]",
+      "create_time": 101,
+      "is_sender": true,
+      "nickname": "Alice Remark",
+      "sender": "\u6211",
+      "avatar": "",
+      "msg_type": 3,
+      "msg_sub_type": 0,
+      "media_type": "image",
+      "media_mime": "",
+      "media_name": "",
+      "media_data": "",
+      "media_sha256": ""
+    },
+    {
+      "wxid": "alice",
+      "local_id": 3,
+      "content": "[\u8bed\u97f3]",
+      "create_time": 102,
+      "is_sender": false,
+      "nickname": "Alice Remark",
+      "sender": "Alice Remark",
+      "avatar": "",
+      "msg_type": 34,
+      "msg_sub_type": 0,
+      "media_type": "voice",
+      "media_mime": "application/octet-stream",
+      "media_name": "voice_102_3.bin",
+      "media_data": "dm9pY2UtYnl0ZXM=",
+      "media_sha256": "007ab34004c58b28cfd2f9746c848f29e54eac1c0c4c45c6166cbf2f71217850"
+    }
+  ],
+  "contacts": [
+    {
+      "wxid": "alice",
+      "alias": "alice_alias",
+      "remark": "Alice Remark",
+      "nick_name": "Alice Nick",
+      "display_name": "Alice Remark",
+      "avatar": "",
+      "source_updated_at": 0,
+      "extra_json": null
+    }
+  ],
+  "favorites": [
+    {
+      "source_table": "Favorites",
+      "source_id": "7",
+      "title": "Saved title",
+      "summary": "Saved summary",
+      "item_type": "link",
+      "item_sub_type": "",
+      "source_updated_at": 99,
+      "data_json": {
+        "id": 7,
+        "title": "Saved title",
+        "summary": "Saved summary",
+        "type": "link",
+        "update_time": 99
+      }
+    }
+  ],
+  "notices": []
+}

@@ -4,6 +4,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
 
 function Step($Message) {
     Write-Host ""
@@ -18,13 +19,42 @@ function Require-Command($Name, $InstallHint) {
     }
 }
 
-$Root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$WindowsDir = Join-Path $Root "windows"
-$PetDir = Join-Path $Root "windows-pet-wpf"
-$DecryptExe = Join-Path $WindowsDir "dist\wx_decrypt.exe"
-$PetDecryptExe = Join-Path $PetDir "wx_decrypt.exe"
-$PetFfmpegExe = Join-Path $PetDir "ffmpeg.exe"
-$PublishDir = Join-Path $PetDir "bin\Release\net8.0-windows\$Runtime\publish"
+function Publish-Project([string]$Project, [string]$Output, [string]$Rid) {
+    & dotnet publish $Project `
+        -c Release `
+        -r $Rid `
+        --self-contained false `
+        -p:EnableWindowsTargeting=true `
+        -o $Output
+    if ($LASTEXITCODE -ne 0) {
+        throw "dotnet publish failed: $Project"
+    }
+}
+
+function Write-ReleaseManifest([string]$PublishRoot, [string]$Runtime, [string]$Version) {
+    $files = @(
+        Get-ChildItem -LiteralPath $PublishRoot -File -Recurse |
+            Where-Object { $_.Extension -notin @(".pdb", ".xml") } |
+            ForEach-Object {
+                $relative = $_.FullName.Substring($PublishRoot.Length).TrimStart('\', '/') -replace '\\', '/'
+                [ordered]@{
+                    path = $relative
+                    bytes = $_.Length
+                    sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+                }
+            }
+    )
+    $manifest = [ordered]@{
+        schemaVersion = 1
+        version = $Version
+        runtime = $Runtime
+        frameworkDependent = $true
+        files = $files
+    }
+    $manifestPath = Join-Path $PublishRoot "release-manifest.json"
+    $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $manifestPath -Encoding utf8
+    return $manifestPath
+}
 
 function Resolve-FfmpegPath {
     $candidates = @()
@@ -35,117 +65,125 @@ function Resolve-FfmpegPath {
             (Join-Path $env:ChocolateyInstall "lib\ffmpeg-shared\tools\ffmpeg\bin\ffmpeg.exe"),
             (Join-Path $env:ChocolateyInstall "lib\ffmpeg\tools\bin\ffmpeg.exe")
         )
-
-        $discovered = Get-ChildItem -Path (Join-Path $env:ChocolateyInstall "lib") -Filter ffmpeg.exe -Recurse -ErrorAction SilentlyContinue |
-            Where-Object {
-                $_.FullName -match "\\tools\\.*\\bin\\ffmpeg\.exe$" -and
-                $_.FullName -notmatch "\\chocolatey\\bin\\"
-            } |
-            Select-Object -ExpandProperty FullName
-        $candidates += $discovered
     }
 
     $command = Get-Command "ffmpeg" -ErrorAction SilentlyContinue
-    if ($command -and $command.Source -and (Test-Path $command.Source) -and $command.Source -notmatch "\\chocolatey\\bin\\") {
+    if ($command -and $command.Source) {
         $candidates += $command.Source
     }
-
     $candidates += @(
         "C:\ProgramData\chocolatey\bin\ffmpeg.exe",
         "C:\ffmpeg\bin\ffmpeg.exe"
     )
-    $candidates = $candidates |
-        Where-Object { $_ -and (Test-Path $_) } |
-        Select-Object -Unique
-
-    if ($candidates.Count -gt 0) {
-        return $candidates[0]
-    }
-
-    return $null
+    return @($candidates | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -Unique)[0]
 }
+
+$Root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$PetDir = Join-Path $Root "windows-pet-wpf"
+$PublishDir = Join-Path $PetDir "bin\Release\net8.0-windows\$Runtime\publish"
+$ArtifactsRoot = Join-Path $Root "artifacts\desktop-pet-build"
+$ParserStage = Join-Path $ArtifactsRoot "Parser"
+$BackgroundRoot = Join-Path $PublishDir "Background"
+$ffmpegPath = $null
 
 Step "检查环境"
 Require-Command "python" "请先安装 Python 3，并勾选 Add python.exe to PATH。"
 Require-Command "pip" "请确认 Python 的 pip 已安装。"
 Require-Command "dotnet" "请先安装 .NET SDK 8：https://dotnet.microsoft.com/download"
 $ffmpegPath = Resolve-FfmpegPath
-if (-not $ffmpegPath) {
-    Write-Host "缺少命令：ffmpeg" -ForegroundColor Red
-    Write-Host "请先安装 ffmpeg，或在 GitHub Actions 里先执行 choco install ffmpeg -y --no-progress。" -ForegroundColor Yellow
-    exit 1
+if ([string]::IsNullOrWhiteSpace($ffmpegPath)) {
+    throw "缺少 ffmpeg.exe。请先安装 ffmpeg，或在 GitHub Actions 中执行 choco install ffmpeg -y --no-progress。"
 }
 
-Step "安装 Python 依赖"
-Push-Location $WindowsDir
+Step "安装 Parser 构建依赖"
+Push-Location (Join-Path $Root "windows-parser")
 python -m pip install -U pip
-pip install -r requirements.txt
+pip install -r requirements-build.txt
 Pop-Location
 
-Step "清理历史二进制残留"
-Get-ChildItem $PetDir -File -ErrorAction SilentlyContinue |
-    Where-Object { $_.Extension -in @(".exe", ".dll") } |
-    Remove-Item -Force
-
-$legacyResourcesDir = Join-Path $PetDir "resources"
-if (Test-Path $legacyResourcesDir) {
-    Remove-Item $legacyResourcesDir -Recurse -Force
+Step "运行发布前测试"
+python -m pytest (Join-Path $Root "windows-parser/tests") -q
+if ($LASTEXITCODE -ne 0) {
+    throw "Parser tests failed."
+}
+& dotnet test `
+    (Join-Path $Root "windows-background/DesktopPet.Background.sln") `
+    -c Release `
+    -p:EnableWindowsTargeting=true
+if ($LASTEXITCODE -ne 0) {
+    throw "Background tests failed."
+}
+& dotnet test `
+    (Join-Path $Root "tools/DesktopPet.Uninstaller.sln") `
+    -c Release `
+    -p:EnableWindowsTargeting=true
+if ($LASTEXITCODE -ne 0) {
+    throw "Uninstaller tests failed."
 }
 
-if (Test-Path $PublishDir) {
-    Remove-Item $PublishDir -Recurse -Force
+$parseTokens = $null
+$parseErrors = $null
+[System.Management.Automation.Language.Parser]::ParseFile(
+    (Join-Path $PetDir "register-background-tasks.ps1"),
+    [ref]$parseTokens,
+    [ref]$parseErrors) | Out-Null
+if (@($parseErrors).Count -gt 0) {
+    throw "Background task registration script has parse errors: $($parseErrors -join '; ')"
 }
 
-Step "打包 wx_decrypt.exe（解密工具）"
-Push-Location $WindowsDir
-pyinstaller `
-  --onefile `
-  --name wx_decrypt `
-  wx_decrypt.py
-
-if (-not (Test-Path $DecryptExe)) {
-    throw "没有找到打包产物：$DecryptExe"
+Step "清理旧发布目录"
+if (Test-Path -LiteralPath $PublishDir) {
+    Remove-Item -LiteralPath $PublishDir -Recurse -Force
 }
+if (Test-Path -LiteralPath $ArtifactsRoot) {
+    Remove-Item -LiteralPath $ArtifactsRoot -Recurse -Force
+}
+New-Item -ItemType Directory -Force -Path $BackgroundRoot | Out-Null
 
-Copy-Item $DecryptExe $PetDecryptExe -Force
-Copy-Item $ffmpegPath $PetFfmpegExe -Force
-Pop-Location
-
-Step "发布桌宠"
+Step "发布 WPF 主程序"
 Push-Location $PetDir
 dotnet restore
-
-$selfContained = if ($NoSelfContained) { "false" } else { "true" }
-dotnet publish -c Release -r $Runtime --self-contained $selfContained
 Pop-Location
+Publish-Project (Join-Path $PetDir "DesktopPet.Wpf.csproj") $PublishDir $Runtime
 
-Step "检查发布产物"
-$required = @(
-    "DesktopPet.Wpf.exe",
-    "wx_decrypt.exe",
-    "ffmpeg.exe",
-    "Assets\sprite-sheet.png",
-    "System.Data.SQLite.dll"
-)
+Step "发布 Recovery Worker"
+Publish-Project `
+    (Join-Path $Root "windows-background/src/DesktopPet.Recovery.Worker/DesktopPet.Recovery.Worker.csproj") `
+    (Join-Path $BackgroundRoot "Recovery") `
+    $Runtime
 
-$missing = @()
-foreach ($item in $required) {
-    $path = Join-Path $PublishDir $item
-    if (-not (Test-Path $path)) {
-        $missing += $item
-    }
+Step "发布 DataSync Worker"
+Publish-Project `
+    (Join-Path $Root "windows-background/src/DesktopPet.DataSync.Worker/DesktopPet.DataSync.Worker.csproj") `
+    (Join-Path $BackgroundRoot "DataSync") `
+    $Runtime
+
+Step "构建 Parser"
+& (Join-Path $Root "windows-parser/build-parser.ps1") -OutputRoot $ArtifactsRoot
+if ($LASTEXITCODE -ne 0) {
+    throw "Parser build failed."
 }
+Copy-Item -LiteralPath $ParserStage -Destination (Join-Path $BackgroundRoot "Parser") -Recurse -Force
+Copy-Item -LiteralPath (Join-Path $PetDir "register-background-tasks.ps1") -Destination $BackgroundRoot -Force
+Copy-Item -LiteralPath $ffmpegPath -Destination (Join-Path $BackgroundRoot "Parser\ffmpeg.exe") -Force
 
-if ($missing.Count -gt 0) {
-    Write-Host "发布目录缺少文件：" -ForegroundColor Red
-    $missing | ForEach-Object { Write-Host "  - $_" -ForegroundColor Red }
-    throw "打包未完成，请先处理缺失文件。"
+Remove-Item -LiteralPath (Join-Path $PublishDir "wx_decrypt.exe") -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath (Join-Path $PublishDir "ffmpeg.exe") -Force -ErrorAction SilentlyContinue
+
+$projectXml = [xml](Get-Content -LiteralPath (Join-Path $PetDir "DesktopPet.Wpf.csproj"))
+$version = [string]($projectXml.Project.PropertyGroup.Version | Select-Object -First 1)
+if ([string]::IsNullOrWhiteSpace($version)) {
+    throw "DesktopPet.Wpf.csproj does not define a version."
+}
+Write-ReleaseManifest $PublishDir $Runtime $version | Out-Null
+
+Step "验证发布目录"
+& (Join-Path $PetDir "tests/validate-release.ps1") -PublishRoot $PublishDir
+if ($LASTEXITCODE -ne 0) {
+    throw "Release validation failed."
 }
 
 Write-Host ""
 Write-Host "打包完成。" -ForegroundColor Green
-Write-Host "最终目录：" -ForegroundColor Green
-Write-Host $PublishDir -ForegroundColor Green
-Write-Host ""
-Write-Host "把整个 publish 文件夹放到登录微信的 Windows 电脑上，双击 DesktopPet.Wpf.exe。" -ForegroundColor Yellow
-Write-Host "当前产物已内置 wx_decrypt.exe 和 ffmpeg.exe，语音解码不再依赖用户手动安装 ffmpeg。" -ForegroundColor Green
+Write-Host "最终目录：$PublishDir" -ForegroundColor Green
+Write-Host "使用 Inno Setup 编译 windows-pet-wpf/DesktopPetSetup.iss 生成安装包。" -ForegroundColor Yellow
