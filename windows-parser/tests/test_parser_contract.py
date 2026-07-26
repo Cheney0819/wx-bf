@@ -145,16 +145,23 @@ def test_result_above_32_mib_is_rejected_without_publish(tmp_path: Path) -> None
     assert not (output_root / "result.json").exists()
 
 
-def test_cancellation_signal_changes_progress_handler_state() -> None:
+def test_cancellation_signal_changes_progress_handler_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     state = CancellationState()
-    previous = signal.getsignal(signal.SIGINT)
-    try:
-        state.install_signal_handlers()
-        os.kill(os.getpid(), signal.SIGINT)
-        assert state.cancelled is True
-        assert state.progress_handler() == 1
-    finally:
-        signal.signal(signal.SIGINT, previous)
+    handlers: dict[int, object] = {}
+
+    def register(signum: int, handler: object) -> None:
+        handlers[signum] = handler
+
+    monkeypatch.setattr(signal, "signal", register)
+    state.install_signal_handlers()
+    handler = handlers[signal.SIGINT]
+    assert callable(handler)
+    handler(signal.SIGINT, None)
+
+    assert state.cancelled is True
+    assert state.progress_handler() == 1
 
 
 def test_parser_source_contains_no_forbidden_runtime_ownership() -> None:
