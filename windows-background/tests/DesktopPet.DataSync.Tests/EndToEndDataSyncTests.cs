@@ -250,11 +250,126 @@ public sealed class EndToEndDataSyncTests : IDisposable
             new HttpClient(),
             time,
             identity,
-            supervisor);
+            supervisor,
+            emitRuntimeEvents: true);
         await runtime.ReconcileHandoffsAsync(default);
 
         Assert.True(await runtime.ProcessOneParserJobAsync(default));
         Assert.False(await runtime.ProcessOneParserJobAsync(default));
+        using var payload = JsonDocument.Parse(await ReadLatestRuntimePayloadAsync(
+            paths.SyncDatabase,
+            "datasync_parser_failed"));
+        Assert.True(
+            payload.RootElement.TryGetProperty("metrics", out var metrics),
+            payload.RootElement.ToString());
+        Assert.Equal("process_cleanup", metrics.GetProperty("stageCode").GetString());
+        Assert.Equal("parser_cleanup_timeout", metrics.GetProperty("failureCode").GetString());
+    }
+
+    [Theory]
+    [InlineData("database_path_outside_input_root", "database_path_outside_input_root")]
+    [InlineData("database:path", "stderr_present")]
+    public async Task ParserFailureDiagnosticsReportProcessExit(
+        string stderr,
+        string expectedStderrCode)
+    {
+        if (OperatingSystem.IsWindows()) return;
+        var paths = TestPaths();
+        var time = new AdjustableTimeProvider(DateTimeOffset.Parse("2026-07-26T00:00:00Z"));
+        var identity = new ClientIdentityDocument(1, LegacySessionId, LegacySource, time.GetUtcNow());
+        var staging = await CopyReadableFixtureToStagingAsync(paths.StagingRoot);
+        await PublishRecoveryHandoffAsync(paths, staging);
+        var parser = await CreateFailingParserArtifactAsync(
+            paths.ParserRoot,
+            stderr);
+        var protector = new EncryptedOutboxProtector(new XorTestProtector());
+        await using var repository = await OpenRepositoryAsync(paths.SyncDatabase, time, protector);
+        var runtime = CreateRuntime(
+            paths,
+            parser,
+            repository,
+            protector,
+            new MissingSettingsProvider(),
+            new HttpClient(),
+            time,
+            identity,
+            emitRuntimeEvents: true);
+        await runtime.ReconcileHandoffsAsync(default);
+
+        Assert.True(await runtime.ProcessOneParserJobAsync(default));
+        using var payload = JsonDocument.Parse(await ReadLatestRuntimePayloadAsync(
+            paths.SyncDatabase,
+            "datasync_parser_failed"));
+        Assert.True(
+            payload.RootElement.TryGetProperty("metrics", out var metrics),
+            payload.RootElement.ToString());
+        Assert.Equal("process_exit", metrics.GetProperty("stageCode").GetString());
+        Assert.Equal(2, metrics.GetProperty("exitCode").GetInt32());
+        Assert.Equal(
+            expectedStderrCode,
+            metrics.GetProperty("stderrCode").GetString());
+
+        using var telemetry = JsonDocument.Parse(await ReadTelemetryPayloadAsync(
+            repository,
+            protector,
+            "datasync_parser_failed"));
+        var uploadedMetrics = telemetry.RootElement
+            .GetProperty("payload")
+            .GetProperty("metrics");
+        Assert.Equal("process_exit", uploadedMetrics.GetProperty("stageCode").GetString());
+        Assert.Equal(2, uploadedMetrics.GetProperty("exitCode").GetInt32());
+        Assert.Equal(
+            expectedStderrCode,
+            uploadedMetrics.GetProperty("stderrCode").GetString());
+    }
+
+    [Fact]
+    public async Task ParserStartFailureDiagnosticsReportMissingArtifact()
+    {
+        if (OperatingSystem.IsWindows()) return;
+        var paths = TestPaths();
+        var time = new AdjustableTimeProvider(DateTimeOffset.Parse("2026-07-26T00:00:00Z"));
+        var identity = new ClientIdentityDocument(1, LegacySessionId, LegacySource, time.GetUtcNow());
+        var staging = await CopyReadableFixtureToStagingAsync(paths.StagingRoot);
+        await PublishRecoveryHandoffAsync(paths, staging);
+        var parser = new ParserArtifact(
+            Path.Combine(paths.ParserRoot, "parser-install.json"),
+            new string('0', 64));
+        var protector = new EncryptedOutboxProtector(new XorTestProtector());
+        await using var repository = await OpenRepositoryAsync(paths.SyncDatabase, time, protector);
+        var runtime = CreateRuntime(
+            paths,
+            parser,
+            repository,
+            protector,
+            new MissingSettingsProvider(),
+            new HttpClient(),
+            time,
+            identity,
+            emitRuntimeEvents: true);
+        await runtime.ReconcileHandoffsAsync(default);
+
+        Assert.True(await runtime.ProcessOneParserJobAsync(default));
+        using var payload = JsonDocument.Parse(await ReadLatestRuntimePayloadAsync(
+            paths.SyncDatabase,
+            "datasync_parser_failed"));
+        Assert.True(
+            payload.RootElement.TryGetProperty("metrics", out var metrics),
+            payload.RootElement.ToString());
+        Assert.Equal("process_start", metrics.GetProperty("stageCode").GetString());
+        Assert.Equal("parser_artifact_missing", metrics.GetProperty("failureCode").GetString());
+        Assert.False(metrics.TryGetProperty("exitCode", out _));
+
+        using var telemetry = JsonDocument.Parse(await ReadTelemetryPayloadAsync(
+            repository,
+            protector,
+            "datasync_parser_failed"));
+        var uploadedMetrics = telemetry.RootElement
+            .GetProperty("payload")
+            .GetProperty("metrics");
+        Assert.Equal("process_start", uploadedMetrics.GetProperty("stageCode").GetString());
+        Assert.Equal("parser_artifact_missing", uploadedMetrics.GetProperty("failureCode").GetString());
+        Assert.False(uploadedMetrics.TryGetProperty("exitCode", out _));
     }
 
     private DataSyncRuntime CreateRuntime(
@@ -266,7 +381,8 @@ public sealed class EndToEndDataSyncTests : IDisposable
         HttpClient httpClient,
         TimeProvider timeProvider,
         ClientIdentityDocument identity,
-        ParserProcessSupervisor? supervisor = null)
+        ParserProcessSupervisor? supervisor = null,
+        bool emitRuntimeEvents = false)
     {
         var importer = new HandoffManifestImporter(
             repository,
@@ -274,6 +390,11 @@ public sealed class EndToEndDataSyncTests : IDisposable
             new HandoffAcceptancePublisher(paths.AcceptedRoot, timeProvider),
             timeProvider);
         var jobsRoot = Path.Combine(paths.DataSyncRoot, "Jobs");
+        var telemetryWriter = new TelemetryOutboxWriter(
+            repository,
+            outboxProtector,
+            identity,
+            timeProvider);
         return new DataSyncRuntime(
             paths.ReadyRoot,
             jobsRoot,
@@ -298,8 +419,9 @@ public sealed class EndToEndDataSyncTests : IDisposable
             new StatusOutboxWriter(repository, outboxProtector, identity, timeProvider),
             new TelemetryHandoffImporter(
                 new TelemetryEnvelopeValidator(),
-                new TelemetryOutboxWriter(repository, outboxProtector, identity, timeProvider),
-                paths.TelemetryRejectedRoot));
+                telemetryWriter,
+                paths.TelemetryRejectedRoot),
+            emitRuntimeEvents ? telemetryWriter : null);
     }
 
     private static async Task WriteLegacyIdentityAsync(string path)
@@ -442,6 +564,33 @@ public sealed class EndToEndDataSyncTests : IDisposable
         return new ParserArtifact(installManifest, sha256);
     }
 
+    private static async Task<ParserArtifact> CreateFailingParserArtifactAsync(
+        string parserRoot,
+        string stderrCode)
+    {
+        if (OperatingSystem.IsWindows())
+            throw new PlatformNotSupportedException("Unix parser fixture requested on Windows.");
+        Directory.CreateDirectory(parserRoot);
+        var executable = Path.Combine(parserRoot, "wx_parser.exe");
+        await File.WriteAllTextAsync(
+            executable,
+            $"#!/bin/sh\nprintf '%s\\n' '{stderrCode}' >&2\nexit 2\n");
+        File.SetUnixFileMode(
+            executable,
+            UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        var sha256 = await Sha256Async(executable);
+        var installManifest = Path.Combine(parserRoot, "parser-install.json");
+        await File.WriteAllTextAsync(
+            installManifest,
+            JsonSerializer.Serialize(new
+            {
+                schemaVersion = 1,
+                executablePath = "wx_parser.exe",
+                sha256,
+            }));
+        return new ParserArtifact(installManifest, sha256);
+    }
+
     private static string FindExecutable(string name)
     {
         foreach (var directory in (Environment.GetEnvironmentVariable("PATH") ?? "")
@@ -467,6 +616,55 @@ public sealed class EndToEndDataSyncTests : IDisposable
     {
         await using var stream = File.OpenRead(path);
         return Convert.ToHexString(await SHA256.HashDataAsync(stream)).ToLowerInvariant();
+    }
+
+    private static async Task<string> ReadLatestRuntimePayloadAsync(
+        string databasePath,
+        string eventType)
+    {
+        await using var connection = await SqliteConnectionFactory.OpenAsync(
+            databasePath,
+            readOnly: true,
+            default);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT payload_json
+            FROM runtime_event
+            WHERE event_type = $event_type
+              AND json_type(payload_json, '$.metrics') = 'object'
+            ORDER BY sequence DESC
+            LIMIT 1;
+            """;
+        command.Parameters.AddWithValue("$event_type", eventType);
+        return (string)(await command.ExecuteScalarAsync() ?? string.Empty);
+    }
+
+    private static async Task<string> ReadTelemetryPayloadAsync(
+        DataSyncRepository repository,
+        IOutboxProtector protector,
+        string eventName)
+    {
+        var rows = await repository.GetPendingOutboxAsync(100, default);
+        foreach (var row in rows.Where(item => item.Endpoint == "events"))
+        {
+            var plaintext = protector.Unprotect(row.Id, row.Endpoint, row.Ciphertext);
+            try
+            {
+                using var document = JsonDocument.Parse(plaintext);
+                if (string.Equals(
+                        document.RootElement.GetProperty("event_name").GetString(),
+                        eventName,
+                        StringComparison.Ordinal))
+                {
+                    return Encoding.UTF8.GetString(plaintext);
+                }
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(plaintext);
+            }
+        }
+        throw new Xunit.Sdk.XunitException($"Telemetry event '{eventName}' was not queued.");
     }
 
     private static string Hash(string material) =>

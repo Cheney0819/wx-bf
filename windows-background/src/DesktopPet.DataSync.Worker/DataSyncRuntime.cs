@@ -179,17 +179,31 @@ public sealed class DataSyncRuntime : IDataSyncRuntime
             TimeSpan.FromMinutes(3),
             cancellationToken);
         if (job is null) return false;
+        var stageKey = "input_list";
+        ParserProcessResult? process = null;
         try
         {
             var inputs = await _repository.ListParseJobInputsAsync(job.Id, cancellationToken);
+            stageKey = "job_build";
             var jobRoot = Path.Combine(_jobsRoot, job.Id);
             var built = Directory.Exists(jobRoot)
                 ? await _jobBuilder.LoadExistingAsync(job, inputs, 5000, cancellationToken)
                 : await _jobBuilder.BuildAsync(job, inputs, 5000, cancellationToken);
-            var process = await _supervisor.RunAsync(built.JobManifestPath, cancellationToken);
+            stageKey = "process_start";
+            try
+            {
+                process = await _supervisor.RunAsync(built.JobManifestPath, cancellationToken);
+            }
+            catch (ParserSupervisorException exception) when (exception.Code == "parser_cleanup_timeout")
+            {
+                stageKey = "process_cleanup";
+                throw;
+            }
+            stageKey = "process_exit";
             if (process.ExitCode != 0 || process.StdoutTruncated)
                 throw new InvalidDataException("Parser process did not return a bounded success object.");
             ParserCompletion completion;
+            stageKey = "completion_parse";
             try
             {
                 completion = JsonSerializer.Deserialize<ParserCompletion>(process.Stdout, JsonOptions) ??
@@ -208,14 +222,28 @@ public sealed class DataSyncRuntime : IDataSyncRuntime
             {
                 throw new InvalidDataException("Parser completion identity is invalid.");
             }
+            stageKey = "result_validate";
             var result = await _resultValidator.ValidateAsync(
                 expectedResultPath,
                 job.Id,
                 job.SourceSetId,
                 cancellationToken);
+            stageKey = "outbox_commit";
             await _outboxWriter.CommitAsync(job, result, cancellationToken);
             TryDeleteJobDirectory(built.JobRoot);
-            await RecordEventAsync("datasync_parser_completed", "success", cancellationToken);
+            stageKey = "completed";
+            await RecordEventAsync(
+                "datasync_parser_completed",
+                "success",
+                cancellationToken,
+                new
+                {
+                    stageCode = stageKey,
+                    messageCount = result.Messages.Count,
+                    contactCount = result.Contacts.Count,
+                    favoriteCount = result.Favorites.Count,
+                    noticeCount = result.Notices.Count,
+                });
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -224,9 +252,14 @@ public sealed class DataSyncRuntime : IDataSyncRuntime
         catch (Exception exception) when (exception is
             InvalidDataException or IOException or UnauthorizedAccessException or
             System.Security.Cryptography.CryptographicException or JsonException or
-            InvalidOperationException or ArgumentException)
+            InvalidOperationException or ArgumentException or System.ComponentModel.Win32Exception or
+            ParserSupervisorException)
         {
-            await RecordEventAsync("datasync_parser_failed", "bounded_failure", cancellationToken);
+            await RecordEventAsync(
+                "datasync_parser_failed",
+                "bounded_failure",
+                cancellationToken,
+                BuildParserFailureMetrics(stageKey, process, exception));
         }
         return true;
     }
@@ -296,25 +329,29 @@ public sealed class DataSyncRuntime : IDataSyncRuntime
     private Task RecordEventAsync(
         string eventType,
         string code,
-        CancellationToken cancellationToken) => RecordEventCoreAsync(eventType, code, cancellationToken);
+        CancellationToken cancellationToken,
+        object? metrics = null) => RecordEventCoreAsync(eventType, code, metrics, cancellationToken);
 
     private async Task RecordEventCoreAsync(
         string eventType,
         string code,
+        object? metrics,
         CancellationToken cancellationToken)
     {
         try
         {
+            var metricsElement = metrics is null
+                ? JsonSerializer.SerializeToElement(new { }, JsonOptions)
+                : JsonSerializer.SerializeToElement(metrics, JsonOptions);
             await _repository.RecordRuntimeEventAsync(
                 eventType,
-                JsonSerializer.Serialize(new { code }),
+                JsonSerializer.Serialize(new { code, metrics = metricsElement }, JsonOptions),
                 cancellationToken);
             if (_eventWriter is null) return;
             var bytes = Encoding.UTF8.GetBytes($"{eventType}|{code}|{DateTimeOffset.UtcNow:O}|{Guid.NewGuid():N}");
             string eventId;
             try { eventId = Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant(); }
             finally { CryptographicOperations.ZeroMemory(bytes); }
-            using var metrics = JsonDocument.Parse("{}");
             await _eventWriter.CommitAsync(
                 new OperationalTelemetryEnvelope(
                     1,
@@ -326,7 +363,7 @@ public sealed class DataSyncRuntime : IDataSyncRuntime
                         ? "error" : "info",
                     code,
                     DateTimeOffset.UtcNow,
-                    metrics.RootElement.Clone()),
+                    metricsElement),
                 cancellationToken);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -351,6 +388,64 @@ public sealed class DataSyncRuntime : IDataSyncRuntime
                 // Core state is already durable; telemetry diagnostics remain best effort.
             }
         }
+    }
+
+    private static object BuildParserFailureMetrics(
+        string stageKey,
+        ParserProcessResult? process,
+        Exception exception)
+    {
+        var stderrCode = ExtractStderrCode(process?.Stderr);
+        var metrics = new Dictionary<string, object?>(StringComparer.Ordinal)
+        {
+            ["stageCode"] = stageKey,
+            ["failureCode"] = ParserFailureCode(stageKey, exception),
+            ["stdoutTruncated"] = process?.StdoutTruncated ?? false,
+            ["stderrTruncated"] = process?.StderrTruncated ?? false,
+        };
+        if (process is not null) metrics["exitCode"] = process.ExitCode;
+        if (stderrCode is not null) metrics["stderrCode"] = stderrCode;
+        return metrics;
+    }
+
+    private static string ParserFailureCode(string stageKey, Exception exception)
+    {
+        if (exception is ParserSupervisorException supervisorException)
+            return supervisorException.Code;
+        return (stageKey, exception) switch
+        {
+            ("job_build", FileNotFoundException) => "parser_input_missing",
+            ("job_build", System.Security.Cryptography.CryptographicException) =>
+                "parser_input_hash_mismatch",
+            ("process_start", FileNotFoundException) => "parser_artifact_missing",
+            ("process_start", System.Security.Cryptography.CryptographicException) =>
+                "parser_hash_mismatch",
+            ("process_start", InvalidDataException or JsonException) => "parser_install_invalid",
+            ("process_start", System.ComponentModel.Win32Exception) =>
+                "parser_process_start_failed",
+            ("process_exit", InvalidDataException) => "parser_process_failed",
+            ("completion_parse", InvalidDataException or JsonException) =>
+                "parser_completion_invalid",
+            ("result_validate", FileNotFoundException) => "parser_result_missing",
+            ("result_validate", InvalidDataException or JsonException) => "parser_result_invalid",
+            ("outbox_commit", _) => "parser_outbox_commit_failed",
+            _ => "parser_bounded_failure",
+        };
+    }
+
+    private static string? ExtractStderrCode(string? stderr)
+    {
+        var token = stderr?
+            .Trim()
+            .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries)
+            .FirstOrDefault();
+        if (string.IsNullOrEmpty(token)) return null;
+        if (token.Length > 80 || token.Any(character =>
+                !(char.IsAsciiLetterOrDigit(character) || character is '_' or '-')))
+        {
+            return "stderr_present";
+        }
+        return token.ToLowerInvariant();
     }
 
     private static void TryDeleteJobDirectory(string path)
