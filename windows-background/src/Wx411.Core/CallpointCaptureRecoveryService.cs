@@ -66,6 +66,7 @@ public sealed class CallpointCaptureRecoveryService
             token);
 
         var ready = new CaptureReadySignal(collector.IsReadyForValidation);
+        string? lastCaptureFailure = null;
         if (!ready.Value)
         {
             var resolution = await WaitForCaptureProcessSelectionsAsync(
@@ -132,6 +133,8 @@ public sealed class CallpointCaptureRecoveryService
                             new Progress<CallpointCaptureStatus>(status =>
                                 progress.Report(new RecoveryProgress(22, status.Message, status.Detail))),
                             token);
+                        if (!string.IsNullOrWhiteSpace(captureResult?.Error))
+                            lastCaptureFailure = captureResult.Error;
                         captureResult?.Dispose();
                     }
                     finally
@@ -167,7 +170,11 @@ public sealed class CallpointCaptureRecoveryService
         }
 
         if (!ready.Value && collector.PendingMatches.Count == 0)
-            throw new InvalidOperationException("所有候选 PID 的调用点均未命中数据库 key。请确认先点捕获，再启动并登录目标程序。");
+        {
+            throw new InvalidOperationException(
+                lastCaptureFailure ??
+                "所有候选 PID 的调用点均未命中数据库 key。请确认先点捕获，再启动并登录目标程序。");
+        }
 
         var outputPaths = new List<string>();
         var failedDatabasePaths = new List<string>();

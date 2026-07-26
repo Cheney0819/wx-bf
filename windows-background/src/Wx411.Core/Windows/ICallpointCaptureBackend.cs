@@ -126,6 +126,16 @@ public sealed class FakeCaptureBackend : ICallpointCaptureBackend
             };
             channel.TryWrite(copy);
         }
-        return Task.FromResult<CapturedKeyMaterial?>(null);
+        if (string.IsNullOrWhiteSpace(_result?.Error))
+            return Task.FromResult<CapturedKeyMaterial?>(null);
+        return Task.FromResult<CapturedKeyMaterial?>(new CapturedKeyMaterial(
+            _result.CallpointName,
+            _result.HitRva,
+            _result.RegisterValues,
+            _result.Pid,
+            _result.CapturedAt)
+        {
+            Error = _result.Error,
+        });
     }
 }
