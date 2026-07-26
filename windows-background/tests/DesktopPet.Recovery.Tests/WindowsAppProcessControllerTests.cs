@@ -30,6 +30,31 @@ public sealed class WindowsAppProcessControllerTests
     }
 
     [Fact]
+    public async Task RestartInvokesCapturePreparationBeforeStartingTarget()
+    {
+        var executable = Path.GetFullPath(Path.Combine("opt", "one", "Weixin.exe"));
+        var operations = new FakeProcessOperations
+        {
+            Snapshots =
+            [new AppProcessSnapshot(10, 1, executable, DateTimeOffset.UnixEpoch)],
+        };
+        var controller = new WindowsAppProcessController(
+            operations,
+            TimeSpan.FromSeconds(5));
+
+        await controller.RestartAsync(
+            _ =>
+            {
+                operations.CapturePreparationStarted = true;
+                return Task.CompletedTask;
+            },
+            default);
+
+        Assert.True(operations.CapturePreparationStarted);
+        Assert.True(operations.CapturePreparationStartedBeforeProcessStart);
+    }
+
+    [Fact]
     public async Task RestartWithoutInteractiveTargetFailsBeforeStarting()
     {
         var operations = new FakeProcessOperations { Snapshots = [] };
@@ -67,6 +92,10 @@ public sealed class WindowsAppProcessControllerTests
 
         public string? StartedExecutable { get; private set; }
 
+        public bool CapturePreparationStarted { get; set; }
+
+        public bool CapturePreparationStartedBeforeProcessStart { get; private set; }
+
         public IReadOnlyList<AppProcessSnapshot> SnapshotInteractiveTargets() => Snapshots;
 
         public Task TerminateTreeAsync(
@@ -81,6 +110,7 @@ public sealed class WindowsAppProcessControllerTests
 
         public AppProcessIdentity Start(string executablePath)
         {
+            CapturePreparationStartedBeforeProcessStart = CapturePreparationStarted;
             StartedExecutable = executablePath;
             return new AppProcessIdentity(99, executablePath);
         }

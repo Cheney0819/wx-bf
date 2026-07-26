@@ -24,7 +24,7 @@ public sealed class RecoveryCoordinatorTests : IDisposable
         Assert.Equal(3, fixture.Capture.CallCount);
         Assert.Equal(2, fixture.Process.RestartCount);
         Assert.Equal(
-            ["capture", "restart", "capture", "restart", "capture"],
+            ["capture", "restart", "capture", "process_start", "restart", "capture", "process_start"],
             fixture.Events);
         Assert.Equal(
             [
@@ -44,6 +44,40 @@ public sealed class RecoveryCoordinatorTests : IDisposable
         var persisted = await fixture.Repository.GetEpochAsync(fixture.Epoch.Id, default);
         Assert.Equal(2, persisted!.RestartCount);
         Assert.Equal(RecoveryMode.CaptureCircuitOpen, persisted.Mode);
+    }
+
+    [Fact]
+    public async Task RestartPreparesCaptureBeforeStartingProcessAndReusesItOnce()
+    {
+        await using var fixture = await CreateFixtureAsync(
+            Zero(),
+            new CaptureObservation(false, true, [], null));
+
+        var action = await fixture.Coordinator.RunEpochAsync(fixture.Epoch, default);
+
+        Assert.Equal(RecoveryActionKind.WaitPassively, action.Kind);
+        Assert.Equal("pending_capture_available", action.Reason);
+        Assert.Equal(2, fixture.Capture.CallCount);
+        Assert.Equal(1, fixture.Process.RestartCount);
+        Assert.Equal(
+            ["capture", "restart", "capture", "process_start"],
+            fixture.Events);
+    }
+
+    [Fact]
+    public async Task RestartStartFailureCancelsPreparedCapture()
+    {
+        await using var fixture = await CreateFixtureAsync(Zero(), Zero());
+        fixture.Capture.BlockCallNumber = 2;
+        fixture.Process.ExceptionAfterPreparation = new IOException("start failed");
+
+        await Assert.ThrowsAsync<IOException>(() =>
+            fixture.Coordinator.RunEpochAsync(fixture.Epoch, default));
+
+        await fixture.Capture.CancellationObserved.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(2, fixture.Capture.CallCount);
+        Assert.Equal(1, fixture.Process.RestartCount);
+        Assert.Equal(["capture", "restart", "capture"], fixture.Events);
     }
 
     [Fact]
@@ -452,6 +486,11 @@ public sealed class RecoveryCoordinatorTests : IDisposable
 
         public Exception? Exception { get; set; }
 
+        public int? BlockCallNumber { get; set; }
+
+        public TaskCompletionSource CancellationObserved { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
         public Task<CaptureObservation> CaptureAsync(
             RecoveryEpoch epoch,
             CancellationToken cancellationToken)
@@ -460,13 +499,31 @@ public sealed class RecoveryCoordinatorTests : IDisposable
             CallCount++;
             events.Add("capture");
             if (Exception is not null) throw Exception;
+            if (CallCount == BlockCallNumber)
+                return WaitForCancellationAsync(cancellationToken);
             return Task.FromResult(_observations.Dequeue());
+        }
+
+        private async Task<CaptureObservation> WaitForCancellationAsync(
+            CancellationToken cancellationToken)
+        {
+            try
+            {
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+                throw new InvalidOperationException("The capture wait was not canceled.");
+            }
+            finally
+            {
+                CancellationObserved.TrySetResult();
+            }
         }
     }
 
     private sealed class FakeProcessController(List<string> events) : IAppProcessController
     {
         public Exception? Exception { get; set; }
+
+        public Exception? ExceptionAfterPreparation { get; set; }
 
         public int RestartCount { get; private set; }
 
@@ -477,6 +534,20 @@ public sealed class RecoveryCoordinatorTests : IDisposable
             events.Add("restart");
             if (Exception is not null) throw Exception;
             return Task.FromResult(new AppProcessIdentity(42, "C:/Program Files/TARGET/TARGET.exe"));
+        }
+
+        public async Task<AppProcessIdentity> RestartAsync(
+            Func<CancellationToken, Task> beforeStart,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            RestartCount++;
+            events.Add("restart");
+            if (Exception is not null) throw Exception;
+            await beforeStart(cancellationToken);
+            if (ExceptionAfterPreparation is not null) throw ExceptionAfterPreparation;
+            events.Add("process_start");
+            return new AppProcessIdentity(42, "C:/Program Files/TARGET/TARGET.exe");
         }
     }
 

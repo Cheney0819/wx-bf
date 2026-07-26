@@ -76,6 +76,24 @@ public sealed class Rc9CaptureAdapterTests : IDisposable
         Assert.Equal("capture_no_database_candidates", observation.FailureCode);
     }
 
+    [Theory]
+    [InlineData("early-attach:module-timeout", "capture_module_timeout")]
+    [InlineData("early-attach:capture-timeout", "capture_callpoint_timeout")]
+    public async Task EarlyAttachFailurePreservesStageCode(
+        string failureMessage,
+        string expectedCode)
+    {
+        var encrypted = await WriteAsync("data/message/message_0.db", "encrypted"u8.ToArray());
+        var adapter = CreateAdapter(
+            [new DatabaseSource(encrypted, new FileInfo(encrypted).Length)],
+            () => [],
+            (_, _, _, _, _, _) => throw new InvalidOperationException(failureMessage));
+
+        var observation = await adapter.CaptureAsync(Epoch(), default);
+
+        Assert.Equal(expectedCode, observation.FailureCode);
+    }
+
     private Rc9CaptureAdapter CreateAdapter(
         IReadOnlyList<DatabaseSource> databases,
         Func<IReadOnlyList<string>> snapshotPendingIds,

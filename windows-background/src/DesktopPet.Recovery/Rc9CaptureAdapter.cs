@@ -230,17 +230,37 @@ public sealed class Rc9CaptureAdapter : IRecoveryCaptureAdapter
             CryptographicException or Win32Exception or ArgumentException or
             PlatformNotSupportedException or NotSupportedException;
 
-    private static string FailureCode(Exception exception) => exception switch
+    private static string FailureCode(Exception exception)
     {
-        UnauthorizedAccessException => "capture_access_denied",
-        Win32Exception => "capture_windows_error",
-        CryptographicException => "capture_crypto_error",
-        IOException => "capture_io_error",
-        PlatformNotSupportedException or NotSupportedException => "capture_platform_unsupported",
-        ArgumentException => "capture_invalid_input",
-        InvalidOperationException => "capture_no_result",
-        _ => "capture_failed",
-    };
+        if (exception is InvalidOperationException invalid)
+        {
+            if (invalid.Message.Contains(
+                    "early-attach:module-timeout",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return "capture_module_timeout";
+            }
+
+            if (invalid.Message.Contains(
+                    "early-attach:capture-timeout",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return "capture_callpoint_timeout";
+            }
+        }
+
+        return exception switch
+        {
+            UnauthorizedAccessException => "capture_access_denied",
+            Win32Exception => "capture_windows_error",
+            CryptographicException => "capture_crypto_error",
+            IOException => "capture_io_error",
+            PlatformNotSupportedException or NotSupportedException => "capture_platform_unsupported",
+            ArgumentException => "capture_invalid_input",
+            InvalidOperationException => "capture_no_result",
+            _ => "capture_failed",
+        };
+    }
 
     private static string GenerationId(
         string epochId,

@@ -44,8 +44,14 @@ public sealed class WindowsAppProcessController : IAppProcessController
     }
 
     public async Task<AppProcessIdentity> RestartAsync(
+        CancellationToken cancellationToken) =>
+        await RestartAsync(static _ => Task.CompletedTask, cancellationToken);
+
+    public async Task<AppProcessIdentity> RestartAsync(
+        Func<CancellationToken, Task> beforeStart,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(beforeStart);
         cancellationToken.ThrowIfCancellationRequested();
         var snapshots = _operations.SnapshotInteractiveTargets()
             .Where(item => IsExpectedExecutable(item.ExecutablePath))
@@ -72,6 +78,8 @@ public sealed class WindowsAppProcessController : IAppProcessController
                 cancellationToken);
         }
 
+        cancellationToken.ThrowIfCancellationRequested();
+        await beforeStart(cancellationToken);
         cancellationToken.ThrowIfCancellationRequested();
         return _operations.Start(executablePath);
     }

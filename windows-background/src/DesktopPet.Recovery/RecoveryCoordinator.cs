@@ -55,6 +55,8 @@ public sealed class RecoveryCoordinator
     {
         ArgumentNullException.ThrowIfNull(epoch);
         await _gate.WaitAsync(cancellationToken);
+        Task<CaptureObservation>? preparedCaptureTask = null;
+        CancellationTokenSource? preparedCaptureCancellation = null;
         try
         {
             var current = await RequireActiveEpochAsync(epoch.Id, cancellationToken);
@@ -109,11 +111,16 @@ public sealed class RecoveryCoordinator
                             },
                             cancellationToken);
                         CaptureObservation observation;
+                        var captureTask = preparedCaptureTask;
+                        var captureCancellation = preparedCaptureCancellation;
+                        preparedCaptureTask = null;
+                        preparedCaptureCancellation = null;
                         try
                         {
-                            observation = await _captureAdapter.CaptureAsync(
+                            captureTask ??= _captureAdapter.CaptureAsync(
                                 current,
                                 cancellationToken);
+                            observation = await captureTask;
                         }
                         catch (Exception) when (!cancellationToken.IsCancellationRequested)
                         {
@@ -124,6 +131,10 @@ public sealed class RecoveryCoordinator
                                 new { restartCount = current.RestartCount },
                                 CancellationToken.None);
                             throw;
+                        }
+                        finally
+                        {
+                            captureCancellation?.Dispose();
                         }
                         action = await _stateMachine.ObserveAsync(
                             epoch.Id,
@@ -184,9 +195,28 @@ public sealed class RecoveryCoordinator
                             "restart_started",
                             new { restartCount = current.RestartCount },
                             cancellationToken);
+                        CancellationTokenSource? preparationCancellation = null;
+                        Task<CaptureObservation>? preparationTask = null;
                         try
                         {
-                            await _processController.RestartAsync(cancellationToken);
+                            preparationCancellation =
+                                CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                            await _processController.RestartAsync(
+                                token =>
+                                {
+                                    token.ThrowIfCancellationRequested();
+                                    preparationTask = _captureAdapter.CaptureAsync(
+                                        current,
+                                        preparationCancellation.Token);
+                                    return Task.CompletedTask;
+                                },
+                                cancellationToken);
+                            preparedCaptureTask = preparationTask ??
+                                throw new InvalidOperationException(
+                                    "Capture preparation did not start before the target process.");
+                            preparedCaptureCancellation = preparationCancellation;
+                            preparationTask = null;
+                            preparationCancellation = null;
                         }
                         catch (Exception) when (!cancellationToken.IsCancellationRequested)
                         {
@@ -197,6 +227,12 @@ public sealed class RecoveryCoordinator
                                 new { restartCount = current.RestartCount },
                                 CancellationToken.None);
                             throw;
+                        }
+                        finally
+                        {
+                            CancelAndObservePreparedCapture(
+                                preparationTask,
+                                preparationCancellation);
                         }
                         await PublishTelemetryBestEffortAsync(
                             "recovery_restart_completed",
@@ -258,8 +294,35 @@ public sealed class RecoveryCoordinator
         }
         finally
         {
+            CancelAndObservePreparedCapture(
+                preparedCaptureTask,
+                preparedCaptureCancellation);
             _gate.Release();
         }
+    }
+
+    private static void CancelAndObservePreparedCapture(
+        Task<CaptureObservation>? captureTask,
+        CancellationTokenSource? cancellation)
+    {
+        if (cancellation is null) return;
+        cancellation.Cancel();
+        if (captureTask is null)
+        {
+            cancellation.Dispose();
+            return;
+        }
+
+        _ = captureTask.ContinueWith(
+            static (completed, state) =>
+            {
+                _ = completed.Exception;
+                ((CancellationTokenSource)state!).Dispose();
+            },
+            cancellation,
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
     }
 
     private async Task PublishTelemetryBestEffortAsync(
