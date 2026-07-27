@@ -9,12 +9,50 @@ capture with `unsupported_module`. The supplied production sample is
 The current catalog accepts only exact identities `4.1.11.55` and
 `4.1.12.24`.
 
+## IDA Evidence
+
+The supplied loose IDA database was analyzed in the already-open IDA Pro 9.2
+process after `ida_auto.auto_wait()`. Hex-Rays successfully decompiled every
+candidate. The read-only evidence exports are kept beside the supplied sample:
+
+- `weixin_4.1.12.26_ida_evidence.json`
+- `weixin_4.1.12.26_ida_evidence.md`
+- `analyze_weixin_411226_key_callpoints.py`
+
+The script made no names, types, comments, byte patches, or other IDB changes.
+
+The recovered call chain is:
+
+```text
+sqlite3_key(a1, pKey, nKey)
+  -> codec_attach(a1, mainDbIndex, pKey, nKey)
+     -> codec_init(holder, db, codec, pKey, nKey)
+        -> codec_set_pass(codec, pKey, nKey, mode=0)
+
+sqlite3_key_v2(a1, dbName, pKey, nKey)
+  -> codec_attach(a1, selectedDbIndex, pKey, nKey)
+```
+
+At `sqlite3_key_sink + 0x2A`, the four instructions are `mov rcx,[rdi+38h]`,
+`mov rdx,rax`, `mov r8d,ebx`, and `call sqlite3_key`, proving that the chosen
+breakpoint sees `RDX=pKey` and `R8D=nKey`. The entry-point prototypes recovered
+by Hex-Rays independently prove the Windows x64 register assignments for the
+other five points.
+
+The `DB_KEY_STING` string xref is not a key source. Its only enclosing function,
+`sub_180568FB0`, copies an input `std::string` and appends the literal text
+`DB_KEY_STING`; it does not read or forward key material. The two historical
+business-key fallback definitions are also not required for this profile:
+runtime arms at most four points and the first four verified SQLCipher points
+cover both `sqlite3_key` entry paths and the shared codec path.
+
 ## Sample Evidence
 
 The supplied 191,480,360-byte PE sample contains the following verified
 callpoints. The first three signatures occur exactly once in the complete
-image. `codec_attach_equiv` is identified by its function signature and by the
-unchanged relative layout of the adjacent SQLCipher functions.
+image. `codec_attach_equiv` is identified by its function signature, its
+callers from both key APIs, its call to `codec_init`, and the unchanged relative
+layout of the adjacent SQLCipher functions.
 
 | Callpoint | Signature RVA | Breakpoint RVA | Register semantics |
 |---|---:|---:|---|
@@ -34,7 +72,8 @@ register setup, rather than the deltas alone, establish the new locations.
 Add a separate `Weixin411226` `ModuleCallpointProfile` with the exact version,
 exact SHA-256, `StructureOnly` holder strategy, and the six verified
 callpoints above. Keep the four primary points first because the debugger arms
-at most four breakpoints per attach. Keep `.24` and `.11` profiles unchanged.
+at most four breakpoints per attach. Do not add unproven `.26` business-key
+fallbacks. Keep `.24` and `.11` profiles unchanged.
 
 Make `.26` the preferred profile so the requested callpoint-name set includes
 all six verified names. This preserves the existing first four selections for

@@ -62,6 +62,10 @@ public static class CallpointProfiles
     public const string CurrentModuleSha256 =
         "f8bb1a54081beb90a6cad36e8951f0eb5d2f3c424d8623558550ba19d35edb01";
 
+    public const string LatestModuleVersion = "4.1.12.26";
+    public const string LatestModuleSha256 =
+        "4914a621a810ecbc0a132b6ff8f612658cfce323d3989b3e5fe32d4ff343ba46";
+
     private static readonly byte[] SigSqlite3Key = [
         0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54,
         0x56, 0x57, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48,
@@ -231,6 +235,64 @@ public static class CallpointProfiles
         CallpointRegisterSemantics.BusinessKeyPreEncode,
         "0x3EA742: R8=clear std::string*.");
 
+    private static readonly CallpointDefinition LatestCodecSetPassEquivalent = new(
+        "codec_set_pass_equiv",
+        SignatureRva: 0x3485AE0,
+        BreakpointRva: 0x3485AE0,
+        [
+            0x41, 0x57, 0x41, 0x56, 0x41, 0x54, 0x56, 0x57,
+            0x55, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x44, 0x89,
+            0xCF, 0x44, 0x89, 0xC5, 0x49, 0x89, 0xD6, 0x48,
+            0x89, 0xCE, 0x31, 0xC0, 0x45, 0x85, 0xC9, 0x0F,
+        ],
+        CallpointRegisterSemantics.Sqlite3KeySink,
+        "0x3485AE0: RDX=pKey ptr, R8D=nKey before MMV1 transform.");
+
+    private static readonly CallpointDefinition LatestSqlite3KeyEquivalent = new(
+        "sqlite3_key_equiv",
+        SignatureRva: 0x55380B0,
+        BreakpointRva: 0x55380B0,
+        SigSqlite3Key,
+        CallpointRegisterSemantics.Sqlite3KeySink,
+        "0x55380B0: RDX=pKey ptr, R8D=nKey.");
+
+    private static readonly CallpointDefinition LatestSqlite3KeyV2Equivalent = new(
+        "sqlite3_key_v2_equiv",
+        SignatureRva: 0x5538160,
+        BreakpointRva: 0x5538160,
+        SigSqlite3KeyV2,
+        CallpointRegisterSemantics.KeyInR8LengthInR9D,
+        "0x5538160: R8=pKey ptr, R9D=nKey.");
+
+    private static readonly CallpointDefinition LatestCodecAttachEquivalent = new(
+        "codec_attach_equiv",
+        SignatureRva: 0x5537EC0,
+        BreakpointRva: 0x5537EC0,
+        [
+            0x41, 0x57, 0x41, 0x56, 0x41, 0x54, 0x56, 0x57,
+            0x55, 0x53, 0x48, 0x83, 0xEC, 0x40, 0x48, 0x89,
+            0xCE, 0x48, 0x8B, 0x05, 0x68, 0xD4, 0x2B, 0x05,
+            0x48, 0x31, 0xE0, 0x48, 0x89, 0x44, 0x24, 0x38,
+        ],
+        CallpointRegisterSemantics.KeyInR8LengthInR9D,
+        "0x5537EC0: R8=pKey ptr, R9D=nKey.");
+
+    private static readonly CallpointDefinition LatestSqlite3KeySink = new(
+        "sqlite3_key_sink",
+        SignatureRva: 0x34B8A60,
+        BreakpointRva: 0x34B8A6A,
+        [0x48, 0x8B, 0x4F, 0x38, 0x48, 0x89, 0xC2, 0x41, 0x89, 0xD8],
+        CallpointRegisterSemantics.Sqlite3KeySink,
+        "0x34B8A6A: RDX=pKey ptr, R8D=nKey.");
+
+    private static readonly CallpointDefinition LatestCodecInitEquivalent = new(
+        "codec_init_equiv",
+        SignatureRva: 0x3486270,
+        BreakpointRva: 0x3486270,
+        SigCodecInit,
+        CallpointRegisterSemantics.KeyInR9LengthStack5,
+        "0x3486270: R9=pKey ptr, [RSP+0x28]=nKey.");
+
     public static CallpointDefinition[] All { get; } = [
         Sqlite3KeySink,
         Sqlite3KeyEquivalent,
@@ -265,12 +327,27 @@ public static class CallpointProfiles
             CurrentBusinessKeyPreEncode,
         ]);
 
+    public static ModuleCallpointProfile Weixin411226 { get; } = new(
+        "Weixin.dll 4.1.12.26",
+        LatestModuleVersion,
+        LatestModuleSha256,
+        CodecHolderStrategy.StructureOnly,
+        [
+            LatestCodecSetPassEquivalent,
+            LatestSqlite3KeyEquivalent,
+            LatestSqlite3KeyV2Equivalent,
+            LatestCodecAttachEquivalent,
+            LatestSqlite3KeySink,
+            LatestCodecInitEquivalent,
+        ]);
+
     public static IReadOnlyList<ModuleCallpointProfile> Supported { get; } = [
         Weixin411155,
         Weixin411224,
+        Weixin411226,
     ];
 
-    public static ModuleCallpointProfile Preferred => Weixin411224;
+    public static ModuleCallpointProfile Preferred => Weixin411226;
 
     public static ModuleCallpointProfile? FindByIdentity(string moduleVersion, string moduleSha256)
     {

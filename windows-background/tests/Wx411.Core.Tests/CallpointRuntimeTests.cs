@@ -8,7 +8,7 @@ namespace Wx411.Core.Tests;
 public sealed class CallpointRuntimeTests
 {
     [Fact]
-    public void ModuleProfileCatalogSelectsBothExactIdentities()
+    public void ModuleProfileCatalogSelectsAllExactIdentities()
     {
         var profileType = typeof(CallpointProfiles).Assembly.GetType("Wx411.Core.ModuleCallpointProfile");
         Assert.NotNull(profileType);
@@ -21,7 +21,7 @@ public sealed class CallpointRuntimeTests
         var supported = Assert.IsAssignableFrom<System.Collections.IEnumerable>(
             supportedProperty!.GetValue(null));
         var profiles = supported.Cast<object>().ToArray();
-        Assert.Equal(2, profiles.Length);
+        Assert.Equal(3, profiles.Length);
 
         var find = typeof(CallpointProfiles).GetMethod(
             "FindByIdentity",
@@ -40,12 +40,71 @@ public sealed class CallpointRuntimeTests
                 "F8BB1A54081BEB90A6CAD36E8951F0EB5D2F3C424D8623558550BA19D35EDB01",
             ]),
             "4.1.12.24");
+        AssertProfile(
+            find.Invoke(null, [
+                "4.1.12.26",
+                "4914A621A810ECBC0A132B6FF8F612658CFCE323D3989B3E5FE32D4FF343BA46",
+            ]),
+            "4.1.12.26");
         Assert.Null(find.Invoke(null, ["4.1.12.24", new string('0', 64)]));
+        Assert.Null(find.Invoke(null, ["4.1.12.26", new string('0', 64)]));
+        Assert.Same(RequiredProfile("Weixin411226"), CallpointProfiles.Preferred);
 
         static void AssertProfile(object? profile, string expectedVersion)
         {
             Assert.NotNull(profile);
             Assert.Equal(expectedVersion, profile!.GetType().GetProperty("ModuleVersion")!.GetValue(profile));
+        }
+    }
+
+    [Fact]
+    public void LatestModuleProfileDefinesSixIdaVerifiedPoints()
+    {
+        var profile = RequiredProfile("Weixin411226");
+        var callpoints = Assert.IsAssignableFrom<IEnumerable<CallpointDefinition>>(
+            profile.GetType().GetProperty("Callpoints")!.GetValue(profile)).ToArray();
+
+        Assert.Equal(
+            [
+                "codec_set_pass_equiv",
+                "sqlite3_key_equiv",
+                "sqlite3_key_v2_equiv",
+                "codec_attach_equiv",
+                "sqlite3_key_sink",
+                "codec_init_equiv",
+            ],
+            callpoints.Select(item => item.Name).ToArray());
+
+        AssertCallpoint(callpoints[0], 0x3485AE0, 0x3485AE0,
+            CallpointRegisterSemantics.Sqlite3KeySink,
+            "415741564154565755534883EC204489CF4489C54989D64889CE31C04585C90F");
+        AssertCallpoint(callpoints[1], 0x55380B0, 0x55380B0,
+            CallpointRegisterSemantics.Sqlite3KeySink,
+            "41574156415541545657534883EC204889D74885C90F94C04885D20F94C208C2");
+        AssertCallpoint(callpoints[2], 0x5538160, 0x5538160,
+            CallpointRegisterSemantics.KeyInR8LengthInR9D,
+            "415741564154565755534883EC204889D64885C90F94C04D85C00F94C208C245");
+        AssertCallpoint(callpoints[3], 0x5537EC0, 0x5537EC0,
+            CallpointRegisterSemantics.KeyInR8LengthInR9D,
+            "415741564154565755534883EC404889CE488B0568D42B054831E04889442438");
+        AssertCallpoint(callpoints[4], 0x34B8A60, 0x34B8A6A,
+            CallpointRegisterSemantics.Sqlite3KeySink,
+            "488B4F384889C24189D8");
+        AssertCallpoint(callpoints[5], 0x3486270, 0x3486270,
+            CallpointRegisterSemantics.KeyInR9LengthStack5,
+            "41574156565755534883EC380F297424204C89CF4989D64989CF8B9C24900000");
+
+        static void AssertCallpoint(
+            CallpointDefinition actual,
+            int signatureRva,
+            int breakpointRva,
+            CallpointRegisterSemantics semantics,
+            string signatureHex)
+        {
+            Assert.Equal(signatureRva, actual.SignatureRva);
+            Assert.Equal(breakpointRva, actual.BreakpointRva);
+            Assert.Equal(semantics, actual.Semantics);
+            Assert.Equal(signatureHex, Convert.ToHexString(actual.ExpectedSig));
         }
     }
 
@@ -113,11 +172,13 @@ public sealed class CallpointRuntimeTests
     {
         var legacy = RequiredProfile("Weixin411155");
         var current = RequiredProfile("Weixin411224");
+        var latest = RequiredProfile("Weixin411226");
         var strategy = legacy.GetType().GetProperty("HolderStrategy");
 
         Assert.NotNull(strategy);
         Assert.Equal("LegacyXor", strategy!.GetValue(legacy)!.ToString());
         Assert.Equal("StructureOnly", strategy.GetValue(current)!.ToString());
+        Assert.Equal("StructureOnly", strategy.GetValue(latest)!.ToString());
     }
 
     [Fact]
@@ -141,6 +202,16 @@ public sealed class CallpointRuntimeTests
         Assert.NotNull(rejected);
         Assert.False((bool)rejected!.GetType().GetProperty("IsValid")!.GetValue(rejected)!);
         Assert.Null(rejected.GetType().GetProperty("Profile")!.GetValue(rejected));
+
+        var latest = validate.Invoke(null, [
+            "4.1.12.26",
+            "4914a621a810ecbc0a132b6ff8f612658cfce323d3989b3e5fe32d4ff343ba46",
+        ]);
+        Assert.NotNull(latest);
+        Assert.True((bool)latest!.GetType().GetProperty("IsValid")!.GetValue(latest)!);
+        Assert.Same(
+            RequiredProfile("Weixin411226"),
+            latest.GetType().GetProperty("Profile")!.GetValue(latest));
     }
 
     [Fact]
