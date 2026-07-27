@@ -57,6 +57,8 @@ public sealed class RecoveryCoordinator
         await _gate.WaitAsync(cancellationToken);
         Task<CaptureObservation>? preparedCaptureTask = null;
         CancellationTokenSource? preparedCaptureCancellation = null;
+        var completedRelativePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var continueCaptureAfterPublish = false;
         try
         {
             var current = await RequireActiveEpochAsync(epoch.Id, cancellationToken);
@@ -64,6 +66,7 @@ public sealed class RecoveryCoordinator
             {
                 var reuseResult = await _keyReuseAdapter.TryDecryptAsync(current, cancellationToken);
                 var reuse = reuseResult.Observation;
+                AddCompletedRelativePaths(completedRelativePaths, reuse.Databases);
                 if (reuse.HasValidatedKey || reuse.HasPendingCapture || reuse.OutputPaths.Count > 0)
                 {
                     var requiredDatabasesComplete =
@@ -83,6 +86,7 @@ public sealed class RecoveryCoordinator
                     {
                         await PublishDecryptResultBestEffortAsync(
                             reuse,
+                            completedRelativePaths.Count,
                             cancellationToken);
                         var publication = await _handoffPublisher.PublishWithStatusAsync(
                             epoch.Id,
@@ -117,6 +121,7 @@ public sealed class RecoveryCoordinator
                 {
                     case RecoveryActionKind.CaptureCurrent:
                         current = await RequireActiveEpochAsync(epoch.Id, cancellationToken);
+                        continueCaptureAfterPublish = false;
                         await PublishTelemetryBestEffortAsync(
                             "recovery_capture_started",
                             "info",
@@ -137,6 +142,7 @@ public sealed class RecoveryCoordinator
                             captureTask ??= _captureAdapter.CaptureAsync(
                                 current,
                                 RecoveryCaptureTarget.BoundProcess,
+                                Snapshot(completedRelativePaths),
                                 cancellationToken);
                             observation = await captureTask;
                         }
@@ -158,6 +164,10 @@ public sealed class RecoveryCoordinator
                             epoch.Id,
                             observation,
                             cancellationToken);
+                        AddCompletedRelativePaths(completedRelativePaths, observation.Databases);
+                        continueCaptureAfterPublish = observation.OutputPaths.Count > 0 &&
+                            (observation.UnmatchedDatabases.Count > 0 ||
+                             observation.FailedDatabases.Count > 0);
                         var observationCode = StableCodeOrDefault(
                             observation.FailureCode,
                             "capture_failed");
@@ -181,6 +191,7 @@ public sealed class RecoveryCoordinator
                             {
                                 await PublishDecryptResultBestEffortAsync(
                                     observation,
+                                    completedRelativePaths.Count,
                                     cancellationToken);
                             }
                         }
@@ -257,6 +268,7 @@ public sealed class RecoveryCoordinator
                                     preparationTask = _captureAdapter.CaptureAsync(
                                         current,
                                         RecoveryCaptureTarget.RestartedProcess,
+                                        Snapshot(completedRelativePaths),
                                         preparationCancellation.Token);
                                     return Task.CompletedTask;
                                 },
@@ -311,6 +323,12 @@ public sealed class RecoveryCoordinator
                                     action.RequiredDatabasesComplete,
                                 },
                                 cancellationToken);
+                        }
+                        if (continueCaptureAfterPublish)
+                        {
+                            action = RecoveryAction.CaptureCurrent();
+                            continueCaptureAfterPublish = false;
+                            break;
                         }
                         return action;
 
@@ -431,12 +449,15 @@ public sealed class RecoveryCoordinator
 
     private Task PublishDecryptResultBestEffortAsync(
         CaptureObservation observation,
+        int completedDatabaseCount,
         CancellationToken cancellationToken)
     {
         var databaseCount = Math.Max(
             observation.CandidateDatabaseCount,
             Math.Max(observation.Databases.Count, observation.OutputPaths.Count));
-        var outputCount = Math.Min(observation.OutputPaths.Count, databaseCount);
+        var outputCount = Math.Min(
+            Math.Max(observation.OutputPaths.Count, completedDatabaseCount),
+            databaseCount);
         var pendingCount = Math.Max(0, databaseCount - outputCount);
         return PublishTelemetryBestEffortAsync(
             "client_wechat_decrypt_export_result",
@@ -459,6 +480,20 @@ public sealed class RecoveryCoordinator
             character is >= 'a' and <= 'z' || char.IsAsciiDigit(character) || character == '_')
             ? value
             : fallback;
+
+    private static void AddCompletedRelativePaths(
+        ISet<string> completedRelativePaths,
+        IEnumerable<RecoveredDatabase> databases)
+    {
+        foreach (var database in databases)
+        {
+            if (!string.IsNullOrWhiteSpace(database.RelativePath))
+                completedRelativePaths.Add(database.RelativePath.Replace('\\', '/'));
+        }
+    }
+
+    private static IReadOnlySet<string> Snapshot(IEnumerable<string> values) =>
+        values.ToHashSet(StringComparer.OrdinalIgnoreCase);
 
     private async Task<RecoveryEpoch> RequireActiveEpochAsync(
         string epochId,

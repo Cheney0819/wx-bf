@@ -20,6 +20,13 @@ public interface IRecoveryCaptureAdapter
         RecoveryCaptureTarget target,
         CancellationToken cancellationToken) =>
         CaptureAsync(epoch, cancellationToken);
+
+    Task<CaptureObservation> CaptureAsync(
+        RecoveryEpoch epoch,
+        RecoveryCaptureTarget target,
+        IReadOnlySet<string> completedRelativePaths,
+        CancellationToken cancellationToken) =>
+        CaptureAsync(epoch, target, cancellationToken);
 }
 
 public interface IRecoveryKeyReuseAdapter

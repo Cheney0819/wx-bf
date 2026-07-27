@@ -244,6 +244,109 @@ public sealed class RecoveryCoordinatorTests : IDisposable
     }
 
     [Fact]
+    public async Task PartialBatchPublishesAndContinuesWithCompletedDatabaseExcluded()
+    {
+        var auxiliarySource = await WriteStagingAsync("hardlink.sqlite", "auxiliary"u8.ToArray());
+        var messageSource = await WriteStagingAsync("message.sqlite", "message"u8.ToArray());
+        var auxiliary = new RecoveredDatabase(
+            new string('6', 64),
+            "db_storage/hardlink/hardlink.db",
+            auxiliarySource,
+            await Sha256Async(auxiliarySource));
+        var message = new RecoveredDatabase(
+            new string('7', 64),
+            "db_storage/message/message_0.db",
+            messageSource,
+            await Sha256Async(messageSource));
+        await using var fixture = await CreateFixtureAsync(
+            new CaptureObservation(
+                HasValidatedKey: true,
+                HasPendingCapture: false,
+                OutputPaths: [auxiliarySource],
+                FailureCode: null,
+                RecoveredDatabases: [auxiliary],
+                CandidateDatabaseCount: 2,
+                UnmatchedDatabasePaths: ["C:/fixture/db_storage/message/message_0.db"],
+                RequiredDatabasesComplete: false),
+            new CaptureObservation(
+                HasValidatedKey: true,
+                HasPendingCapture: false,
+                OutputPaths: [messageSource],
+                FailureCode: null,
+                RecoveredDatabases: [message],
+                CandidateDatabaseCount: 2,
+                RequiredDatabasesComplete: true));
+
+        var action = await fixture.Coordinator.RunEpochAsync(fixture.Epoch, default);
+
+        Assert.Equal(RecoveryActionKind.PublishOutputs, action.Kind);
+        Assert.Equal(2, fixture.Capture.CallCount);
+        Assert.Equal(2, Directory.EnumerateFiles(
+            Path.Combine(_root, "handoff", "ready"),
+            "*.json").Count());
+        Assert.Empty(fixture.Capture.CompletedPathSnapshots[0]);
+        Assert.Contains(
+            "db_storage/hardlink/hardlink.db",
+            fixture.Capture.CompletedPathSnapshots[1]);
+        Assert.Equal("db_storage/message/message_0.db", Assert.Single(action.Databases).RelativePath);
+        var decryptEvents = fixture.Telemetry.Events
+            .Where(draft => draft.EventName == "client_wechat_decrypt_export_result")
+            .ToArray();
+        Assert.Equal(2, decryptEvents.Length);
+        Assert.Equal(1, decryptEvents[0].Metrics.GetProperty("outputCount").GetInt32());
+        Assert.Equal(1, decryptEvents[0].Metrics.GetProperty("pendingCount").GetInt32());
+        Assert.Equal("success", decryptEvents[1].Code);
+        Assert.Equal(2, decryptEvents[1].Metrics.GetProperty("outputCount").GetInt32());
+        Assert.Equal(0, decryptEvents[1].Metrics.GetProperty("pendingCount").GetInt32());
+    }
+
+    [Fact]
+    public async Task RestartedCaptureKeepsCompletedDatabaseExclusions()
+    {
+        var auxiliarySource = await WriteStagingAsync("restart-hardlink.sqlite", "auxiliary"u8.ToArray());
+        var messageSource = await WriteStagingAsync("restart-message.sqlite", "message"u8.ToArray());
+        var auxiliary = new RecoveredDatabase(
+            new string('8', 64),
+            "db_storage/hardlink/hardlink.db",
+            auxiliarySource,
+            await Sha256Async(auxiliarySource));
+        var message = new RecoveredDatabase(
+            new string('9', 64),
+            "db_storage/message/message_0.db",
+            messageSource,
+            await Sha256Async(messageSource));
+        await using var fixture = await CreateFixtureAsync(
+            new CaptureObservation(
+                HasValidatedKey: true,
+                HasPendingCapture: false,
+                OutputPaths: [auxiliarySource],
+                FailureCode: null,
+                RecoveredDatabases: [auxiliary],
+                CandidateDatabaseCount: 2,
+                UnmatchedDatabasePaths: ["C:/fixture/db_storage/message/message_0.db"],
+                RequiredDatabasesComplete: false),
+            Zero(),
+            new CaptureObservation(
+                HasValidatedKey: true,
+                HasPendingCapture: false,
+                OutputPaths: [messageSource],
+                FailureCode: null,
+                RecoveredDatabases: [message],
+                CandidateDatabaseCount: 2,
+                RequiredDatabasesComplete: true));
+
+        var action = await fixture.Coordinator.RunEpochAsync(fixture.Epoch, default);
+
+        Assert.Equal(RecoveryActionKind.PublishOutputs, action.Kind);
+        Assert.Equal(3, fixture.Capture.CallCount);
+        Assert.Equal(1, fixture.Process.RestartCount);
+        Assert.Equal(RecoveryCaptureTarget.RestartedProcess, fixture.Capture.Targets[2]);
+        Assert.Contains(
+            "db_storage/hardlink/hardlink.db",
+            fixture.Capture.CompletedPathSnapshots[2]);
+    }
+
+    [Fact]
     public async Task OversizedFailureCodeFallsBackBeforeTelemetryPublication()
     {
         var oversized = new string('a', 33);
@@ -593,6 +696,8 @@ public sealed class RecoveryCoordinatorTests : IDisposable
 
         public List<RecoveryCaptureTarget> Targets { get; } = [];
 
+        public List<IReadOnlySet<string>> CompletedPathSnapshots { get; } = [];
+
         public Exception? Exception { get; set; }
 
         public int? BlockCallNumber { get; set; }
@@ -608,10 +713,22 @@ public sealed class RecoveryCoordinatorTests : IDisposable
         public Task<CaptureObservation> CaptureAsync(
             RecoveryEpoch epoch,
             RecoveryCaptureTarget target,
+            CancellationToken cancellationToken) =>
+            CaptureAsync(
+                epoch,
+                target,
+                new HashSet<string>(StringComparer.Ordinal),
+                cancellationToken);
+
+        public Task<CaptureObservation> CaptureAsync(
+            RecoveryEpoch epoch,
+            RecoveryCaptureTarget target,
+            IReadOnlySet<string> completedRelativePaths,
             CancellationToken cancellationToken)
         {
             cancellationToken.ThrowIfCancellationRequested();
             Targets.Add(target);
+            CompletedPathSnapshots.Add(completedRelativePaths.ToHashSet(StringComparer.Ordinal));
             CallCount++;
             events.Add("capture");
             if (Exception is not null) throw Exception;

@@ -82,6 +82,51 @@ public sealed class Rc9CaptureAdapterTests : IDisposable
     }
 
     [Fact]
+    public async Task CompletedRelativePathsAreExcludedFromNextCaptureBatch()
+    {
+        var completed = await WriteAsync("data/hardlink/hardlink.db", "completed"u8.ToArray());
+        var remaining = await WriteAsync("data/message/message_0.db", "remaining"u8.ToArray());
+        var plaintext = await WriteAsync("output/message_0.sqlite", "plaintext"u8.ToArray());
+        var sources = new[]
+        {
+            new DatabaseSource(completed, new FileInfo(completed).Length),
+            new DatabaseSource(remaining, new FileInfo(remaining).Length),
+        };
+        IReadOnlyList<DatabaseSource>? capturedSources = null;
+        var result = new CaptureRecoveryResult(
+            [plaintext],
+            [new DatabaseCaptureMatch(
+                remaining,
+                new CipherProfileMatch(SqlCipher4.Profile, [1]),
+                "raw",
+                "sqlite3_key_equiv")],
+            [],
+            [],
+            []);
+        var adapter = CreateAdapter(
+            sources,
+            () => [],
+            (_, _, databases, _, _, _) =>
+            {
+                capturedSources = databases;
+                return Task.FromResult(result);
+            });
+
+        var observation = await adapter.CaptureAsync(
+            Epoch(),
+            RecoveryCaptureTarget.BoundProcess,
+            new HashSet<string>(StringComparer.Ordinal)
+            {
+                "hardlink/hardlink.db",
+            },
+            default);
+
+        Assert.Equal([remaining], capturedSources!.Select(database => database.Path));
+        Assert.Equal(2, observation.CandidateDatabaseCount);
+        Assert.Equal("message/message_0.db", Assert.Single(observation.Databases).RelativePath);
+    }
+
+    [Fact]
     public async Task BoundRuntimeScansAllProcessesWithinItsSessionAndExecutablePath()
     {
         var encrypted = await WriteAsync("data/message/message_0.db", "encrypted"u8.ToArray());

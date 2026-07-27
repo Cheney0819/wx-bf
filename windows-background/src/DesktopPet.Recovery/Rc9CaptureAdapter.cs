@@ -20,6 +20,8 @@ internal delegate Task<CaptureRecoveryResult> Rc9CaptureOperation(
 
 public sealed class Rc9CaptureAdapter : IRecoveryCaptureAdapter
 {
+    private static readonly IReadOnlySet<string> NoCompletedDatabases =
+        new HashSet<string>(StringComparer.OrdinalIgnoreCase);
     private string _dataRoot = null!;
     private string _outputDirectory = null!;
     private IProgress<RecoveryProgress> _progress = null!;
@@ -119,21 +121,49 @@ public sealed class Rc9CaptureAdapter : IRecoveryCaptureAdapter
     public Task<CaptureObservation> CaptureAsync(
         RecoveryEpoch epoch,
         CancellationToken cancellationToken) =>
-        CaptureAsync(epoch, RecoveryCaptureTarget.BoundProcess, cancellationToken);
+        CaptureAsync(
+            epoch,
+            RecoveryCaptureTarget.BoundProcess,
+            NoCompletedDatabases,
+            cancellationToken);
+
+    public Task<CaptureObservation> CaptureAsync(
+        RecoveryEpoch epoch,
+        RecoveryCaptureTarget target,
+        CancellationToken cancellationToken) =>
+        CaptureAsync(epoch, target, NoCompletedDatabases, cancellationToken);
 
     public async Task<CaptureObservation> CaptureAsync(
         RecoveryEpoch epoch,
         RecoveryCaptureTarget target,
+        IReadOnlySet<string> completedRelativePaths,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(epoch);
+        ArgumentNullException.ThrowIfNull(completedRelativePaths);
         cancellationToken.ThrowIfCancellationRequested();
-        var databases = _discoverDatabases();
-        if (databases.Count == 0)
+        var discoveredDatabases = _discoverDatabases();
+        if (discoveredDatabases.Count == 0)
             return Failure(
                 "capture_no_database_candidates",
                 hasPending: false,
                 candidateDatabaseCount: 0);
+        var completed = completedRelativePaths
+            .Select(NormalizeRelativePath)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var databases = discoveredDatabases
+            .Where(database => !completed.Contains(RelativePath(database.Path)))
+            .ToArray();
+        if (databases.Length == 0)
+        {
+            return new CaptureObservation(
+                HasValidatedKey: completed.Count > 0,
+                HasPendingCapture: false,
+                OutputPaths: [],
+                FailureCode: null,
+                CandidateDatabaseCount: discoveredDatabases.Count,
+                RequiredDatabasesComplete: true);
+        }
 
         var scopeMatches = string.Equals(
             epoch.Identity.DataRootIdentity,
@@ -177,7 +207,7 @@ public sealed class Rc9CaptureAdapter : IRecoveryCaptureAdapter
                         result.LoadedPendingCaptureTicketIds.Count > 0,
                     OutputPaths: [],
                     FailureCode: "capture_result_mapping_failed",
-                    CandidateDatabaseCount: databases.Count,
+                    CandidateDatabaseCount: discoveredDatabases.Count,
                     UnmatchedDatabasePaths: result.UnmatchedDatabasePaths,
                     FailedDatabasePaths: result.FailedDatabasePaths,
                     RequiredDatabasesComplete: RequiredDatabasesComplete(
@@ -192,7 +222,7 @@ public sealed class Rc9CaptureAdapter : IRecoveryCaptureAdapter
                 result.OutputPaths,
                 FailureCode: null,
                 recovered,
-                databases.Count,
+                discoveredDatabases.Count,
                 result.UnmatchedDatabasePaths,
                 result.FailedDatabasePaths,
                 RequiredDatabasesComplete(databases, result));
@@ -206,7 +236,7 @@ public sealed class Rc9CaptureAdapter : IRecoveryCaptureAdapter
             return Failure(
                 FailureCode(exception),
                 HasPendingAfter(context, pendingBefore, scopeMatches),
-                databases.Count);
+                discoveredDatabases.Count);
         }
     }
 
@@ -339,6 +369,12 @@ public sealed class Rc9CaptureAdapter : IRecoveryCaptureAdapter
         relativePath.Equals("..", StringComparison.Ordinal) ||
         relativePath.StartsWith(".." + Path.DirectorySeparatorChar, StringComparison.Ordinal) ||
         relativePath.StartsWith(".." + Path.AltDirectorySeparatorChar, StringComparison.Ordinal);
+
+    private string RelativePath(string databasePath) => NormalizeRelativePath(
+        Path.GetRelativePath(_dataRoot, Path.GetFullPath(databasePath)));
+
+    private static string NormalizeRelativePath(string path) =>
+        path.Replace('\\', '/').TrimStart('/');
 
     private static bool IsExpectedCaptureException(Exception exception) =>
         exception is InvalidOperationException or IOException or UnauthorizedAccessException or

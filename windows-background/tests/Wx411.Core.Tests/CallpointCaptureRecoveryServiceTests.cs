@@ -312,7 +312,7 @@ public sealed class CallpointCaptureRecoveryServiceTests
     [InlineData(false, 1, 4, 0, 5, false)]
     [InlineData(false, 1, 5, 0, 5, true)]
     [InlineData(true, 0, 0, 0, 5, true)]
-    public void CaptureMovesOnAfterMatchedDatabaseActivityBecomesIdle(
+    public void MatchedDatabaseIdleClosesOnlyTheCurrentCaptureBatch(
         bool ready,
         int pendingMatches,
         long nowSeconds,
