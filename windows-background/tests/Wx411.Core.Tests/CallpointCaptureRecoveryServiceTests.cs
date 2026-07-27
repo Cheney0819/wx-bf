@@ -1,4 +1,5 @@
 using Wx411.Core.Windows;
+using System.Diagnostics;
 using System.Security.Cryptography;
 
 namespace Wx411.Core.Tests;
@@ -290,6 +291,67 @@ public sealed class CallpointCaptureRecoveryServiceTests
         Assert.Equal(new[] { 20, 30 }, addedPids);
         Assert.Equal(new[] { 20, 30 }, queue.Select(target => target.Pid!.Value));
         Assert.Equal(new[] { 10, 20, 30 }, scheduledPids.Order());
+    }
+
+    [Fact]
+    public void AutomaticDiscoveryRefreshesOnlyAfterScheduledQueueIsDrained()
+    {
+        Assert.False(CallpointCaptureRecoveryService.ShouldRefreshCaptureTargets(
+            scanAll: false,
+            queuedTargetCount: 0));
+        Assert.False(CallpointCaptureRecoveryService.ShouldRefreshCaptureTargets(
+            scanAll: true,
+            queuedTargetCount: 4));
+        Assert.True(CallpointCaptureRecoveryService.ShouldRefreshCaptureTargets(
+            scanAll: true,
+            queuedTargetCount: 0));
+    }
+
+    [Theory]
+    [InlineData(false, 0, 10, 0, 5, false)]
+    [InlineData(false, 1, 4, 0, 5, false)]
+    [InlineData(false, 1, 5, 0, 5, true)]
+    [InlineData(true, 0, 0, 0, 5, true)]
+    public void CaptureMovesOnAfterMatchedDatabaseActivityBecomesIdle(
+        bool ready,
+        int pendingMatches,
+        long nowSeconds,
+        long activitySeconds,
+        long idleSeconds,
+        bool expected)
+    {
+        var frequency = Stopwatch.Frequency;
+
+        Assert.Equal(expected, CallpointCaptureRecoveryService.ShouldStopCurrentCapture(
+            ready,
+            pendingMatches,
+            nowSeconds * frequency,
+            activitySeconds * frequency,
+            TimeSpan.FromSeconds(idleSeconds),
+            frequency));
+    }
+
+    [Fact]
+    public void LateFirstMatchStartsANewIdleWindow()
+    {
+        long now = 0;
+        var signal = new CallpointCaptureRecoveryService.CaptureReadySignal(
+            initial: false,
+            pendingMatches: 0,
+            getTimestamp: () => now,
+            timestampFrequency: 1);
+        var targetStartedAt = now;
+
+        now = 10;
+        signal.Update(ready: false, pendingMatches: 1);
+
+        Assert.False(signal.ShouldStopCurrentCapture(
+            targetStartedAt,
+            TimeSpan.FromSeconds(5)));
+        now = 15;
+        Assert.True(signal.ShouldStopCurrentCapture(
+            targetStartedAt,
+            TimeSpan.FromSeconds(5)));
     }
 
     [Fact]

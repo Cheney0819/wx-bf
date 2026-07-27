@@ -82,7 +82,7 @@ public sealed class Rc9CaptureAdapterTests : IDisposable
     }
 
     [Fact]
-    public async Task BoundRuntimeTargetsExactPidThenUsesConstrainedRestartScan()
+    public async Task BoundRuntimeScansAllProcessesWithinItsSessionAndExecutablePath()
     {
         var encrypted = await WriteAsync("data/message/message_0.db", "encrypted"u8.ToArray());
         var source = new DatabaseSource(encrypted, new FileInfo(encrypted).Length);
@@ -113,8 +113,8 @@ public sealed class Rc9CaptureAdapterTests : IDisposable
             RecoveryCaptureTarget.RestartedProcess,
             default);
 
-        Assert.Equal(42, selections[0].Pid);
-        Assert.False(selections[0].ScanAll);
+        Assert.Null(selections[0].Pid);
+        Assert.True(selections[0].ScanAll);
         Assert.Equal(7, selections[0].SessionId);
         Assert.Equal(executable, selections[0].ExecutablePath);
         Assert.Null(selections[1].Pid);

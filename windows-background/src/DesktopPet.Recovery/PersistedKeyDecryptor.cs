@@ -51,71 +51,58 @@ public sealed class PersistedKeyDecryptor
         ArgumentNullException.ThrowIfNull(progress);
 
         var normalizedRoot = Path.GetFullPath(dataRoot);
-        var keyIds = _vault.ListIds();
+        IReadOnlyList<ValidatedKeyRecord>? storedKeys = null;
         var outputs = new List<string>();
         var recovered = new List<RecoveredDatabase>();
         var unresolvedRequired = new List<DatabaseSource>();
         var hasValidatedKey = false;
         var failureCount = 0;
 
-        foreach (var source in databases)
+        try
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            var resolvedThisDatabase = false;
-            try
+            foreach (var source in databases)
             {
-                var fullPath = Path.GetFullPath(source.Path);
-                var relativePath = Path.GetRelativePath(normalizedRoot, fullPath);
-                if (Path.IsPathRooted(relativePath) || IsParentTraversal(relativePath))
+                cancellationToken.ThrowIfCancellationRequested();
+                var resolvedThisDatabase = false;
+                try
                 {
-                    failureCount++;
-                    continue;
-                }
-
-                using var descriptor = DatabaseProbeDescriptor.Read(fullPath, cancellationToken);
-                if (descriptor.Profiles.Count == 0)
-                {
-                    failureCount++;
-                    continue;
-                }
-                var generationId = GenerationId(epoch.Id, relativePath, descriptor.Generation);
-                var existing = await _repository.GetGenerationAsync(
-                    generationId,
-                    cancellationToken);
-                if (existing is { Status: "completed", OutputPath: not null } &&
-                    File.Exists(existing.OutputPath))
-                {
-                    hasValidatedKey = true;
-                    outputs.Add(existing.OutputPath);
-                    recovered.Add(new RecoveredDatabase(
-                        generationId,
-                        relativePath,
-                        existing.OutputPath,
-                        await FileSha256Async(existing.OutputPath, cancellationToken)));
-                    resolvedThisDatabase = true;
-                    continue;
-                }
-
-                var matchedThisDatabase = false;
-                foreach (var keyId in keyIds)
-                {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    ValidatedKeyRecord? stored = null;
-                    try
+                    var fullPath = Path.GetFullPath(source.Path);
+                    var relativePath = Path.GetRelativePath(normalizedRoot, fullPath);
+                    if (Path.IsPathRooted(relativePath) || IsParentTraversal(relativePath))
                     {
-                        stored = _vault.Load(keyId);
-                    }
-                    catch (Exception exception) when (exception is
-                        IOException or UnauthorizedAccessException or
-                        ArgumentException or CryptographicException or
-                        InvalidDataException or JsonException)
-                    {
-                        _vault.Quarantine(keyId);
+                        failureCount++;
                         continue;
                     }
 
-                    using (stored)
+                    using var descriptor = DatabaseProbeDescriptor.Read(fullPath, cancellationToken);
+                    if (descriptor.Profiles.Count == 0)
                     {
+                        failureCount++;
+                        continue;
+                    }
+                    var generationId = GenerationId(epoch.Id, relativePath, descriptor.Generation);
+                    var existing = await _repository.GetGenerationAsync(
+                        generationId,
+                        cancellationToken);
+                    if (existing is { Status: "completed", OutputPath: not null } &&
+                        File.Exists(existing.OutputPath))
+                    {
+                        hasValidatedKey = true;
+                        outputs.Add(existing.OutputPath);
+                        recovered.Add(new RecoveredDatabase(
+                            generationId,
+                            relativePath,
+                            existing.OutputPath,
+                            await FileSha256Async(existing.OutputPath, cancellationToken)));
+                        resolvedThisDatabase = true;
+                        continue;
+                    }
+
+                    storedKeys ??= LoadUniqueKeys(cancellationToken);
+                    var matchedThisDatabase = false;
+                    foreach (var stored in storedKeys)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
                         var match = CipherProfileProbe.FindMatch(
                             descriptor,
                             stored.Key,
@@ -163,26 +150,33 @@ public sealed class PersistedKeyDecryptor
                         }
                         break;
                     }
-                }
 
-                if (!matchedThisDatabase && keyIds.Count > 0)
+                    if (!matchedThisDatabase && storedKeys.Count > 0)
+                    {
+                        progress.Report(new RecoveryProgress(
+                            5,
+                            $"持久 key 未匹配 {Path.GetFileName(fullPath)}",
+                            null));
+                    }
+                }
+                catch (Exception exception) when (exception is
+                    IOException or UnauthorizedAccessException or
+                    ArgumentException or CryptographicException or IntegrityException)
                 {
-                    progress.Report(new RecoveryProgress(
-                        5,
-                        $"持久 key 未匹配 {Path.GetFileName(fullPath)}",
-                        null));
+                    failureCount++;
+                }
+                finally
+                {
+                    if (!resolvedThisDatabase && source.IsRequired)
+                        unresolvedRequired.Add(source);
                 }
             }
-            catch (Exception exception) when (exception is
-                IOException or UnauthorizedAccessException or
-                ArgumentException or CryptographicException or IntegrityException)
+        }
+        finally
+        {
+            if (storedKeys is not null)
             {
-                failureCount++;
-            }
-            finally
-            {
-                if (!resolvedThisDatabase && source.IsRequired)
-                    unresolvedRequired.Add(source);
+                foreach (var stored in storedKeys) stored.Dispose();
             }
         }
 
@@ -207,6 +201,46 @@ public sealed class PersistedKeyDecryptor
                     .ToArray()),
                 databases.Count),
             Array.AsReadOnly(unresolvedRequired.ToArray()));
+    }
+
+    private IReadOnlyList<ValidatedKeyRecord> LoadUniqueKeys(
+        CancellationToken cancellationToken)
+    {
+        var records = new List<ValidatedKeyRecord>();
+        var fingerprints = new HashSet<string>(StringComparer.Ordinal);
+        try
+        {
+            foreach (var keyId in _vault.ListIds())
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                ValidatedKeyRecord? stored = null;
+                try
+                {
+                    stored = _vault.Load(keyId);
+                    var fingerprint = Convert.ToHexString(SHA256.HashData(stored.Key));
+                    if (!fingerprints.Add(fingerprint)) continue;
+                    records.Add(stored);
+                    stored = null;
+                }
+                catch (Exception exception) when (exception is
+                    IOException or UnauthorizedAccessException or
+                    ArgumentException or CryptographicException or
+                    InvalidDataException or JsonException)
+                {
+                    _vault.Quarantine(keyId);
+                }
+                finally
+                {
+                    stored?.Dispose();
+                }
+            }
+            return records;
+        }
+        catch
+        {
+            foreach (var record in records) record.Dispose();
+            throw;
+        }
     }
 
     private static bool IsParentTraversal(string relativePath) =>

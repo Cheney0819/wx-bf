@@ -158,6 +158,32 @@ public sealed class PersistedKeyDecryptorTests : IDisposable
             SearchOption.AllDirectories));
     }
 
+    [Fact]
+    public async Task VaultRecordsAreUnsealedOncePerRecoveryPass()
+    {
+        var protector = new CountingTestProtector();
+        var fixture = await CreateFixtureAsync(protector);
+        var firstPath = CopyEncryptedFixture("message_0.db");
+        var secondPath = CopyEncryptedFixture("message_1.db");
+        var wrongKey = Enumerable.Repeat((byte)0xCC, 32).ToArray();
+        fixture.Vault.Store(Metadata(firstPath), wrongKey);
+        fixture.Vault.Store(Metadata(secondPath), wrongKey);
+
+        var result = await fixture.Decryptor.TryDecryptAsync(
+            fixture.Epoch,
+            _root,
+            [
+                new DatabaseSource(firstPath, new FileInfo(firstPath).Length),
+                new DatabaseSource(secondPath, new FileInfo(secondPath).Length),
+            ],
+            Path.Combine(_root, "output"),
+            new Progress<RecoveryProgress>(),
+            default);
+
+        Assert.False(result.HasValidatedKey);
+        Assert.Equal(2, protector.UnprotectCount);
+    }
+
     private async Task WriteMalformedJsonEnvelopeAsync(string id)
     {
         var metadata = "{"u8.ToArray();
@@ -234,7 +260,8 @@ public sealed class PersistedKeyDecryptorTests : IDisposable
         Assert.Single(observation.OutputPaths);
     }
 
-    private async Task<PersistedKeyFixture> CreateFixtureAsync()
+    private async Task<PersistedKeyFixture> CreateFixtureAsync(
+        ISecretProtector? protector = null)
     {
         var repository = new RecoveryRepository(
             Path.Combine(_root, "state", "recovery.db"),
@@ -244,7 +271,7 @@ public sealed class PersistedKeyDecryptorTests : IDisposable
             new RecoveryEpochIdentity("4.1.0", "root-a"), false, default);
         var vault = new ValidatedKeyVault(
             Path.Combine(_root, "vault"),
-            new XorTestProtector());
+            protector ?? new XorTestProtector());
         return new PersistedKeyFixture(
             repository,
             epoch,
@@ -290,6 +317,27 @@ public sealed class PersistedKeyDecryptorTests : IDisposable
 
         public byte[] Unprotect(ReadOnlySpan<byte> ciphertext, ReadOnlySpan<byte> entropy) =>
             Transform(ciphertext);
+
+        private static byte[] Transform(ReadOnlySpan<byte> input)
+        {
+            var result = input.ToArray();
+            for (var index = 0; index < result.Length; index++) result[index] ^= 0x7D;
+            return result;
+        }
+    }
+
+    private sealed class CountingTestProtector : ISecretProtector
+    {
+        public int UnprotectCount { get; private set; }
+
+        public byte[] Protect(ReadOnlySpan<byte> plaintext, ReadOnlySpan<byte> entropy) =>
+            Transform(plaintext);
+
+        public byte[] Unprotect(ReadOnlySpan<byte> ciphertext, ReadOnlySpan<byte> entropy)
+        {
+            UnprotectCount++;
+            return Transform(ciphertext);
+        }
 
         private static byte[] Transform(ReadOnlySpan<byte> input)
         {

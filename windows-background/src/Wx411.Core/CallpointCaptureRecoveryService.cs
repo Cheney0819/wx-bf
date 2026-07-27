@@ -8,6 +8,7 @@ namespace Wx411.Core;
 public sealed class CallpointCaptureRecoveryService
 {
     private static readonly TimeSpan CallpointCaptureTimeout = TimeSpan.FromSeconds(180);
+    private static readonly TimeSpan MatchedCaptureIdleTimeout = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan CaptureProcessWaitTimeout = TimeSpan.FromMinutes(5);
     private static readonly TimeSpan CaptureRetryDelay = TimeSpan.FromMilliseconds(300);
     private static readonly TimeSpan DatabaseRefreshInterval = TimeSpan.FromMilliseconds(500);
@@ -81,7 +82,9 @@ public sealed class CallpointCaptureRecoveryService
             progress,
             token);
 
-        var ready = new CaptureReadySignal(collector.IsReadyForValidation);
+        var ready = new CaptureReadySignal(
+            collector.IsReadyForValidation,
+            collector.Matches.Count + collector.PendingDatabaseIds.Count);
         string? lastCaptureFailure = null;
         if (!ready.Value)
         {
@@ -139,6 +142,7 @@ public sealed class CallpointCaptureRecoveryService
                 try
                 {
                     var backend = _captureBackendFactory();
+                    var targetStartedAt = Stopwatch.GetTimestamp();
                     try
                     {
                         var captureResult = await backend.CaptureToChannelWhenModuleLoadsAsync(
@@ -148,7 +152,9 @@ public sealed class CallpointCaptureRecoveryService
                             CaptureProcessWaitTimeout,
                             CallpointCaptureTimeout,
                             channel,
-                            () => ready.Value,
+                            () => ready.ShouldStopCurrentCapture(
+                                targetStartedAt,
+                                MatchedCaptureIdleTimeout),
                             new Progress<CallpointCaptureStatus>(status =>
                                 progress.Report(new RecoveryProgress(22, status.Message, status.Detail))),
                             token);
@@ -173,7 +179,7 @@ public sealed class CallpointCaptureRecoveryService
                 if (channel.Error is not null)
                     throw new InvalidOperationException(channel.Error.Message);
                 if (ready.Value) break;
-                if (process.ScanAll)
+                if (ShouldRefreshCaptureTargets(process.ScanAll, targetQueue.Count))
                 {
                     var update = await WaitForRefreshedCaptureTargetsAsync(
                         targetQueue,
@@ -306,7 +312,9 @@ public sealed class CallpointCaptureRecoveryService
                         vault,
                         vaultRecords,
                         progress);
-                    ready.Value = collector.IsReadyForValidation;
+                    ready.Update(
+                        collector.IsReadyForValidation,
+                        collector.Matches.Count + collector.PendingDatabaseIds.Count);
                     progress.Report(new RecoveryProgress(
                         update.NewMatches.Count > 0 ? 48 : 34,
                         update.NewMatches.Count > 0
@@ -350,7 +358,9 @@ public sealed class CallpointCaptureRecoveryService
             {
                 var update = await catalog.RefreshAsync(token);
                 collector.Synchronize(catalog.Descriptors, counters, token);
-                ready.Value = collector.IsReadyForValidation;
+                ready.Update(
+                    collector.IsReadyForValidation,
+                    collector.Matches.Count + collector.PendingDatabaseIds.Count);
                 if (update.AddedPaths.Count > 0 || update.ReplacedPaths.Count > 0)
                 {
                     progress.Report(new RecoveryProgress(
@@ -470,6 +480,36 @@ public sealed class CallpointCaptureRecoveryService
             added.Add(pid);
         }
         return added;
+    }
+
+    internal static bool ShouldRefreshCaptureTargets(
+        bool scanAll,
+        int queuedTargetCount)
+    {
+        if (queuedTargetCount < 0)
+            throw new ArgumentOutOfRangeException(nameof(queuedTargetCount));
+        return scanAll && queuedTargetCount == 0;
+    }
+
+    internal static bool ShouldStopCurrentCapture(
+        bool ready,
+        int pendingMatches,
+        long nowTimestamp,
+        long lastActivityTimestamp,
+        TimeSpan idleTimeout,
+        long timestampFrequency)
+    {
+        if (pendingMatches < 0)
+            throw new ArgumentOutOfRangeException(nameof(pendingMatches));
+        if (idleTimeout <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(idleTimeout));
+        if (timestampFrequency <= 0)
+            throw new ArgumentOutOfRangeException(nameof(timestampFrequency));
+        if (ready) return true;
+        if (pendingMatches == 0 || nowTimestamp < lastActivityTimestamp) return false;
+        var elapsedSeconds =
+            (nowTimestamp - lastActivityTimestamp) / (double)timestampFrequency;
+        return elapsedSeconds >= idleTimeout.TotalSeconds;
     }
 
     internal static CaptureTargetRefreshUpdate EnqueueRefreshedCaptureTargets(
@@ -612,9 +652,49 @@ public sealed class CallpointCaptureRecoveryService
     private sealed record CaptureProcessResolution(IReadOnlyList<RecoveryProcessSelection> Targets, IReadOnlyList<int> DatabaseOwnerPids);
     private sealed record PendingVaultReference(string DatabaseSaltFingerprint, string RecordId);
 
-    private sealed class CaptureReadySignal(bool initial)
+    internal sealed class CaptureReadySignal
     {
-        private int _value = initial ? 1 : 0;
-        internal bool Value { get => Volatile.Read(ref _value) == 1; set => Volatile.Write(ref _value, value ? 1 : 0); }
+        private readonly Func<long> _getTimestamp;
+        private readonly long _timestampFrequency;
+        private int _value;
+        private int _pendingMatches;
+        private long _lastActivityTimestamp;
+
+        internal CaptureReadySignal(
+            bool initial,
+            int pendingMatches,
+            Func<long>? getTimestamp = null,
+            long? timestampFrequency = null)
+        {
+            _getTimestamp = getTimestamp ?? Stopwatch.GetTimestamp;
+            _timestampFrequency = timestampFrequency ?? Stopwatch.Frequency;
+            _value = initial ? 1 : 0;
+            _pendingMatches = pendingMatches;
+            _lastActivityTimestamp = _getTimestamp();
+        }
+
+        internal bool Value => Volatile.Read(ref _value) == 1;
+
+        internal void Update(bool ready, int pendingMatches)
+        {
+            var previous = Volatile.Read(ref _pendingMatches);
+            if (pendingMatches > previous)
+                Interlocked.Exchange(ref _lastActivityTimestamp, _getTimestamp());
+            Interlocked.Exchange(ref _pendingMatches, pendingMatches);
+            Volatile.Write(ref _value, ready ? 1 : 0);
+        }
+
+        internal bool ShouldStopCurrentCapture(
+            long targetStartedAt,
+            TimeSpan idleTimeout) =>
+            CallpointCaptureRecoveryService.ShouldStopCurrentCapture(
+                Value,
+                Volatile.Read(ref _pendingMatches),
+                _getTimestamp(),
+                Math.Max(
+                    targetStartedAt,
+                    Interlocked.Read(ref _lastActivityTimestamp)),
+                idleTimeout,
+                _timestampFrequency);
     }
 }

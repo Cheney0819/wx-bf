@@ -242,12 +242,12 @@ public sealed class Rc9CaptureAdapter : IRecoveryCaptureAdapter
         _progress = progress;
         _discoverDatabases = discoverDatabases;
         _createCaptureContext = createCaptureContext;
-        _boundProcess = boundProcess;
-        _restartedProcess = boundProcess with
+        _boundProcess = boundProcess with
         {
             Pid = null,
             ScanAll = true,
         };
+        _restartedProcess = _boundProcess;
     }
 
     private static RecoveryProcessSelection BoundProcessSelection(
