@@ -26,13 +26,14 @@ public sealed class AmbiguousWeChatProcessException : InvalidOperationException
 
     public int CandidateCount { get; }
 
-    public string Code => "ambiguous_data_root";
+    public string Code => "ambiguous_wechat_process";
 }
 
 internal sealed record WeChatProcessCandidate(
     int ProcessId,
     int SessionId,
-    string ExecutablePath);
+    string ExecutablePath,
+    bool HasMainWindow = false);
 
 public interface IWeChatIdentityProvider
 {
@@ -112,7 +113,8 @@ public sealed class WeChatIdentityProvider : IWeChatIdentityProvider
                     candidates.Add(new WeChatProcessCandidate(
                         process.Id,
                         process.SessionId,
-                        Path.GetFullPath(path)));
+                        Path.GetFullPath(path),
+                        process.MainWindowHandle != nint.Zero));
                 }
             }
             catch (Exception exception) when (exception is
@@ -134,13 +136,15 @@ public sealed class WeChatIdentityProvider : IWeChatIdentityProvider
         IReadOnlyList<WeChatProcessCandidate> candidates)
     {
         ArgumentNullException.ThrowIfNull(candidates);
-        return candidates.Count switch
-        {
-            0 => throw new InvalidOperationException(
-                "No target process is active in the worker session."),
-            1 => candidates[0],
-            _ => throw new AmbiguousWeChatProcessException(candidates.Count),
-        };
+        if (candidates.Count == 0)
+            throw new InvalidOperationException(
+                "No target process is active in the worker session.");
+        if (candidates.Count == 1) return candidates[0];
+
+        var windowed = candidates.Where(candidate => candidate.HasMainWindow).ToArray();
+        if (windowed.Length == 1) return windowed[0];
+        throw new AmbiguousWeChatProcessException(
+            windowed.Length > 1 ? windowed.Length : candidates.Count);
     }
 
     private static string NormalizeRoot(string path)

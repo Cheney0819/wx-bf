@@ -67,7 +67,7 @@ public sealed class RecoveryCycle : IRecoveryCycle
         {
             var ambiguous = new WeChatDataRootResolution(
                 DataRoot: null,
-                resolution.CandidateCount,
+                exception.CandidateCount,
                 DatabaseCount: 0,
                 exception.Code);
             await _preflightTelemetry.PublishDataRootResultAsync(

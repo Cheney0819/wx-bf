@@ -145,9 +145,10 @@ public sealed class RecoveryCycleTests : IDisposable
             default);
 
         Assert.Equal(RecoveryActionKind.WaitPassively, action.Kind);
-        Assert.Equal("ambiguous_data_root", action.Reason);
+        Assert.Equal("ambiguous_wechat_process", action.Reason);
         var draft = Assert.Single(telemetry.Events);
-        Assert.Equal("ambiguous_data_root", draft.Code);
+        Assert.Equal("ambiguous_wechat_process", draft.Code);
+        Assert.Equal(2, draft.Metrics.GetProperty("candidateCount").GetInt32());
         Assert.True(draft.Metrics.GetProperty("wechatLoggedIn").GetBoolean());
         Assert.False(File.Exists(paths.RecoveryDatabase));
     }

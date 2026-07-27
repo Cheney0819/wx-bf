@@ -76,7 +76,24 @@ public sealed class WeChatIdentityProviderTests : IDisposable
         var exception = Assert.Throws<AmbiguousWeChatProcessException>(() =>
             WeChatIdentityProvider.SelectInteractiveProcess(processes));
 
-        Assert.Equal("ambiguous_data_root", exception.Code);
+        Assert.Equal("ambiguous_wechat_process", exception.Code);
+    }
+
+    [Fact]
+    public void UniqueWindowedProcessIsSelectedAmongHelperProcesses()
+    {
+        var executable = typeof(WeChatIdentityProviderTests).Assembly.Location;
+        var expected = new WeChatProcessCandidate(42, 7, executable, HasMainWindow: true);
+        var processes = new[]
+        {
+            new WeChatProcessCandidate(41, 7, executable, HasMainWindow: false),
+            expected,
+            new WeChatProcessCandidate(43, 7, executable, HasMainWindow: false),
+        };
+
+        var selected = WeChatIdentityProvider.SelectInteractiveProcess(processes);
+
+        Assert.Equal(expected, selected);
     }
 
     [Fact]
