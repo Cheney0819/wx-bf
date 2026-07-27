@@ -160,6 +160,7 @@ def parse_job(job: ParserJob, cancellation: CancellationState) -> dict[str, Any]
         notices,
         cancellation,
     )
+    messages = _newest_messages(messages, job.maximum_messages)
     favorites, favorites_have_more = _read_favorites(
         job.databases,
         cursor,
@@ -386,10 +387,7 @@ def _read_messages(
         current = cursor["m"].get(table_key)
         if current is None or boundary < current:
             cursor["m"][table_key] = boundary
-    return _newest_messages(
-        [message for _, _, _, message in selected],
-        maximum_messages,
-    ), have_more
+    return [message for _, _, _, message in selected], have_more
 
 
 def _resolve_message_display_names(
@@ -671,7 +669,11 @@ def _attach_voice(
 
 
 def _newest_messages(messages: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
-    messages.sort(
+    unique_messages: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for message in messages:
+        unique_messages.setdefault(_message_identity(message), message)
+    result = list(unique_messages.values())
+    result.sort(
         key=lambda item: (
             item["create_time"],
             item["wxid"],
@@ -680,7 +682,21 @@ def _newest_messages(messages: list[dict[str, Any]], limit: int) -> list[dict[st
             item["content"],
         )
     )
-    return messages[-limit:]
+    return result[-limit:]
+
+
+def _message_identity(message: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        message["wxid"],
+        message["local_id"],
+        message["create_time"],
+        message["is_sender"],
+        message["sender"],
+        message["content"],
+        message["msg_type"],
+        message["msg_sub_type"],
+        message["media_sha256"],
+    )
 
 
 def _friendly_content(message_type: int, content: str) -> str:

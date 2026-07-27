@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import signal
@@ -253,6 +254,114 @@ def test_message_table_ties_do_not_duplicate_or_skip_across_pages(tmp_path: Path
     assert first_keys.isdisjoint(second_keys)
     assert len(first_keys | second_keys) == 6000
     assert "nextCursor" not in second_document
+
+
+def test_duplicate_messages_across_database_shards_are_emitted_once(tmp_path: Path) -> None:
+    job_root = tmp_path / "job"
+    first_database = job_root / "input" / "message" / "message_0.db"
+    second_database = job_root / "input" / "message" / "message_1.db"
+    create_message_database(first_database, count=3)
+    create_message_database(second_database, count=3)
+    job = write_job(
+        job_root,
+        [
+            ("message/message_0.db", first_database),
+            ("message/message_1.db", second_database),
+        ],
+        maximum_messages=4,
+    )
+
+    identities: set[tuple[object, ...]] = set()
+    page_count = 0
+    while page_count < 10:
+        result = run_parser(job)
+        document = json.loads(
+            (job_root / "output" / "result.json").read_text(encoding="utf-8")
+        )
+        assert result.returncode == 0
+        page_count += 1
+        identities.update(
+            (
+                message["wxid"],
+                message["local_id"],
+                message["create_time"],
+                message["is_sender"],
+                message["sender"],
+                message["content"],
+                message["msg_type"],
+                message["msg_sub_type"],
+                message["media_sha256"],
+            )
+            for message in document["messages"]
+        )
+        cursor = document.get("nextCursor")
+        if cursor is None:
+            break
+        payload = json.loads(job.read_text(encoding="utf-8"))
+        payload["cursor"] = cursor
+        job.write_text(json.dumps(payload), encoding="utf-8")
+        os.remove(job_root / "output" / "result.json")
+
+    assert page_count == 2
+    assert len(identities) == 3
+
+
+def test_duplicate_messages_are_deduplicated_after_sender_name_resolution(
+    tmp_path: Path,
+) -> None:
+    job_root = tmp_path / "job"
+    first_database = job_root / "input" / "message" / "message_0.db"
+    second_database = job_root / "input" / "message" / "message_1.db"
+    contact_database = job_root / "input" / "contact" / "contact.db"
+    chat_username = "shared@chatroom"
+    chat_hash = hashlib.md5(chat_username.encode("utf-8")).hexdigest()
+
+    for database, sender in ((first_database, "alice"), (second_database, "bob")):
+        database.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(database) as connection:
+            connection.execute("CREATE TABLE Name2Id(user_name TEXT)")
+            connection.execute(
+                "INSERT INTO Name2Id(rowid, user_name) VALUES(1, ?), (2, ?)",
+                (chat_username, sender),
+            )
+            connection.execute(
+                f'''CREATE TABLE "Msg_{chat_hash}"(
+                    local_id INTEGER,
+                    local_type INTEGER,
+                    create_time INTEGER,
+                    real_sender_id INTEGER,
+                    message_content BLOB,
+                    WCDB_CT_message_content INTEGER
+                )'''
+            )
+            connection.execute(
+                f'INSERT INTO "Msg_{chat_hash}" VALUES(7, 1, 100, 2, "same", 0)'
+            )
+
+    contact_database.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(contact_database) as connection:
+        connection.execute(
+            "CREATE TABLE contact(username TEXT, alias TEXT, remark TEXT, nick_name TEXT)"
+        )
+        connection.executemany(
+            "INSERT INTO contact VALUES(?, '', 'Same Person', '')",
+            (("alice",), ("bob",), (chat_username,)),
+        )
+    job = write_job(
+        job_root,
+        [
+            ("contact/contact.db", contact_database),
+            ("message/message_0.db", first_database),
+            ("message/message_1.db", second_database),
+        ],
+    )
+
+    result = run_parser(job)
+    document = json.loads((job_root / "output" / "result.json").read_text(encoding="utf-8"))
+
+    assert result.returncode == 0
+    assert len(document["messages"]) == 1
+    assert document["messages"][0]["sender"] == "Same Person"
 
 
 def test_contact_and_favorite_boundaries_advance_independently(tmp_path: Path) -> None:

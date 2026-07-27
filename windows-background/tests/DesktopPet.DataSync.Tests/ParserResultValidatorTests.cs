@@ -131,13 +131,32 @@ public sealed class ParserResultValidatorTests : IDisposable
     }
 
     [Fact]
-    public async Task DuplicateMessageIdentityIsRejected()
+    public async Task DuplicateMessageIdentityIsNormalized()
     {
         var valid = JsonSerializer.SerializeToElement(ParserResultTestData.Document());
         var duplicate = ParserResultTestData.Message(1, "hello");
         var resultPath = await ParserResultTestData.WriteAsync(
             _root,
             Replace(valid, "messages", new[] { duplicate, duplicate }));
+
+        var result = await new ParserResultValidator().ValidateAsync(
+            resultPath, "job-1", "source-1", default);
+
+        Assert.Single(result.Messages);
+    }
+
+    [Fact]
+    public async Task DuplicateMessagesAreAllValidatedBeforeNormalization()
+    {
+        var valid = JsonSerializer.SerializeToElement(ParserResultTestData.Document());
+        var first = ParserResultTestData.Message(1, "hello");
+        var second = JsonSerializer.SerializeToElement(first)
+            .EnumerateObject()
+            .ToDictionary(property => property.Name, property => (object?)property.Value);
+        second["media_data"] = "not-base64";
+        var resultPath = await ParserResultTestData.WriteAsync(
+            _root,
+            Replace(valid, "messages", new object[] { first, second }));
 
         await Assert.ThrowsAsync<InvalidDataException>(() =>
             new ParserResultValidator().ValidateAsync(

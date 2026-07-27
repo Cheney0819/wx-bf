@@ -47,8 +47,7 @@ public sealed class ParserResultValidator
                 throw new InvalidDataException("Parser result JSON violates schema 1.", exception);
             }
 
-            ValidateDocument(result, expectedJobId, expectedSourceSetId);
-            return result;
+            return ValidateDocument(result, expectedJobId, expectedSourceSetId);
         }
         finally
         {
@@ -56,7 +55,7 @@ public sealed class ParserResultValidator
         }
     }
 
-    private static void ValidateDocument(
+    private static ParserResultDocument ValidateDocument(
         ParserResultDocument result,
         string expectedJobId,
         string expectedSourceSetId)
@@ -85,13 +84,14 @@ public sealed class ParserResultValidator
         }
 
         var messageIdentities = new HashSet<string>(StringComparer.Ordinal);
+        var uniqueMessages = new List<ParsedMessage>(result.Messages.Count);
         foreach (var message in result.Messages)
         {
             if (message is null || string.IsNullOrWhiteSpace(message.Wxid))
                 throw new InvalidDataException("Parser message identity is empty.");
             ValidateMedia(message);
-            if (!messageIdentities.Add(ParserItemIdentity.Message(message)))
-                throw new InvalidDataException("Parser result contains duplicate messages.");
+            if (messageIdentities.Add(ParserItemIdentity.Message(message)))
+                uniqueMessages.Add(message);
         }
 
         var contacts = new HashSet<string>(StringComparer.Ordinal);
@@ -128,6 +128,10 @@ public sealed class ParserResultValidator
                 throw new InvalidDataException("Parser notice is invalid.");
             }
         }
+
+        return uniqueMessages.Count == result.Messages.Count
+            ? result
+            : result with { Messages = uniqueMessages };
     }
 
     private static void ValidateMedia(ParsedMessage message)

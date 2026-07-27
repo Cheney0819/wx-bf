@@ -116,6 +116,49 @@ public sealed class IncrementalOutboxWriterTests : IDisposable
     }
 
     [Fact]
+    public async Task SameMessageOnTwoParserPagesIsExportedOnce()
+    {
+        var valid = JsonSerializer.SerializeToElement(ParserResultTestData.Document());
+        var duplicate = ParserResultTestData.Message(1, "same-message");
+        var firstDocument = valid.EnumerateObject().ToDictionary(
+            property => property.Name,
+            property => property.Name switch
+            {
+                "contacts" or "favorites" => (object?)Array.Empty<object>(),
+                "messages" => new[] { duplicate },
+                _ => property.Value,
+            });
+        firstDocument["nextCursor"] = "next-page";
+        var fixture = await CreateFixtureAsync(document: firstDocument);
+
+        await fixture.Writer.CommitAsync(fixture.Job, fixture.Result, default);
+
+        var secondDocument = valid.EnumerateObject().ToDictionary(
+            property => property.Name,
+            property => property.Name switch
+            {
+                "contacts" or "favorites" => (object?)Array.Empty<object>(),
+                "messages" => new[] { duplicate },
+                _ => property.Value,
+            });
+        var secondPath = await ParserResultTestData.WriteAsync(_root, secondDocument);
+        var secondResult = await new ParserResultValidator().ValidateAsync(
+            secondPath,
+            fixture.Job.Id,
+            fixture.Job.SourceSetId,
+            default);
+
+        await fixture.Writer.CommitAsync(fixture.Job, secondResult, default);
+
+        Assert.Equal(1, await fixture.Repository.CountExportedItemsAsync(default));
+        Assert.Equal(1, await fixture.Repository.CountOutboxAsync(default));
+        Assert.Equal(ParseJobState.Completed, (await fixture.Repository.GetParseJobAsync(
+            fixture.Job.Id,
+            default))!.State);
+        await fixture.Repository.DisposeAsync();
+    }
+
+    [Fact]
     public async Task MutableContactAndFavoriteFieldsCreateNewExportsButStablePayloadDoesNot()
     {
         var protector = new EncryptedOutboxProtector(new XorTestProtector());
