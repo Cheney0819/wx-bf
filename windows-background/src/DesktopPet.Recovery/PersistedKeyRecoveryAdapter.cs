@@ -33,8 +33,8 @@ public sealed class PersistedKeyRecoveryAdapter : IRecoveryKeyReuseAdapter
     {
         ArgumentNullException.ThrowIfNull(epoch);
         cancellationToken.ThrowIfCancellationRequested();
-        var databases = DatabaseSourceDiscovery.Discover([_dataRoot]);
-        return _decryptor.TryDecryptAsync(
+        var databases = DatabaseSourceDiscovery.Discover([_dataRoot], cancellationToken);
+        return _decryptor.TryDecryptUntilCancelledAsync(
             epoch,
             _dataRoot,
             databases,

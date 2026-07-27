@@ -65,6 +65,24 @@ public sealed class PersistedKeyDecryptorTests : IDisposable
     }
 
     [Fact]
+    public async Task DirectCancellationIsNotSwallowed()
+    {
+        var fixture = await CreateFixtureAsync();
+        var databasePath = CopyEncryptedFixture("message_cancelled.db");
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            fixture.Decryptor.TryDecryptAsync(
+                fixture.Epoch,
+                _root,
+                [new DatabaseSource(databasePath, new FileInfo(databasePath).Length)],
+                Path.Combine(_root, "output"),
+                new Progress<RecoveryProgress>(),
+                cancellation.Token));
+    }
+
+    [Fact]
     public async Task OneUnreadableDatabaseDoesNotBlockAnother()
     {
         var fixture = await CreateFixtureAsync();

@@ -72,9 +72,6 @@ public sealed class ParserJobBuilder
                 var source = Path.GetFullPath(input.PlaintextPath);
                 if (!File.Exists(source))
                     throw new FileNotFoundException("Catalog generation is missing.", source);
-                var sourceHash = await FileSha256Async(source, cancellationToken);
-                if (!string.Equals(sourceHash, input.Sha256, StringComparison.OrdinalIgnoreCase))
-                    throw new CryptographicException("Catalog generation hash drifted before parse.");
 
                 var relativeParts = relativePath.Split('/');
                 var temporaryDestination = Path.Combine(

@@ -36,12 +36,43 @@ public sealed class PersistedKeyDecryptor
         _vault = vault;
     }
 
-    public async Task<PersistedDecryptResult> TryDecryptAsync(
+    public Task<PersistedDecryptResult> TryDecryptAsync(
         RecoveryEpoch epoch,
         string dataRoot,
         IReadOnlyList<DatabaseSource> databases,
         string outputDirectory,
         IProgress<RecoveryProgress> progress,
+        CancellationToken cancellationToken) => TryDecryptCoreAsync(
+            epoch,
+            dataRoot,
+            databases,
+            outputDirectory,
+            progress,
+            preservePartialOnCancellation: false,
+            cancellationToken);
+
+    internal Task<PersistedDecryptResult> TryDecryptUntilCancelledAsync(
+        RecoveryEpoch epoch,
+        string dataRoot,
+        IReadOnlyList<DatabaseSource> databases,
+        string outputDirectory,
+        IProgress<RecoveryProgress> progress,
+        CancellationToken cancellationToken) => TryDecryptCoreAsync(
+            epoch,
+            dataRoot,
+            databases,
+            outputDirectory,
+            progress,
+            preservePartialOnCancellation: true,
+            cancellationToken);
+
+    private async Task<PersistedDecryptResult> TryDecryptCoreAsync(
+        RecoveryEpoch epoch,
+        string dataRoot,
+        IReadOnlyList<DatabaseSource> databases,
+        string outputDirectory,
+        IProgress<RecoveryProgress> progress,
+        bool preservePartialOnCancellation,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(epoch);
@@ -57,6 +88,7 @@ public sealed class PersistedKeyDecryptor
         var unresolvedRequired = new List<DatabaseSource>();
         var hasValidatedKey = false;
         var failureCount = 0;
+        var wasCancelled = false;
 
         try
         {
@@ -172,6 +204,11 @@ public sealed class PersistedKeyDecryptor
                 }
             }
         }
+        catch (OperationCanceledException) when (
+            preservePartialOnCancellation && cancellationToken.IsCancellationRequested)
+        {
+            wasCancelled = true;
+        }
         finally
         {
             if (storedKeys is not null)
@@ -180,13 +217,29 @@ public sealed class PersistedKeyDecryptor
             }
         }
 
+        if (wasCancelled)
+        {
+            var recoveredPaths = recovered
+                .Select(item => item.RelativePath)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            foreach (var source in databases.Where(source => source.IsRequired))
+            {
+                var relativePath = Path.GetRelativePath(normalizedRoot, Path.GetFullPath(source.Path))
+                    .Replace('\\', '/');
+                if (!recoveredPaths.Contains(relativePath))
+                    unresolvedRequired.Add(source);
+            }
+        }
+
         var distinctOutputs = outputs
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToArray();
-        var failureCode = failureCount > 0 && distinctOutputs.Length > 0
+        var failureCode = (failureCount > 0 || wasCancelled) && distinctOutputs.Length > 0
             ? "persisted_key_partial_failure"
             : hasValidatedKey && distinctOutputs.Length == 0
                 ? "persisted_key_export_failed"
+                : wasCancelled
+                    ? "persisted_key_cancelled"
                 : !hasValidatedKey
                     ? "persisted_key_no_match"
                     : null;
@@ -200,7 +253,9 @@ public sealed class PersistedKeyDecryptor
                     .DistinctBy(item => item.GenerationId, StringComparer.Ordinal)
                     .ToArray()),
                 databases.Count),
-            Array.AsReadOnly(unresolvedRequired.ToArray()));
+            Array.AsReadOnly(unresolvedRequired
+                .DistinctBy(source => Path.GetFullPath(source.Path), StringComparer.OrdinalIgnoreCase)
+                .ToArray()));
     }
 
     private IReadOnlyList<ValidatedKeyRecord> LoadUniqueKeys(

@@ -53,6 +53,16 @@ public sealed class DatabaseSourceDiscoveryTests
     }
 
     [Fact]
+    public void DiscoverHonorsCancellationBeforeWalkingRoots()
+    {
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        Assert.Throws<OperationCanceledException>(() =>
+            DatabaseSourceDiscovery.Discover([Path.GetTempPath()], cancellation.Token));
+    }
+
+    [Fact]
     public void SourceClearsEveryDatabaseHeader()
     {
         var source = TestSourceTree.ReadWindowsEasy(

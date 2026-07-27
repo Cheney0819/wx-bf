@@ -72,7 +72,7 @@ public sealed class TelemetryOutboxWriter
         string payloadJson,
         CancellationToken cancellationToken) =>
         _repository.RecordRuntimeEventAsync(
-            "datasync_handoff_rejected",
+            "datasync_telemetry_rejected",
             payloadJson,
             cancellationToken);
 

@@ -9,15 +9,19 @@ public sealed record DatabaseSource(string Path, long Length)
 
 public static class DatabaseSourceDiscovery
 {
-    public static IReadOnlyList<DatabaseSource> Discover() => Discover(DefaultRoots());
+    public static IReadOnlyList<DatabaseSource> Discover() => Discover(DefaultRoots(), default);
 
-    public static IReadOnlyList<DatabaseSource> Discover(IEnumerable<string> roots)
+    public static IReadOnlyList<DatabaseSource> Discover(
+        IEnumerable<string> roots,
+        CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(roots);
+        cancellationToken.ThrowIfCancellationRequested();
 
         var files = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var root in roots.Where(root => !string.IsNullOrWhiteSpace(root)))
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (!Directory.Exists(root)) continue;
             try
             {
@@ -29,7 +33,10 @@ public static class DatabaseSourceDiscovery
                     AttributesToSkip = FileAttributes.ReparsePoint,
                 };
                 foreach (var path in Directory.EnumerateFiles(root, "*.db", options))
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
                     files.Add(path);
+                }
             }
             catch (UnauthorizedAccessException)
             {
@@ -44,6 +51,7 @@ public static class DatabaseSourceDiscovery
         var databases = new List<DatabaseSource>();
         foreach (var path in files)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             try
             {
                 var info = new FileInfo(path);

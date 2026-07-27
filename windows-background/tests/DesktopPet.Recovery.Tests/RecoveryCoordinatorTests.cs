@@ -599,6 +599,151 @@ public sealed class RecoveryCoordinatorTests : IDisposable
         Assert.Equal(1, fixture.Process.RestartCount);
     }
 
+    [Fact]
+    public async Task TimedOutPersistedKeyReuseContinuesIntoLiveCapture()
+    {
+        var reuse = new BlockingReuseAdapter();
+        await using var fixture = await CreateFixtureAsync(
+            new RecordingTelemetryPublisher(),
+            reuse,
+            telemetryTimeout: null,
+            keyReuseTimeout: TimeSpan.FromMilliseconds(20),
+            observations:
+            [
+                new CaptureObservation(false, true, [], null),
+            ]);
+
+        var action = await fixture.Coordinator.RunEpochAsync(fixture.Epoch, default)
+            .WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(RecoveryActionKind.WaitPassively, action.Kind);
+        Assert.Equal("pending_capture_available", action.Reason);
+        Assert.Equal(1, fixture.Capture.CallCount);
+        await reuse.CancellationObserved.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(
+            [
+                "recovery_key_reuse_started:key_reuse_started",
+                "recovery_key_reuse_timed_out:key_reuse_timed_out",
+                "recovery_capture_started:capture_started",
+                "recovery_capture_succeeded:pending_capture_available",
+            ],
+            fixture.Telemetry.Events.Select(EventIdentity));
+    }
+
+    [Fact]
+    public async Task UncooperativePersistedKeyReuseStopsBeforeLiveCaptureCanRaceIt()
+    {
+        var reuse = new SlowIgnoringCancellationReuseAdapter(TimeSpan.FromMilliseconds(250));
+        await using var fixture = await CreateFixtureAsync(
+            new RecordingTelemetryPublisher(),
+            reuse,
+            telemetryTimeout: null,
+            keyReuseTimeout: TimeSpan.FromMilliseconds(20),
+            keyReuseCancellationTimeout: TimeSpan.FromMilliseconds(20),
+            observations: [new CaptureObservation(false, true, [], null)]);
+
+        var action = await fixture.Coordinator.RunEpochAsync(fixture.Epoch, default)
+            .WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(RecoveryActionKind.WaitPassively, action.Kind);
+        Assert.Equal("key_reuse_cancellation_pending", action.Reason);
+        Assert.Equal(0, fixture.Capture.CallCount);
+        Assert.Contains(
+            fixture.Telemetry.Events,
+            draft => EventIdentity(draft) ==
+                "recovery_key_reuse_cancellation_pending:key_reuse_cancellation_pending");
+
+        var nextCoordinator = new RecoveryCoordinator(
+            fixture.Repository,
+            fixture.Capture,
+            fixture.Process,
+            fixture.Publisher,
+            fixture.Telemetry,
+            reuse,
+            keyReuseTimeout: TimeSpan.FromMilliseconds(20),
+            keyReuseCancellationTimeout: TimeSpan.FromMilliseconds(20),
+            keyReuseFence: fixture.KeyReuseFence);
+        var nextAction = await nextCoordinator.RunEpochAsync(fixture.Epoch, default)
+            .WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal("key_reuse_cancellation_pending", nextAction.Reason);
+        Assert.Equal(1, reuse.CallCount);
+        Assert.Equal(0, fixture.Capture.CallCount);
+    }
+
+    [Fact]
+    public async Task ExternalCancellationFencesUnfinishedReuseAcrossRecoveryCycles()
+    {
+        var reuse = new SlowIgnoringCancellationReuseAdapter(TimeSpan.FromMilliseconds(250));
+        await using var fixture = await CreateFixtureAsync(
+            new RecordingTelemetryPublisher(),
+            reuse,
+            telemetryTimeout: null,
+            keyReuseTimeout: TimeSpan.FromMinutes(1),
+            keyReuseCancellationTimeout: TimeSpan.FromMilliseconds(20),
+            observations: [new CaptureObservation(false, true, [], null)]);
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromMilliseconds(20));
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            fixture.Coordinator.RunEpochAsync(fixture.Epoch, cancellation.Token));
+
+        var nextCoordinator = new RecoveryCoordinator(
+            fixture.Repository,
+            fixture.Capture,
+            fixture.Process,
+            fixture.Publisher,
+            fixture.Telemetry,
+            reuse,
+            keyReuseTimeout: TimeSpan.FromMilliseconds(20),
+            keyReuseCancellationTimeout: TimeSpan.FromMilliseconds(20),
+            keyReuseFence: fixture.KeyReuseFence);
+        var nextAction = await nextCoordinator.RunEpochAsync(fixture.Epoch, default)
+            .WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal("key_reuse_cancellation_pending", nextAction.Reason);
+        Assert.Equal(1, reuse.CallCount);
+        Assert.Equal(0, fixture.Capture.CallCount);
+    }
+
+    [Fact]
+    public async Task TimedOutPersistedKeyReusePreservesCompletedDatabaseForLiveCapture()
+    {
+        var source = await WriteStagingAsync("timed-out-partial.sqlite", "partial"u8.ToArray());
+        var recovered = new RecoveredDatabase(
+            new string('f', 64),
+            "db_storage/hardlink/hardlink.db",
+            source,
+            await Sha256Async(source));
+        var reuse = new PartialOnCancellationReuseAdapter(
+            new PersistedDecryptResult(
+                new CaptureObservation(
+                    true,
+                    false,
+                    [source],
+                    "persisted_key_partial_failure",
+                    [recovered],
+                    CandidateDatabaseCount: 18),
+                [new DatabaseSource("db_storage/message/message_0.db", 1)]));
+        await using var fixture = await CreateFixtureAsync(
+            new RecordingTelemetryPublisher(),
+            reuse,
+            telemetryTimeout: null,
+            keyReuseTimeout: TimeSpan.FromMilliseconds(20),
+            keyReuseCancellationTimeout: TimeSpan.FromSeconds(1),
+            observations: [new CaptureObservation(false, true, [], null)]);
+
+        var action = await fixture.Coordinator.RunEpochAsync(fixture.Epoch, default)
+            .WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal("pending_capture_available", action.Reason);
+        Assert.Equal(1, fixture.Capture.CallCount);
+        Assert.Contains(
+            "db_storage/hardlink/hardlink.db",
+            fixture.Capture.CompletedPathSnapshots.Single());
+        Assert.Single(Directory.EnumerateFiles(
+            Path.Combine(_root, "handoff", "ready"),
+            "*.json"));
+    }
+
     private async Task<CoordinatorFixture> CreateFixtureAsync(
         params CaptureObservation[] observations)
         => await CreateFixtureAsync(reuse: null, observations);
@@ -610,12 +755,15 @@ public sealed class RecoveryCoordinatorTests : IDisposable
             new RecordingTelemetryPublisher(),
             reuse,
             telemetryTimeout: null,
-            observations);
+            keyReuseTimeout: null,
+            observations: observations);
 
     private async Task<CoordinatorFixture> CreateFixtureAsync(
         RecordingTelemetryPublisher telemetry,
         IRecoveryKeyReuseAdapter? reuse,
         TimeSpan? telemetryTimeout = null,
+        TimeSpan? keyReuseTimeout = null,
+        TimeSpan? keyReuseCancellationTimeout = null,
         params CaptureObservation[] observations)
     {
         var repository = new RecoveryRepository(
@@ -634,6 +782,7 @@ public sealed class RecoveryCoordinatorTests : IDisposable
             Path.Combine(_root, "handoff", "ready"),
             Path.Combine(_root, "staging"),
             TimeProvider.System);
+        var keyReuseFence = new SemaphoreSlim(1, 1);
         return new CoordinatorFixture(
             repository,
             epoch,
@@ -641,6 +790,8 @@ public sealed class RecoveryCoordinatorTests : IDisposable
             process,
             events,
             telemetry,
+            publisher,
+            keyReuseFence,
             new RecoveryCoordinator(
                 repository,
                 capture,
@@ -648,7 +799,10 @@ public sealed class RecoveryCoordinatorTests : IDisposable
                 publisher,
                 telemetry,
                 reuse,
-                telemetryTimeout));
+                telemetryTimeout,
+                keyReuseTimeout,
+                keyReuseCancellationTimeout,
+                keyReuseFence));
     }
 
     private static CaptureObservation Zero() =>
@@ -681,6 +835,8 @@ public sealed class RecoveryCoordinatorTests : IDisposable
         FakeProcessController Process,
         List<string> Events,
         RecordingTelemetryPublisher Telemetry,
+        AtomicHandoffPublisher Publisher,
+        SemaphoreSlim KeyReuseFence,
         RecoveryCoordinator Coordinator) : IAsyncDisposable
     {
         public ValueTask DisposeAsync() => Repository.DisposeAsync();
@@ -804,6 +960,65 @@ public sealed class RecoveryCoordinatorTests : IDisposable
             cancellationToken.ThrowIfCancellationRequested();
             CallCount++;
             return Task.FromResult(_result);
+        }
+    }
+
+    private sealed class BlockingReuseAdapter : IRecoveryKeyReuseAdapter
+    {
+        public TaskCompletionSource CancellationObserved { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public async Task<PersistedDecryptResult> TryDecryptAsync(
+            RecoveryEpoch epoch,
+            CancellationToken cancellationToken)
+        {
+            try
+            {
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+                throw new InvalidOperationException("The key reuse wait was not canceled.");
+            }
+            finally
+            {
+                CancellationObserved.TrySetResult();
+            }
+        }
+    }
+
+    private sealed class SlowIgnoringCancellationReuseAdapter(TimeSpan delay)
+        : IRecoveryKeyReuseAdapter
+    {
+        private int _callCount;
+
+        public int CallCount => Volatile.Read(ref _callCount);
+
+        public async Task<PersistedDecryptResult> TryDecryptAsync(
+            RecoveryEpoch epoch,
+            CancellationToken cancellationToken)
+        {
+            Interlocked.Increment(ref _callCount);
+            await Task.Delay(delay);
+            return new PersistedDecryptResult(
+                new CaptureObservation(false, false, [], "persisted_key_no_match"),
+                []);
+        }
+    }
+
+    private sealed class PartialOnCancellationReuseAdapter(PersistedDecryptResult result)
+        : IRecoveryKeyReuseAdapter
+    {
+        public async Task<PersistedDecryptResult> TryDecryptAsync(
+            RecoveryEpoch epoch,
+            CancellationToken cancellationToken)
+        {
+            try
+            {
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                return result;
+            }
+            throw new InvalidOperationException("The cancellation wait completed unexpectedly.");
         }
     }
 

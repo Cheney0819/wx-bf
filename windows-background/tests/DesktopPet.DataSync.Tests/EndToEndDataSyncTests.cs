@@ -450,6 +450,10 @@ public sealed class EndToEndDataSyncTests : IDisposable
         Assert.Equal("process_start", metrics.GetProperty("stageCode").GetString());
         Assert.Equal("parser_artifact_missing", metrics.GetProperty("failureCode").GetString());
         Assert.False(metrics.TryGetProperty("exitCode", out _));
+        Assert.True(
+            await CountRuntimeEventsAsync(
+                paths.SyncDatabase,
+                "datasync_parser_started") >= 1);
 
         using var telemetry = JsonDocument.Parse(await ReadTelemetryPayloadAsync(
             repository,
@@ -461,6 +465,39 @@ public sealed class EndToEndDataSyncTests : IDisposable
         Assert.Equal("process_start", uploadedMetrics.GetProperty("stageCode").GetString());
         Assert.Equal("parser_artifact_missing", uploadedMetrics.GetProperty("failureCode").GetString());
         Assert.False(uploadedMetrics.TryGetProperty("exitCode", out _));
+    }
+
+    [Fact]
+    public async Task ParserStartedEventPrecedesJobBuildFailure()
+    {
+        var paths = TestPaths();
+        var time = new AdjustableTimeProvider(DateTimeOffset.Parse("2026-07-26T00:00:00Z"));
+        var identity = new ClientIdentityDocument(1, LegacySessionId, LegacySource, time.GetUtcNow());
+        var staging = await CopyReadableFixtureToStagingAsync(paths.StagingRoot);
+        await PublishRecoveryHandoffAsync(paths, staging);
+        var protector = new EncryptedOutboxProtector(new XorTestProtector());
+        await using var repository = await OpenRepositoryAsync(paths.SyncDatabase, time, protector);
+        var runtime = CreateRuntime(
+            paths,
+            new ParserArtifact(Path.Combine(paths.ParserRoot, "missing.json"), new string('0', 64)),
+            repository,
+            protector,
+            new MissingSettingsProvider(),
+            new HttpClient(),
+            time,
+            identity,
+            emitRuntimeEvents: true);
+        await runtime.ReconcileHandoffsAsync(default);
+        foreach (var path in Directory.EnumerateFiles(paths.GenerationRoot, "*", SearchOption.AllDirectories))
+            File.Delete(path);
+
+        Assert.True(await runtime.ProcessOneParserJobAsync(default));
+
+        var eventTypes = await ReadRuntimeEventTypesAsync(paths.SyncDatabase);
+        var started = eventTypes.IndexOf("datasync_parser_started");
+        var failed = eventTypes.IndexOf("datasync_parser_failed");
+        Assert.True(started >= 0, "Parser start event was not recorded.");
+        Assert.True(failed > started, "Parser failure was recorded before parser start.");
     }
 
     private DataSyncRuntime CreateRuntime(
@@ -818,6 +855,34 @@ public sealed class EndToEndDataSyncTests : IDisposable
             """;
         command.Parameters.AddWithValue("$event_type", eventType);
         return (string)(await command.ExecuteScalarAsync() ?? string.Empty);
+    }
+
+    private static async Task<long> CountRuntimeEventsAsync(
+        string databasePath,
+        string eventType)
+    {
+        await using var connection = await SqliteConnectionFactory.OpenAsync(
+            databasePath,
+            readOnly: true,
+            default);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT COUNT(*) FROM runtime_event WHERE event_type = $event_type;";
+        command.Parameters.AddWithValue("$event_type", eventType);
+        return (long)(await command.ExecuteScalarAsync() ?? 0L);
+    }
+
+    private static async Task<List<string>> ReadRuntimeEventTypesAsync(string databasePath)
+    {
+        await using var connection = await SqliteConnectionFactory.OpenAsync(
+            databasePath,
+            readOnly: true,
+            default);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT event_type FROM runtime_event ORDER BY sequence;";
+        var eventTypes = new List<string>();
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync()) eventTypes.Add(reader.GetString(0));
+        return eventTypes;
     }
 
     private static async Task<string> ReadTelemetryPayloadAsync(

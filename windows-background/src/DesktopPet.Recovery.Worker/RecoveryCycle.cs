@@ -18,6 +18,7 @@ public sealed class RecoveryCycle : IRecoveryCycle
     private readonly IOperationalTelemetryPublisher _telemetryPublisher;
     private readonly RecoveryPreflightTelemetry _preflightTelemetry;
     private readonly IProgress<RecoveryProgress> _progress;
+    private readonly SemaphoreSlim _keyReuseFence = new(1, 1);
 
     public RecoveryCycle(
         BackgroundPaths paths,
@@ -152,7 +153,8 @@ public sealed class RecoveryCycle : IRecoveryCycle
             publisher,
             _telemetryPublisher,
             persistedKeyAdapter,
-            telemetryPublishTimeout: TimeSpan.FromSeconds(2));
+            telemetryPublishTimeout: TimeSpan.FromSeconds(2),
+            keyReuseFence: _keyReuseFence);
         var allowLiveCapture = trigger is
             RecoveryCycleTrigger.Startup or RecoveryCycleTrigger.ProcessStarted;
         return await coordinator.RunEpochAsync(

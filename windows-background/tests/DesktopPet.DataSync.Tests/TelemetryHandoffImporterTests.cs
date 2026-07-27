@@ -187,6 +187,12 @@ public sealed class TelemetryHandoffImporterTests : IDisposable
         Assert.Equal(Path.GetFileName(path), Path.GetFileName(rejected));
         Assert.Equal(0, await CountAsync(fixture.Repository.DatabasePath, "imported_telemetry"));
         Assert.Equal(0, await CountAsync(fixture.Repository.DatabasePath, "outbox"));
+        Assert.Contains(
+            "datasync_telemetry_rejected",
+            await ReadRuntimeEventTypesAsync(fixture.Repository.DatabasePath));
+        Assert.DoesNotContain(
+            "datasync_handoff_rejected",
+            await ReadRuntimeEventTypesAsync(fixture.Repository.DatabasePath));
         var diagnostic = await ReadLatestRuntimePayloadAsync(fixture.Repository.DatabasePath);
         Assert.Contains(Path.GetFileName(path), diagnostic, StringComparison.Ordinal);
         Assert.DoesNotContain(untrusted, diagnostic, StringComparison.Ordinal);
@@ -308,6 +314,20 @@ public sealed class TelemetryHandoffImporterTests : IDisposable
         Assert.Equal(_now, state.UpdatedAtUtc);
         Assert.Single(Directory.EnumerateFiles(RejectedRoot()));
         Assert.Empty(Directory.EnumerateFiles(ReadyRoot()));
+    }
+
+    [Fact]
+    public async Task ReconciliationNamesTelemetryImportWithoutClaimingDatabaseHandoff()
+    {
+        var fixture = await CreateFixtureAsync();
+        await WriteEnvelopeAsync(EventId('e'), new { databaseCount = 18 });
+        var runtime = CreateRuntime(fixture);
+
+        await runtime.ReconcileTelemetryAsync(default);
+
+        var eventTypes = await ReadRuntimeEventTypesAsync(fixture.Repository.DatabasePath);
+        Assert.Contains("datasync_telemetry_imported", eventTypes);
+        Assert.DoesNotContain("datasync_handoff_imported", eventTypes);
     }
 
     [Fact]
@@ -578,6 +598,17 @@ public sealed class TelemetryHandoffImporterTests : IDisposable
         await using var command = connection.CreateCommand();
         command.CommandText = "SELECT payload_json FROM runtime_event ORDER BY sequence DESC LIMIT 1;";
         return (string)(await command.ExecuteScalarAsync() ?? string.Empty);
+    }
+
+    private static async Task<IReadOnlyList<string>> ReadRuntimeEventTypesAsync(string path)
+    {
+        await using var connection = await SqliteConnectionFactory.OpenAsync(path, false, default);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT event_type FROM runtime_event ORDER BY sequence;";
+        var eventTypes = new List<string>();
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync()) eventTypes.Add(reader.GetString(0));
+        return eventTypes;
     }
 
     public void Dispose()

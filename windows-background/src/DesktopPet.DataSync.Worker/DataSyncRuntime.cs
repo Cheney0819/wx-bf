@@ -130,7 +130,7 @@ public sealed class DataSyncRuntime : IDataSyncRuntime
             catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or
                 System.Security.Cryptography.CryptographicException or JsonException)
             {
-                await RecordEventAsync("datasync_handoff_rejected", "bounded_failure", cancellationToken);
+                await RecordEventAsync("datasync_telemetry_rejected", "bounded_failure", cancellationToken);
             }
         }
 
@@ -146,7 +146,7 @@ public sealed class DataSyncRuntime : IDataSyncRuntime
                 var result = await _telemetryImporter.ImportAsync(path, cancellationToken);
                 if (result.WasRejected || !result.WasAlreadyImported)
                     await RecordEventAsync(
-                        result.WasRejected ? "datasync_handoff_rejected" : "datasync_handoff_imported",
+                        result.WasRejected ? "datasync_telemetry_rejected" : "datasync_telemetry_imported",
                         result.WasRejected ? "validation_failed" : "success",
                         cancellationToken);
             }
@@ -157,7 +157,7 @@ public sealed class DataSyncRuntime : IDataSyncRuntime
             catch (Exception exception) when (exception is InvalidDataException or IOException or
                 UnauthorizedAccessException or System.Security.Cryptography.CryptographicException or JsonException)
             {
-                await RecordEventAsync("datasync_handoff_rejected", "bounded_failure", cancellationToken);
+                await RecordEventAsync("datasync_telemetry_rejected", "bounded_failure", cancellationToken);
             }
         }
     }
@@ -191,6 +191,11 @@ public sealed class DataSyncRuntime : IDataSyncRuntime
         ParserProcessResult? process = null;
         try
         {
+            await RecordEventAsync(
+                "datasync_parser_started",
+                "job_claimed",
+                cancellationToken,
+                new { attempt = job.AttemptCount });
             var inputs = await _repository.ListParseJobInputsAsync(job.Id, cancellationToken);
             stageKey = "job_build";
             var jobRoot = Path.Combine(_jobsRoot, job.Id);

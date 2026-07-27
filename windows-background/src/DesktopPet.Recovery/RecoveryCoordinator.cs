@@ -14,6 +14,9 @@ public sealed class RecoveryCoordinator
     private readonly IOperationalTelemetryPublisher _telemetryPublisher;
     private readonly IRecoveryKeyReuseAdapter? _keyReuseAdapter;
     private readonly TimeSpan _telemetryPublishTimeout;
+    private readonly TimeSpan _keyReuseTimeout;
+    private readonly TimeSpan _keyReuseCancellationTimeout;
+    private readonly SemaphoreSlim _keyReuseFence;
     private readonly SemaphoreSlim _gate = new(1, 1);
 
     public RecoveryCoordinator(
@@ -23,7 +26,10 @@ public sealed class RecoveryCoordinator
         AtomicHandoffPublisher handoffPublisher,
         IOperationalTelemetryPublisher telemetryPublisher,
         IRecoveryKeyReuseAdapter? keyReuseAdapter = null,
-        TimeSpan? telemetryPublishTimeout = null)
+        TimeSpan? telemetryPublishTimeout = null,
+        TimeSpan? keyReuseTimeout = null,
+        TimeSpan? keyReuseCancellationTimeout = null,
+        SemaphoreSlim? keyReuseFence = null)
     {
         ArgumentNullException.ThrowIfNull(repository);
         ArgumentNullException.ThrowIfNull(captureAdapter);
@@ -33,6 +39,15 @@ public sealed class RecoveryCoordinator
         var publishTimeout = telemetryPublishTimeout ?? TimeSpan.FromSeconds(2);
         if (publishTimeout <= TimeSpan.Zero || publishTimeout > TimeSpan.FromSeconds(30))
             throw new ArgumentOutOfRangeException(nameof(telemetryPublishTimeout));
+        var reuseTimeout = keyReuseTimeout ?? TimeSpan.FromSeconds(15);
+        if (reuseTimeout <= TimeSpan.Zero || reuseTimeout > TimeSpan.FromMinutes(5))
+            throw new ArgumentOutOfRangeException(nameof(keyReuseTimeout));
+        var reuseCancellationTimeout = keyReuseCancellationTimeout ?? TimeSpan.FromSeconds(2);
+        if (reuseCancellationTimeout <= TimeSpan.Zero ||
+            reuseCancellationTimeout > TimeSpan.FromSeconds(30))
+        {
+            throw new ArgumentOutOfRangeException(nameof(keyReuseCancellationTimeout));
+        }
         _repository = repository;
         _stateMachine = new RecoveryStateMachine(repository);
         _captureAdapter = captureAdapter;
@@ -41,6 +56,9 @@ public sealed class RecoveryCoordinator
         _telemetryPublisher = telemetryPublisher;
         _keyReuseAdapter = keyReuseAdapter;
         _telemetryPublishTimeout = publishTimeout;
+        _keyReuseTimeout = reuseTimeout;
+        _keyReuseCancellationTimeout = reuseCancellationTimeout;
+        _keyReuseFence = keyReuseFence ?? new SemaphoreSlim(1, 1);
     }
 
     public async Task<RecoveryAction> RunEpochAsync(
@@ -64,51 +82,164 @@ public sealed class RecoveryCoordinator
             var current = await RequireActiveEpochAsync(epoch.Id, cancellationToken);
             if (_keyReuseAdapter is not null)
             {
-                var reuseResult = await _keyReuseAdapter.TryDecryptAsync(current, cancellationToken);
-                var reuse = reuseResult.Observation;
-                AddCompletedRelativePaths(completedRelativePaths, reuse.Databases);
-                if (reuse.HasValidatedKey || reuse.HasPendingCapture || reuse.OutputPaths.Count > 0)
+                if (!await _keyReuseFence.WaitAsync(0, cancellationToken))
                 {
-                    var requiredDatabasesComplete =
-                        reuseResult.UnresolvedRequiredDatabases.Count == 0;
-                    var reuseAction = requiredDatabasesComplete
-                        ? await _stateMachine.ObserveAsync(
-                            epoch.Id,
-                            reuse,
-                            cancellationToken)
-                        : reuse.OutputPaths.Count > 0
-                            ? RecoveryAction.Publish(
-                                reuse.OutputPaths,
-                                reuse.Databases,
-                                requiredDatabasesComplete: false)
-                            : RecoveryAction.Wait("required_databases_unresolved");
-                    if (reuseAction.Kind == RecoveryActionKind.PublishOutputs)
+                    await PublishTelemetryBestEffortAsync(
+                        "recovery_key_reuse_cancellation_pending",
+                        "warning",
+                        "key_reuse_cancellation_pending",
+                        new { },
+                        cancellationToken);
+                    return RecoveryAction.Wait("key_reuse_cancellation_pending");
+                }
+
+                PersistedDecryptResult? reuseResult;
+                var reuseTimedOut = false;
+                CancellationTokenSource? reuseCancellation = null;
+                Task<PersistedDecryptResult>? reuseTask = null;
+                var disposeReuseCancellation = true;
+                var releaseKeyReuseFence = true;
+                try
+                {
+                    await PublishTelemetryBestEffortAsync(
+                        "recovery_key_reuse_started",
+                        "info",
+                        "key_reuse_started",
+                        new { executableVersion = current.Identity.ExecutableVersion },
+                        cancellationToken);
+                    reuseCancellation =
+                        CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                    var deadline = Task.Delay(
+                        _keyReuseTimeout,
+                        cancellationToken);
+                    reuseTask = Task.Run(
+                        () => _keyReuseAdapter.TryDecryptAsync(
+                            current,
+                            reuseCancellation.Token),
+                        CancellationToken.None);
+                    var completed = await Task.WhenAny(reuseTask, deadline);
+                    if (completed == reuseTask)
                     {
-                        await PublishDecryptResultBestEffortAsync(
-                            reuse,
-                            completedRelativePaths.Count,
+                        reuseResult = await reuseTask;
+                    }
+                    else
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        reuseTimedOut = true;
+                        reuseCancellation.Cancel();
+                        await PublishTelemetryBestEffortAsync(
+                            "recovery_key_reuse_timed_out",
+                            "warning",
+                            "key_reuse_timed_out",
+                            new { timeoutSeconds = (int)Math.Ceiling(_keyReuseTimeout.TotalSeconds) },
                             cancellationToken);
-                        var publication = await _handoffPublisher.PublishWithStatusAsync(
-                            epoch.Id,
-                            reuseAction.Databases,
-                            reuseAction.RequiredDatabasesComplete,
-                            cancellationToken);
-                        if (publication.WasPublished)
+                        try
                         {
-                            await PublishTelemetryBestEffortAsync(
-                                "recovery_handoff_published",
-                                "info",
-                                "handoff_ready",
-                                new
-                                {
-                                    databaseCount = reuseAction.Databases.Count,
-                                    reuseAction.RequiredDatabasesComplete,
-                                },
+                            reuseResult = await reuseTask.WaitAsync(
+                                _keyReuseCancellationTimeout,
                                 cancellationToken);
                         }
+                        catch (OperationCanceledException) when (
+                            reuseCancellation.IsCancellationRequested &&
+                            !cancellationToken.IsCancellationRequested)
+                        {
+                            reuseResult = null;
+                        }
+                        catch (TimeoutException)
+                        {
+                            disposeReuseCancellation = false;
+                            releaseKeyReuseFence = false;
+                            ObserveKeyReuseCompletion(
+                                reuseTask,
+                                reuseCancellation,
+                                _keyReuseFence);
+                            await PublishTelemetryBestEffortAsync(
+                                "recovery_key_reuse_cancellation_pending",
+                                "warning",
+                                "key_reuse_cancellation_pending",
+                                new { },
+                                cancellationToken);
+                            return RecoveryAction.Wait("key_reuse_cancellation_pending");
+                        }
                     }
-                    if (requiredDatabasesComplete || !allowLiveCapture)
-                        return reuseAction;
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    reuseCancellation?.Cancel();
+                    if (reuseTask is { IsCompleted: false } && reuseCancellation is not null)
+                    {
+                        disposeReuseCancellation = false;
+                        releaseKeyReuseFence = false;
+                        ObserveKeyReuseCompletion(
+                            reuseTask,
+                            reuseCancellation,
+                            _keyReuseFence);
+                    }
+                    else if (reuseTask?.IsFaulted == true)
+                    {
+                        _ = reuseTask.Exception;
+                    }
+                    throw;
+                }
+                finally
+                {
+                    if (disposeReuseCancellation) reuseCancellation?.Dispose();
+                    if (releaseKeyReuseFence) _keyReuseFence.Release();
+                }
+                cancellationToken.ThrowIfCancellationRequested();
+                if (reuseResult is null)
+                {
+                    if (!allowLiveCapture)
+                        return RecoveryAction.Wait(
+                            reuseTimedOut ? "key_reuse_timed_out" : "key_reuse_only");
+                }
+                else
+                {
+                    var reuse = reuseResult.Observation;
+                    AddCompletedRelativePaths(completedRelativePaths, reuse.Databases);
+                    if (reuse.HasValidatedKey || reuse.HasPendingCapture || reuse.OutputPaths.Count > 0)
+                    {
+                        var requiredDatabasesComplete =
+                            reuseResult.UnresolvedRequiredDatabases.Count == 0;
+                        var reuseAction = requiredDatabasesComplete
+                            ? await _stateMachine.ObserveAsync(
+                                epoch.Id,
+                                reuse,
+                                cancellationToken)
+                            : reuse.OutputPaths.Count > 0
+                                ? RecoveryAction.Publish(
+                                    reuse.OutputPaths,
+                                    reuse.Databases,
+                                    requiredDatabasesComplete: false)
+                                : RecoveryAction.Wait("required_databases_unresolved");
+                        if (reuseAction.Kind == RecoveryActionKind.PublishOutputs)
+                        {
+                            await PublishDecryptResultBestEffortAsync(
+                                reuse,
+                                completedRelativePaths.Count,
+                                cancellationToken);
+                            var publication = await _handoffPublisher.PublishWithStatusAsync(
+                                epoch.Id,
+                                reuseAction.Databases,
+                                reuseAction.RequiredDatabasesComplete,
+                                cancellationToken);
+                            if (publication.WasPublished)
+                            {
+                                await PublishTelemetryBestEffortAsync(
+                                    "recovery_handoff_published",
+                                    "info",
+                                    "handoff_ready",
+                                    new
+                                    {
+                                        databaseCount = reuseAction.Databases.Count,
+                                        reuseAction.RequiredDatabasesComplete,
+                                    },
+                                    cancellationToken);
+                            }
+                        }
+                        if (requiredDatabasesComplete || !allowLiveCapture)
+                            return reuseAction;
+                    }
                 }
             }
             if (!allowLiveCapture) return RecoveryAction.Wait("key_reuse_only");
@@ -393,6 +524,25 @@ public sealed class RecoveryCoordinator
                 ((CancellationTokenSource)state!).Dispose();
             },
             cancellation,
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+    }
+
+    private static void ObserveKeyReuseCompletion(
+        Task<PersistedDecryptResult> task,
+        CancellationTokenSource cancellation,
+        SemaphoreSlim fence)
+    {
+        _ = task.ContinueWith(
+            static (completed, state) =>
+            {
+                _ = completed.Exception;
+                var completion = ((CancellationTokenSource Cancellation, SemaphoreSlim Fence))state!;
+                completion.Cancellation.Dispose();
+                completion.Fence.Release();
+            },
+            (cancellation, fence),
             CancellationToken.None,
             TaskContinuationOptions.ExecuteSynchronously,
             TaskScheduler.Default);

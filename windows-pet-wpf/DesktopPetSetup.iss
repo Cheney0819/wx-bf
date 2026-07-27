@@ -1,5 +1,5 @@
 #define MyAppName "桌宠"
-#define MyAppVersion "1.0.25"
+#define MyAppVersion "1.0.26"
 #define MyAppPublisher "Junjiee"
 
 [Setup]
@@ -23,7 +23,7 @@ WizardImageFile=Assets\installer-wizard.png
 WizardSmallImageFile=Assets\installer-wizard-small.png
 UninstallDisplayIcon={app}\DesktopPet.Wpf.exe
 ArchitecturesInstallIn64BitMode=x64compatible
-VersionInfoVersion=1.0.25.0
+VersionInfoVersion=1.0.26.0
 VersionInfoTextVersion={#MyAppVersion}
 
 [Languages]
