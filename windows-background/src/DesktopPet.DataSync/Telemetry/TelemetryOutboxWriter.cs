@@ -117,10 +117,21 @@ public sealed class TelemetryOutboxWriter
 
             if (string.Equals(envelope.EventName, "recovery_capture_failed", StringComparison.Ordinal))
                 state["decrypt_ok"] = "false";
-            else if (string.Equals(envelope.EventName, "recovery_handoff_published", StringComparison.Ordinal) ||
-                     string.Equals(envelope.EventName, "recovery_capture_succeeded", StringComparison.Ordinal) &&
+            else if (string.Equals(envelope.EventName, "recovery_capture_succeeded", StringComparison.Ordinal) &&
                      string.Equals(envelope.Code, "key_validated", StringComparison.Ordinal))
                 state["decrypt_ok"] = "true";
+            else if (string.Equals(
+                         envelope.EventName,
+                         "client_wechat_decrypt_export_result",
+                         StringComparison.Ordinal))
+            {
+                var decryptSucceeded = string.Equals(
+                    envelope.Code,
+                    "success",
+                    StringComparison.Ordinal);
+                state["decrypt_ok"] = decryptSucceeded ? "true" : "false";
+                if (decryptSucceeded) state["error"] = "";
+            }
 
             if (envelope.Metrics.ValueKind == JsonValueKind.Object &&
                 envelope.Metrics.TryGetProperty("wechatLoggedIn", out var loggedIn) &&

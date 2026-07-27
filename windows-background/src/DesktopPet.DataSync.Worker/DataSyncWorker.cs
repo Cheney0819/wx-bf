@@ -129,28 +129,19 @@ public sealed class DataSyncWorker
             .ToArray();
         await EnqueueHeartbeatBestEffortAsync(cancellationToken);
         var heartbeatTask = RunHeartbeatLoopAsync(sourceCancellation.Token);
+        var maintenanceTask = RunMaintenanceLoopAsync(sourceCancellation.Token);
         try
         {
             await ReconcileAndParseAsync(cancellationToken);
-            await _runtime.ReconcileTelemetryAsync(cancellationToken);
-            await PollUploadsAsync(cancellationToken);
             var reconciliation = Delay(_options.ReconciliationInterval, cancellationToken);
-            var uploadPoll = Delay(_options.UploadPollInterval, cancellationToken);
             while (true)
             {
                 var hintReady = channel.Reader.WaitToReadAsync(cancellationToken).AsTask();
-                var completed = await Task.WhenAny(hintReady, reconciliation, uploadPoll);
+                var completed = await Task.WhenAny(hintReady, reconciliation);
                 if (completed == reconciliation)
                 {
                     await ReconcileAndParseAsync(cancellationToken);
-                    await _runtime.ReconcileTelemetryAsync(cancellationToken);
                     reconciliation = Delay(_options.ReconciliationInterval, cancellationToken);
-                    continue;
-                }
-                if (completed == uploadPoll)
-                {
-                    await PollUploadsAsync(cancellationToken);
-                    uploadPoll = Delay(_options.UploadPollInterval, cancellationToken);
                     continue;
                 }
                 if (!await hintReady) break;
@@ -158,7 +149,6 @@ public sealed class DataSyncWorker
                 await Delay(_options.DebounceInterval, cancellationToken);
                 DrainHints(channel.Reader);
                 await ReconcileAndParseAsync(cancellationToken);
-                await _runtime.ReconcileTelemetryAsync(cancellationToken);
             }
         }
         finally
@@ -167,6 +157,7 @@ public sealed class DataSyncWorker
             channel.Writer.TryComplete();
             await AwaitHintSourcesAsync(sourceTasks, sourceCancellation.Token);
             await AwaitHeartbeatAsync(heartbeatTask, sourceCancellation.Token);
+            await AwaitHeartbeatAsync(maintenanceTask, sourceCancellation.Token);
         }
     }
 
@@ -182,6 +173,34 @@ public sealed class DataSyncWorker
             await Delay(EffectiveHeartbeatInterval, cancellationToken);
             await EnqueueHeartbeatBestEffortAsync(cancellationToken);
         }
+    }
+
+    private async Task RunMaintenanceLoopAsync(CancellationToken cancellationToken)
+    {
+        while (true)
+        {
+            try
+            {
+                await ReconcileTelemetryBestEffortAsync(cancellationToken);
+                await PollUploadsAsync(cancellationToken);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception)
+            {
+                // Retry telemetry and uploads on the next fixed cadence.
+            }
+            await Delay(_options.UploadPollInterval, cancellationToken);
+        }
+    }
+
+    private async Task ReconcileTelemetryBestEffortAsync(CancellationToken cancellationToken)
+    {
+        try { await _runtime.ReconcileTelemetryAsync(cancellationToken); }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+        catch (Exception) { }
     }
 
     private async Task EnqueueHeartbeatBestEffortAsync(CancellationToken cancellationToken)

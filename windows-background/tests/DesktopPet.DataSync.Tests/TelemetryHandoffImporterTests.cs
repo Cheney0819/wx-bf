@@ -230,6 +230,53 @@ public sealed class TelemetryHandoffImporterTests : IDisposable
         Assert.Equal(newer.OccurredAtUtc, state.UpdatedAtUtc);
     }
 
+    [Theory]
+    [InlineData("success", "true")]
+    [InlineData("partial_success", "false")]
+    public async Task DecryptExportResultUpdatesDecryptOperationalState(
+        string code,
+        string expected)
+    {
+        var fixture = await CreateFixtureAsync();
+        var result = Envelope(
+            EventId('b'),
+            new { databaseCount = 18, outputCount = code == "success" ? 18 : 1, pendingCount = code == "success" ? 0 : 17 }) with
+        {
+            EventName = "client_wechat_decrypt_export_result",
+            Code = code,
+        };
+
+        await fixture.Writer.CommitAsync(result, default);
+
+        Assert.Equal(expected, await ReadStateAsync(fixture.Repository.DatabasePath, "decrypt_ok"));
+    }
+
+    [Fact]
+    public async Task PublishedHandoffDoesNotOverwritePartialDecryptResult()
+    {
+        var fixture = await CreateFixtureAsync();
+        var partial = Envelope(
+            EventId('b'),
+            new { databaseCount = 18, outputCount = 1, pendingCount = 17 }) with
+        {
+            EventName = "client_wechat_decrypt_export_result",
+            Code = "partial_success",
+        };
+        var handoff = Envelope(
+            EventId('c'),
+            new { databaseCount = 1, requiredDatabasesComplete = false }) with
+        {
+            EventName = "recovery_handoff_published",
+            Code = "handoff_ready",
+            OccurredAtUtc = _now.AddMilliseconds(1),
+        };
+
+        await fixture.Writer.CommitAsync(partial, default);
+        await fixture.Writer.CommitAsync(handoff, default);
+
+        Assert.Equal("false", await ReadStateAsync(fixture.Repository.DatabasePath, "decrypt_ok"));
+    }
+
     [Fact]
     public async Task ReconciliationUsesOccurrenceOrderDespiteReverseFilenamesAndInvalidFiles()
     {

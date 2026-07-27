@@ -67,6 +67,85 @@ public sealed class DataSyncWorkerTests : IDisposable
     }
 
     [Fact]
+    public async Task ContinuousMaintenanceRunsWhileParserIsBlocked()
+    {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        var runtime = new FakeRuntime(parseResults: [true])
+        {
+            BlockFirstParserCall = true,
+            DelayOperations = true,
+        };
+        var worker = CreateWorker(runtime, options: new DataSyncWorkerOptions(
+            TimeSpan.Zero,
+            TimeSpan.FromHours(1),
+            TimeSpan.FromMilliseconds(20),
+            2,
+            TimeSpan.FromHours(1)));
+
+        var running = worker.RunAsync(DataSyncRunMode.Continuous, cancellation.Token);
+        await runtime.ParserBlocked.WaitAsync(TimeSpan.FromSeconds(1));
+        var maintenance = Task.WhenAll(
+            runtime.FirstPostBlockTelemetryReconcile,
+            runtime.FirstTwoPostBlockUploads);
+        var observed = await Task.WhenAny(
+            maintenance,
+            Task.Delay(TimeSpan.FromMilliseconds(250))) == maintenance;
+        cancellation.Cancel();
+        await running;
+
+        Assert.True(observed, "Telemetry and uploads were starved by the blocked parser.");
+        Assert.True(runtime.PostBlockTelemetryReconcileCount >= 1);
+        Assert.True(runtime.PostBlockUploadCalls >= 2);
+        Assert.Equal(2, runtime.MaximumUploadConcurrency);
+    }
+
+    [Fact]
+    public async Task UploadFailureDoesNotStopLaterMaintenanceCadenceOrShutdown()
+    {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        var runtime = new FakeRuntime(parseResults: [false]) { ThrowUploadAt = 1 };
+        runtime.AfterUpload = count =>
+        {
+            if (count == 4) cancellation.Cancel();
+        };
+        var worker = CreateWorker(runtime, options: new DataSyncWorkerOptions(
+            TimeSpan.Zero,
+            TimeSpan.FromHours(1),
+            TimeSpan.FromMilliseconds(20),
+            2,
+            TimeSpan.FromHours(1)));
+
+        await worker.RunAsync(DataSyncRunMode.Continuous, cancellation.Token);
+
+        Assert.Equal(2, runtime.TelemetryReconcileCount);
+        Assert.Equal(4, runtime.UploadCalls);
+        Assert.Equal(3, runtime.SuccessfulUploadCalls);
+    }
+
+    [Fact]
+    public async Task TelemetryFailureDoesNotSkipUploadsOrStopLaterCadence()
+    {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        var runtime = new FakeRuntime(parseResults: [false]) { ThrowTelemetryAt = 1 };
+        runtime.AfterUpload = count =>
+        {
+            if (count == 4) cancellation.Cancel();
+        };
+        var worker = CreateWorker(runtime, options: new DataSyncWorkerOptions(
+            TimeSpan.Zero,
+            TimeSpan.FromHours(1),
+            TimeSpan.FromMilliseconds(20),
+            2,
+            TimeSpan.FromHours(1)));
+
+        await worker.RunAsync(DataSyncRunMode.Continuous, cancellation.Token);
+
+        Assert.Equal(2, runtime.TelemetryReconcileCount);
+        Assert.Equal(4, runtime.UploadCalls);
+        Assert.Equal(4, runtime.SuccessfulUploadCalls);
+    }
+
+    [Fact]
     public async Task ContinuousModeDoesNotDependOnWpfAndRespondsToReadyHint()
     {
         using var cancellation = new CancellationTokenSource();
@@ -296,8 +375,17 @@ public sealed class DataSyncWorkerTests : IDisposable
         private readonly Queue<bool> _parseResults = new(parseResults);
         private readonly TaskCompletionSource _firstReconcile = new(
             TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _parserBlocked = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _firstPostBlockTelemetryReconcile = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _firstTwoPostBlockUploads = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _blockedParserRelease = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
         private int _parserConcurrency;
         private int _uploadConcurrency;
+        private int _postBlockUploadSignals;
         private readonly object _callsGate = new();
 
         internal int InitializeCount { get; private set; }
@@ -306,14 +394,25 @@ public sealed class DataSyncWorkerTests : IDisposable
         internal int UploadCalls { get; private set; }
         internal int HeartbeatCount { get; private set; }
         internal int TelemetryReconcileCount { get; private set; }
+        internal int PostBlockTelemetryReconcileCount { get; private set; }
+        internal int PostBlockUploadCalls { get; private set; }
+        internal int SuccessfulUploadCalls { get; private set; }
         internal int MaximumParserConcurrency { get; private set; }
         internal int MaximumUploadConcurrency { get; private set; }
         internal bool DelayOperations { get; init; }
+        internal bool BlockFirstParserCall { get; init; }
         internal Action<int>? AfterReconcile { get; set; }
         internal Action<int>? AfterHeartbeat { get; set; }
         internal int ThrowHeartbeatAt { get; init; }
+        internal int ThrowTelemetryAt { get; init; }
+        internal int ThrowUploadAt { get; init; }
+        internal Action<int>? AfterUpload { get; set; }
         internal List<string> Calls { get; } = [];
         internal Task FirstReconcile => _firstReconcile.Task;
+        internal Task ParserBlocked => _parserBlocked.Task;
+        internal Task FirstPostBlockTelemetryReconcile =>
+            _firstPostBlockTelemetryReconcile.Task;
+        internal Task FirstTwoPostBlockUploads => _firstTwoPostBlockUploads.Task;
 
         public Task InitializeAsync(CancellationToken cancellationToken)
         {
@@ -333,6 +432,13 @@ public sealed class DataSyncWorkerTests : IDisposable
         public Task ReconcileTelemetryAsync(CancellationToken cancellationToken)
         {
             TelemetryReconcileCount++;
+            if (_parserBlocked.Task.IsCompleted)
+            {
+                PostBlockTelemetryReconcileCount++;
+                _firstPostBlockTelemetryReconcile.TrySetResult();
+            }
+            if (TelemetryReconcileCount == ThrowTelemetryAt)
+                throw new InvalidOperationException("simulated telemetry failure");
             return Task.CompletedTask;
         }
 
@@ -353,6 +459,11 @@ public sealed class DataSyncWorkerTests : IDisposable
             MaximumParserConcurrency = Math.Max(MaximumParserConcurrency, concurrency);
             try
             {
+                if (BlockFirstParserCall && ParserCalls == 1)
+                {
+                    _parserBlocked.TrySetResult();
+                    await _blockedParserRelease.Task.WaitAsync(cancellationToken);
+                }
                 if (DelayOperations) await Task.Delay(20, cancellationToken);
                 return _parseResults.Count > 0 && _parseResults.Dequeue();
             }
@@ -368,11 +479,21 @@ public sealed class DataSyncWorkerTests : IDisposable
         {
             AddCall("upload");
             UploadCalls++;
+            if (_parserBlocked.Task.IsCompleted)
+            {
+                PostBlockUploadCalls++;
+                if (Interlocked.Increment(ref _postBlockUploadSignals) >= 2)
+                    _firstTwoPostBlockUploads.TrySetResult();
+            }
             var concurrency = Interlocked.Increment(ref _uploadConcurrency);
             MaximumUploadConcurrency = Math.Max(MaximumUploadConcurrency, concurrency);
             try
             {
                 if (DelayOperations) await Task.Delay(40, cancellationToken);
+                AfterUpload?.Invoke(UploadCalls);
+                if (UploadCalls == ThrowUploadAt)
+                    throw new InvalidOperationException("simulated upload failure");
+                SuccessfulUploadCalls++;
                 return UploadDisposition.Idle;
             }
             finally
