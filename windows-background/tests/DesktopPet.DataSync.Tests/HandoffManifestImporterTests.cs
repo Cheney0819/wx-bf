@@ -58,12 +58,34 @@ public sealed class HandoffManifestImporterTests : IDisposable
         Assert.NotNull(await repository.GetParseJobAsync(repaired.JobId, default));
     }
 
-    [Fact]
-    public async Task IncompleteRequiredDatabaseSetDoesNotEnqueueParserWork()
+    [Theory]
+    [InlineData("message/message_0.db")]
+    [InlineData("db_storage/message/message_1.db")]
+    [InlineData(@"db_storage\message\biz_message_2.db")]
+    public async Task IncompleteRequiredDatabaseSetEnqueuesAvailableMessageDatabase(
+        string relativePath)
     {
         var fixture = await CreateManifestAsync(
             requiredDatabasesComplete: false,
-            ("message/message_0.db", "message-db"));
+            (relativePath, "message-db"));
+        await using var repository = await OpenRepositoryAsync();
+
+        var result = await CreateImporter(repository).ImportAsync(fixture.Path, default);
+
+        Assert.False(result.WasAlreadyImported);
+        Assert.Single(await repository.ListManifestsAsync(default));
+        Assert.Single(Directory.EnumerateFiles(AcceptedRoot(), "*.json"));
+        var inputs = await repository.ListParseJobInputsAsync(result.JobId, default);
+        Assert.Single(inputs);
+        Assert.Equal(relativePath.Replace('\\', '/'), inputs[0].RelativePath);
+    }
+
+    [Fact]
+    public async Task IncompleteAuxiliaryDatabaseSetRemainsDeferred()
+    {
+        var fixture = await CreateManifestAsync(
+            requiredDatabasesComplete: false,
+            ("contact/contact.db", "contact-db"));
         await using var repository = await OpenRepositoryAsync();
 
         await Assert.ThrowsAsync<IncompleteHandoffException>(() =>
@@ -71,6 +93,20 @@ public sealed class HandoffManifestImporterTests : IDisposable
 
         Assert.Empty(await repository.ListManifestsAsync(default));
         Assert.False(Directory.Exists(AcceptedRoot()));
+    }
+
+    [Fact]
+    public async Task IncompleteNestedMessageLookingPathRemainsDeferred()
+    {
+        var fixture = await CreateManifestAsync(
+            requiredDatabasesComplete: false,
+            ("archive/message/message_0.db", "message-db"));
+        await using var repository = await OpenRepositoryAsync();
+
+        await Assert.ThrowsAsync<IncompleteHandoffException>(() =>
+            CreateImporter(repository).ImportAsync(fixture.Path, default));
+
+        Assert.Empty(await repository.ListManifestsAsync(default));
     }
 
     [Fact]

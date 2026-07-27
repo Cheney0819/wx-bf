@@ -76,8 +76,12 @@ public sealed class HandoffManifestImporter
                 fullManifestPath,
                 manifest,
                 cancellationToken);
-            if (!validated.RequiredDatabasesComplete)
+            if (!validated.RequiredDatabasesComplete &&
+                !HandoffDatabaseClassifier.ContainsMessageDatabase(
+                    validated.Databases.Select(database => database.RelativePath)))
+            {
                 throw new IncompleteHandoffException();
+            }
             var result = await _repository.ImportHandoffAsync(validated, cancellationToken);
             await _acceptancePublisher.PublishAsync(
                 new HandoffAcceptedMarker(

@@ -120,6 +120,28 @@ public sealed class DataSyncRepositoryTests : IDisposable
         Assert.Equal("messages:auth-row", (await repository.GetOutboxAsync("auth-row", default))!.IdempotencyKey);
     }
 
+    [Fact]
+    public async Task IncompleteAuxiliaryHandoffCannotBypassImporterGate()
+    {
+        await using var repository = await OpenAsync(Path.Combine(_root, "sync.db"));
+        var database = new ValidatedHandoffDatabase(
+            new string('b', 64),
+            "contact/contact.db",
+            Path.Combine(_root, "contact.db"),
+            new string('c', 64));
+        var manifest = new ValidatedHandoffManifest(
+            new string('a', 64),
+            "epoch-1",
+            DateTimeOffset.UtcNow,
+            [database],
+            RequiredDatabasesComplete: false);
+
+        await Assert.ThrowsAsync<InvalidDataException>(() =>
+            repository.ImportHandoffAsync(manifest, default));
+
+        Assert.Empty(await repository.ListManifestsAsync(default));
+    }
+
     private async Task<DataSyncRepository> OpenAsync(
         string path,
         TimeProvider? timeProvider = null)
