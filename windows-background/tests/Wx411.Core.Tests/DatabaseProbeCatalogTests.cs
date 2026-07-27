@@ -119,6 +119,30 @@ public sealed class DatabaseProbeCatalogTests
     }
 
     [Fact]
+    public void WalOnlyAppendChangesDatabaseGeneration()
+    {
+        var directory = Directory.CreateTempSubdirectory("wx411-wal-generation-").FullName;
+        var databasePath = Path.Combine(directory, "message_0.db");
+        var walPath = databasePath + "-wal";
+        var fixture = CipherFixtureFactory.Create(SqlCipher4.Profile, pageCount: 8);
+        File.WriteAllBytes(databasePath, fixture.Encrypted);
+        try
+        {
+            var before = DatabaseProbeDescriptor.GetGeneration(databasePath);
+            File.WriteAllBytes(walPath, new byte[64]);
+            File.SetLastWriteTimeUtc(walPath, DateTime.UtcNow.AddSeconds(1));
+            var after = DatabaseProbeDescriptor.GetGeneration(databasePath);
+
+            Assert.NotEqual(before, after);
+            Assert.NotEqual(before.WalFingerprint, after.WalFingerprint);
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
     public void SelectedDatabaseFailureStopsCatalogCreationButOtherFailureIsSkipped()
     {
         var fixture = CipherFixtureFactory.Create(SqlCipher4.Profile, pageCount: 8);

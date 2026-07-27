@@ -3,16 +3,50 @@ using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using DesktopPet.Background.Contracts;
-using Wx411.Core;
 
 namespace DesktopPet.Recovery;
 
 public sealed record WeChatRuntimeIdentity(
-    RecoveryEpochIdentity EpochIdentity,
+    int ProcessId,
+    int SessionId,
     string ExecutablePath,
-    string DataRoot);
+    string ExecutableIdentity,
+    RecoveryEpochIdentity? EpochIdentity = null,
+    string? DataRoot = null);
 
-public sealed class WeChatIdentityProvider
+public sealed class AmbiguousWeChatProcessException : InvalidOperationException
+{
+    public AmbiguousWeChatProcessException(int candidateCount)
+        : base("Multiple target processes are active in the worker session.")
+    {
+        if (candidateCount < 2)
+            throw new ArgumentOutOfRangeException(nameof(candidateCount));
+        CandidateCount = candidateCount;
+    }
+
+    public int CandidateCount { get; }
+
+    public string Code => "ambiguous_wechat_process";
+}
+
+internal sealed record WeChatProcessCandidate(
+    int ProcessId,
+    int SessionId,
+    string ExecutablePath,
+    bool HasMainWindow = false);
+
+public interface IWeChatIdentityProvider
+{
+    WeChatRuntimeIdentity ResolveActiveProcess();
+
+    WeChatRuntimeIdentity BindDataRoot(
+        WeChatRuntimeIdentity runtime,
+        string dataRoot);
+
+    WeChatRuntimeIdentity ResolveActive(string dataRoot);
+}
+
+public sealed class WeChatIdentityProvider : IWeChatIdentityProvider
 {
     public RecoveryEpochIdentity CreateIdentity(
         string executablePath,
@@ -24,40 +58,64 @@ public sealed class WeChatIdentityProvider
         if (!File.Exists(normalizedExecutable))
             throw new FileNotFoundException("Target executable does not exist.", normalizedExecutable);
         var normalizedRoot = NormalizeRoot(dataRoot);
-        var versionInfo = FileVersionInfo.GetVersionInfo(normalizedExecutable);
-        var version = versionInfo.FileVersion ?? versionInfo.ProductVersion ?? "unknown";
-        var executableHash = FileSha256(normalizedExecutable);
-        var signer = SignerIdentity(normalizedExecutable);
-        var executableIdentity = $"{version}|sha256:{executableHash}|signer:{signer}";
         return new RecoveryEpochIdentity(
-            executableIdentity,
+            ExecutableIdentity(normalizedExecutable),
             TextSha256(normalizedRoot));
     }
 
-    public WeChatRuntimeIdentity ResolveActive(IReadOnlyList<string> knownDataRoots)
+    public WeChatRuntimeIdentity ResolveActiveProcess()
     {
-        ArgumentNullException.ThrowIfNull(knownDataRoots);
-        var executablePath = ResolveInteractiveExecutable();
-        var dataRoot = SelectDataRoot(knownDataRoots);
+        var process = ResolveInteractiveProcess();
         return new WeChatRuntimeIdentity(
-            CreateIdentity(executablePath, dataRoot),
-            executablePath,
-            dataRoot);
+            process.Pid,
+            process.SessionId,
+            process.ExecutablePath,
+            ExecutableIdentity(process.ExecutablePath));
     }
 
-    private static string ResolveInteractiveExecutable()
+    public WeChatRuntimeIdentity BindDataRoot(
+        WeChatRuntimeIdentity runtime,
+        string dataRoot)
+    {
+        ArgumentNullException.ThrowIfNull(runtime);
+        ArgumentException.ThrowIfNullOrWhiteSpace(dataRoot);
+        var normalizedRoot = NormalizeRoot(dataRoot);
+        if (!Directory.Exists(normalizedRoot))
+            throw new DirectoryNotFoundException("The selected target data root is unavailable.");
+        var identity = new RecoveryEpochIdentity(
+            runtime.ExecutableIdentity,
+            TextSha256(normalizedRoot));
+        return new WeChatRuntimeIdentity(
+            runtime.ProcessId,
+            runtime.SessionId,
+            runtime.ExecutablePath,
+            runtime.ExecutableIdentity,
+            identity,
+            normalizedRoot);
+    }
+
+    public WeChatRuntimeIdentity ResolveActive(string dataRoot) =>
+        BindDataRoot(ResolveActiveProcess(), dataRoot);
+
+    private static (int Pid, int SessionId, string ExecutablePath) ResolveInteractiveProcess()
     {
         using var current = Process.GetCurrentProcess();
         var currentSession = current.SessionId;
-        foreach (var process in Process.GetProcessesByName("Weixin")
-                     .OrderBy(item => item.Id))
+        var candidates = new List<WeChatProcessCandidate>();
+        foreach (var process in Process.GetProcessesByName("Weixin"))
         {
             try
             {
                 if (process.SessionId != currentSession) continue;
                 var path = process.MainModule?.FileName;
                 if (!string.IsNullOrWhiteSpace(path) && File.Exists(path))
-                    return Path.GetFullPath(path);
+                {
+                    candidates.Add(new WeChatProcessCandidate(
+                        process.Id,
+                        process.SessionId,
+                        Path.GetFullPath(path),
+                        process.MainWindowHandle != nint.Zero));
+                }
             }
             catch (Exception exception) when (exception is
                 InvalidOperationException or Win32Exception or NotSupportedException)
@@ -69,26 +127,24 @@ public sealed class WeChatIdentityProvider
                 process.Dispose();
             }
         }
-        throw new InvalidOperationException("No target process is active in the worker session.");
+
+        var selected = SelectInteractiveProcess(candidates);
+        return (selected.ProcessId, selected.SessionId, selected.ExecutablePath);
     }
 
-    private static string SelectDataRoot(IReadOnlyList<string> knownDataRoots)
+    internal static WeChatProcessCandidate SelectInteractiveProcess(
+        IReadOnlyList<WeChatProcessCandidate> candidates)
     {
-        var candidates = knownDataRoots
-            .Where(path => !string.IsNullOrWhiteSpace(path))
-            .Select(NormalizeRoot)
-            .Where(Directory.Exists)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .Select(path => new
-            {
-                Path = path,
-                DatabaseCount = DatabaseSourceDiscovery.Discover([path]).Count,
-            })
-            .OrderByDescending(item => item.DatabaseCount)
-            .ThenBy(item => item.Path, StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-        return candidates.FirstOrDefault()?.Path ??
-            throw new DirectoryNotFoundException("No configured target data root is available.");
+        ArgumentNullException.ThrowIfNull(candidates);
+        if (candidates.Count == 0)
+            throw new InvalidOperationException(
+                "No target process is active in the worker session.");
+        if (candidates.Count == 1) return candidates[0];
+
+        var windowed = candidates.Where(candidate => candidate.HasMainWindow).ToArray();
+        if (windowed.Length == 1) return windowed[0];
+        throw new AmbiguousWeChatProcessException(
+            windowed.Length > 1 ? windowed.Length : candidates.Count);
     }
 
     private static string NormalizeRoot(string path)
@@ -97,6 +153,15 @@ public sealed class WeChatIdentityProvider
         return OperatingSystem.IsWindows()
             ? normalized.ToUpperInvariant()
             : normalized;
+    }
+
+    private static string ExecutableIdentity(string executablePath)
+    {
+        var versionInfo = FileVersionInfo.GetVersionInfo(executablePath);
+        var version = versionInfo.FileVersion ?? versionInfo.ProductVersion ?? "unknown";
+        var executableHash = FileSha256(executablePath);
+        var signer = SignerIdentity(executablePath);
+        return $"{version}|sha256:{executableHash}|signer:{signer}";
     }
 
     private static string FileSha256(string path)

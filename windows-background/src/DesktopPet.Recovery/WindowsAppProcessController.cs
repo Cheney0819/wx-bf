@@ -26,33 +26,71 @@ public sealed class WindowsAppProcessController : IAppProcessController
     private static readonly TimeSpan DefaultExitTimeout = TimeSpan.FromSeconds(15);
     private readonly IWindowsAppProcessOperations _operations;
     private readonly TimeSpan _exitTimeout;
+    private readonly int? _sessionId;
+    private readonly string? _executablePath;
+    private int? _boundProcessId;
 
     public WindowsAppProcessController()
-        : this(new WindowsAppProcessOperations(), DefaultExitTimeout)
+        : this(new WindowsAppProcessOperations(), DefaultExitTimeout, runtime: null)
+    {
+    }
+
+    public WindowsAppProcessController(WeChatRuntimeIdentity runtime)
+        : this(new WindowsAppProcessOperations(), DefaultExitTimeout, runtime)
     {
     }
 
     internal WindowsAppProcessController(
         IWindowsAppProcessOperations operations,
         TimeSpan exitTimeout)
+        : this(operations, exitTimeout, runtime: null)
+    {
+    }
+
+    internal WindowsAppProcessController(
+        IWindowsAppProcessOperations operations,
+        TimeSpan exitTimeout,
+        WeChatRuntimeIdentity? runtime)
     {
         ArgumentNullException.ThrowIfNull(operations);
         if (exitTimeout <= TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(exitTimeout));
+        if (runtime is not null)
+        {
+            if (runtime.ProcessId <= 0 || runtime.SessionId < 0)
+                throw new ArgumentOutOfRangeException(nameof(runtime));
+            ArgumentException.ThrowIfNullOrWhiteSpace(runtime.ExecutablePath);
+            _boundProcessId = runtime.ProcessId;
+            _sessionId = runtime.SessionId;
+            _executablePath = Path.GetFullPath(runtime.ExecutablePath);
+        }
         _operations = operations;
         _exitTimeout = exitTimeout;
     }
 
     public async Task<AppProcessIdentity> RestartAsync(
+        CancellationToken cancellationToken) =>
+        await RestartAsync(static _ => Task.CompletedTask, cancellationToken);
+
+    public async Task<AppProcessIdentity> RestartAsync(
+        Func<CancellationToken, Task> beforeStart,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(beforeStart);
         cancellationToken.ThrowIfCancellationRequested();
         var snapshots = _operations.SnapshotInteractiveTargets()
             .Where(item => IsExpectedExecutable(item.ExecutablePath))
+            .Where(MatchesRuntime)
             .ToArray();
         if (snapshots.Length == 0)
             throw new InvalidOperationException(
                 "No restartable target process is active in the interactive session.");
+        if (_boundProcessId is int boundPid &&
+            !snapshots.Any(item => item.ProcessId == boundPid))
+        {
+            throw new InvalidOperationException(
+                "The bound target process identity changed before restart.");
+        }
 
         var selectedGroup = snapshots
             .GroupBy(
@@ -73,8 +111,19 @@ public sealed class WindowsAppProcessController : IAppProcessController
         }
 
         cancellationToken.ThrowIfCancellationRequested();
-        return _operations.Start(executablePath);
+        await beforeStart(cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
+        var started = _operations.Start(executablePath);
+        _boundProcessId = null;
+        return started;
     }
+
+    private bool MatchesRuntime(AppProcessSnapshot snapshot) =>
+        (_sessionId is null || snapshot.SessionId == _sessionId) &&
+        (_executablePath is null || string.Equals(
+            Path.GetFullPath(snapshot.ExecutablePath),
+            _executablePath,
+            StringComparison.OrdinalIgnoreCase));
 
     private static bool IsExpectedExecutable(string path) =>
         !string.IsNullOrWhiteSpace(path) &&

@@ -51,7 +51,8 @@ public sealed record ValidatedHandoffManifest(
     string ManifestId,
     string EpochId,
     DateTimeOffset CreatedAtUtc,
-    IReadOnlyList<ValidatedHandoffDatabase> Databases);
+    IReadOnlyList<ValidatedHandoffDatabase> Databases,
+    bool RequiredDatabasesComplete);
 
 public sealed record HandoffImportResult(
     string ManifestId,
@@ -180,6 +181,14 @@ public interface IDataSyncRepository : IAsyncDisposable
         string workerId,
         int statusCode,
         string summary,
+        CancellationToken cancellationToken);
+
+    Task<int> RequeueQuarantinedOutboxAsync(
+        IReadOnlyCollection<int> statusCodes,
+        CancellationToken cancellationToken);
+
+    Task<int> RequeueAuthenticationFailuresIfCredentialChangedAsync(
+        string credentialFingerprint,
         CancellationToken cancellationToken);
 
     Task RecordRuntimeEventAsync(

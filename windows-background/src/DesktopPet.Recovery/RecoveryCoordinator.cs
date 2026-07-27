@@ -55,23 +55,39 @@ public sealed class RecoveryCoordinator
     {
         ArgumentNullException.ThrowIfNull(epoch);
         await _gate.WaitAsync(cancellationToken);
+        Task<CaptureObservation>? preparedCaptureTask = null;
+        CancellationTokenSource? preparedCaptureCancellation = null;
         try
         {
             var current = await RequireActiveEpochAsync(epoch.Id, cancellationToken);
             if (_keyReuseAdapter is not null)
             {
-                var reuse = await _keyReuseAdapter.TryDecryptAsync(current, cancellationToken);
+                var reuseResult = await _keyReuseAdapter.TryDecryptAsync(current, cancellationToken);
+                var reuse = reuseResult.Observation;
                 if (reuse.HasValidatedKey || reuse.HasPendingCapture || reuse.OutputPaths.Count > 0)
                 {
-                    var reuseAction = await _stateMachine.ObserveAsync(
-                        epoch.Id,
-                        reuse,
-                        cancellationToken);
+                    var requiredDatabasesComplete =
+                        reuseResult.UnresolvedRequiredDatabases.Count == 0;
+                    var reuseAction = requiredDatabasesComplete
+                        ? await _stateMachine.ObserveAsync(
+                            epoch.Id,
+                            reuse,
+                            cancellationToken)
+                        : reuse.OutputPaths.Count > 0
+                            ? RecoveryAction.Publish(
+                                reuse.OutputPaths,
+                                reuse.Databases,
+                                requiredDatabasesComplete: false)
+                            : RecoveryAction.Wait("required_databases_unresolved");
                     if (reuseAction.Kind == RecoveryActionKind.PublishOutputs)
                     {
+                        await PublishDecryptResultBestEffortAsync(
+                            reuse,
+                            cancellationToken);
                         var publication = await _handoffPublisher.PublishWithStatusAsync(
                             epoch.Id,
                             reuseAction.Databases,
+                            reuseAction.RequiredDatabasesComplete,
                             cancellationToken);
                         if (publication.WasPublished)
                         {
@@ -79,14 +95,20 @@ public sealed class RecoveryCoordinator
                                 "recovery_handoff_published",
                                 "info",
                                 "handoff_ready",
-                                new { databaseCount = reuseAction.Databases.Count },
+                                new
+                                {
+                                    databaseCount = reuseAction.Databases.Count,
+                                    reuseAction.RequiredDatabasesComplete,
+                                },
                                 cancellationToken);
                         }
                     }
-                    return reuseAction;
+                    if (requiredDatabasesComplete || !allowLiveCapture)
+                        return reuseAction;
                 }
             }
             if (!allowLiveCapture) return RecoveryAction.Wait("key_reuse_only");
+            current = await RequireActiveEpochAsync(epoch.Id, cancellationToken);
             var action = _stateMachine.Begin(current);
             while (true)
             {
@@ -106,11 +128,17 @@ public sealed class RecoveryCoordinator
                             },
                             cancellationToken);
                         CaptureObservation observation;
+                        var captureTask = preparedCaptureTask;
+                        var captureCancellation = preparedCaptureCancellation;
+                        preparedCaptureTask = null;
+                        preparedCaptureCancellation = null;
                         try
                         {
-                            observation = await _captureAdapter.CaptureAsync(
+                            captureTask ??= _captureAdapter.CaptureAsync(
                                 current,
+                                RecoveryCaptureTarget.BoundProcess,
                                 cancellationToken);
+                            observation = await captureTask;
                         }
                         catch (Exception) when (!cancellationToken.IsCancellationRequested)
                         {
@@ -122,6 +150,10 @@ public sealed class RecoveryCoordinator
                                 CancellationToken.None);
                             throw;
                         }
+                        finally
+                        {
+                            captureCancellation?.Dispose();
+                        }
                         action = await _stateMachine.ObserveAsync(
                             epoch.Id,
                             observation,
@@ -129,20 +161,28 @@ public sealed class RecoveryCoordinator
                         var observationCode = StableCodeOrDefault(
                             observation.FailureCode,
                             "capture_failed");
-                        if (observation.HasValidatedKey || observation.HasPendingCapture)
+                        if (observation.HasValidatedKey || observation.HasPendingCapture || observation.OutputPaths.Count > 0)
                         {
                             await PublishTelemetryBestEffortAsync(
                                 "recovery_capture_succeeded",
                                 "info",
                                 observation.HasValidatedKey
                                     ? "key_validated"
-                                    : "pending_capture_available",
+                                    : observation.HasPendingCapture
+                                        ? "pending_capture_available"
+                                        : "partial_outputs_available",
                                 new
                                 {
                                     databaseCount = observation.Databases.Count,
                                     outputCount = observation.OutputPaths.Count,
                                 },
                                 cancellationToken);
+                            if (observation.OutputPaths.Count > 0)
+                            {
+                                await PublishDecryptResultBestEffortAsync(
+                                    observation,
+                                    cancellationToken);
+                            }
                         }
                         else
                         {
@@ -165,12 +205,12 @@ public sealed class RecoveryCoordinator
                         }
                         break;
 
-                    case RecoveryActionKind.RestartAndCapture:
+                    case RecoveryActionKind.RelaunchProcess:
                         current = await RequireActiveEpochAsync(epoch.Id, cancellationToken);
                         await PublishTelemetryBestEffortAsync(
                             "recovery_restart_started",
-                            "info",
-                            "restart_started",
+                            "warning",
+                            "breakpoint_restore_relaunch",
                             new { restartCount = current.RestartCount },
                             cancellationToken);
                         try
@@ -182,10 +222,67 @@ public sealed class RecoveryCoordinator
                             await PublishTelemetryBestEffortAsync(
                                 "recovery_restart_failed",
                                 "error",
+                                "breakpoint_restore_relaunch_failed",
+                                new { restartCount = current.RestartCount },
+                                CancellationToken.None);
+                            throw;
+                        }
+                        await PublishTelemetryBestEffortAsync(
+                            "recovery_restart_completed",
+                            "info",
+                            "breakpoint_restore_relaunch_completed",
+                            new { restartCount = current.RestartCount },
+                            cancellationToken);
+                        return RecoveryAction.Wait(
+                            "breakpoint_restore_relaunch_completed");
+
+                    case RecoveryActionKind.RestartAndCapture:
+                        current = await RequireActiveEpochAsync(epoch.Id, cancellationToken);
+                        await PublishTelemetryBestEffortAsync(
+                            "recovery_restart_started",
+                            "info",
+                            "restart_started",
+                            new { restartCount = current.RestartCount },
+                            cancellationToken);
+                        CancellationTokenSource? preparationCancellation = null;
+                        Task<CaptureObservation>? preparationTask = null;
+                        try
+                        {
+                            preparationCancellation =
+                                CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                            await _processController.RestartAsync(
+                                token =>
+                                {
+                                    token.ThrowIfCancellationRequested();
+                                    preparationTask = _captureAdapter.CaptureAsync(
+                                        current,
+                                        RecoveryCaptureTarget.RestartedProcess,
+                                        preparationCancellation.Token);
+                                    return Task.CompletedTask;
+                                },
+                                cancellationToken);
+                            preparedCaptureTask = preparationTask ??
+                                throw new InvalidOperationException(
+                                    "Capture preparation did not start before the target process.");
+                            preparedCaptureCancellation = preparationCancellation;
+                            preparationTask = null;
+                            preparationCancellation = null;
+                        }
+                        catch (Exception) when (!cancellationToken.IsCancellationRequested)
+                        {
+                            await PublishTelemetryBestEffortAsync(
+                                "recovery_restart_failed",
+                                "error",
                                 "restart_failed",
                                 new { restartCount = current.RestartCount },
                                 CancellationToken.None);
                             throw;
+                        }
+                        finally
+                        {
+                            CancelAndObservePreparedCapture(
+                                preparationTask,
+                                preparationCancellation);
                         }
                         await PublishTelemetryBestEffortAsync(
                             "recovery_restart_completed",
@@ -200,6 +297,7 @@ public sealed class RecoveryCoordinator
                         var publication = await _handoffPublisher.PublishWithStatusAsync(
                             epoch.Id,
                             action.Databases,
+                            action.RequiredDatabasesComplete,
                             cancellationToken);
                         if (publication.WasPublished)
                         {
@@ -207,7 +305,11 @@ public sealed class RecoveryCoordinator
                                 "recovery_handoff_published",
                                 "info",
                                 "handoff_ready",
-                                new { databaseCount = action.Databases.Count },
+                                new
+                                {
+                                    databaseCount = action.Databases.Count,
+                                    action.RequiredDatabasesComplete,
+                                },
                                 cancellationToken);
                         }
                         return action;
@@ -247,8 +349,35 @@ public sealed class RecoveryCoordinator
         }
         finally
         {
+            CancelAndObservePreparedCapture(
+                preparedCaptureTask,
+                preparedCaptureCancellation);
             _gate.Release();
         }
+    }
+
+    private static void CancelAndObservePreparedCapture(
+        Task<CaptureObservation>? captureTask,
+        CancellationTokenSource? cancellation)
+    {
+        if (cancellation is null) return;
+        cancellation.Cancel();
+        if (captureTask is null)
+        {
+            cancellation.Dispose();
+            return;
+        }
+
+        _ = captureTask.ContinueWith(
+            static (completed, state) =>
+            {
+                _ = completed.Exception;
+                ((CancellationTokenSource)state!).Dispose();
+            },
+            cancellation,
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
     }
 
     private async Task PublishTelemetryBestEffortAsync(
@@ -298,6 +427,28 @@ public sealed class RecoveryCoordinator
                 // Telemetry diagnostics remain best effort relative to Recovery work.
             }
         }
+    }
+
+    private Task PublishDecryptResultBestEffortAsync(
+        CaptureObservation observation,
+        CancellationToken cancellationToken)
+    {
+        var databaseCount = Math.Max(
+            observation.CandidateDatabaseCount,
+            Math.Max(observation.Databases.Count, observation.OutputPaths.Count));
+        var outputCount = Math.Min(observation.OutputPaths.Count, databaseCount);
+        var pendingCount = Math.Max(0, databaseCount - outputCount);
+        return PublishTelemetryBestEffortAsync(
+            "client_wechat_decrypt_export_result",
+            "info",
+            pendingCount == 0 ? "success" : "partial_success",
+            new
+            {
+                databaseCount,
+                outputCount,
+                pendingCount,
+            },
+            cancellationToken);
     }
 
     private static string StableCodeOrDefault(string? value, string fallback) =>

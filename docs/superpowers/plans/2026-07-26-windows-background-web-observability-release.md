@@ -149,7 +149,7 @@ Commit: `feat: report recovery preflight to web telemetry`
 
 - [ ] **Step 1: Write failing precedence and secrecy tests**
 
-Cover existing vault, `WECHAT_MONITOR_SERVER_URL`/`WECHAT_MONITOR_SERVER_TOKEN`, legacy `monitor_config.json`, default `https://wx.junjiee.online/api/messages` plus `wx_monitor_2026`, corrupt vault quarantine, and two concurrent callers. Assert the resulting DPAPI bytes contain neither origin nor token.
+Cover existing vault, `WECHAT_MONITOR_SERVER_URL`/`WECHAT_MONITOR_SERVER_TOKEN`, legacy `monitor_config.json`, the deployment endpoint with an explicit test token, corrupt vault quarantine, and two concurrent callers. Assert the resulting DPAPI bytes contain neither origin nor token.
 
 ```csharp
 var result = await bootstrapper.EnsureAsync(default);

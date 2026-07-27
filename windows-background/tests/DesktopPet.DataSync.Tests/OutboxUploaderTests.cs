@@ -23,10 +23,51 @@ public sealed class OutboxUploaderTests : IDisposable
         var result = await fixture.Uploader.UploadOneAsync("worker-a", default);
         var row = await fixture.Repository.GetOutboxAsync("outbox-1", default);
 
-        Assert.Equal(UploadDisposition.Offline, result.Disposition);
+        Assert.Equal(UploadDisposition.CredentialMissing, result.Disposition);
         Assert.Equal(OutboxState.Pending, row!.State);
         Assert.Equal(0, row.AttemptCount);
         await fixture.Repository.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task AuthenticationQuarantineSurvivesRestartUntilCredentialChanges()
+    {
+        var handler = new QueueHandler(
+            new HttpResponseMessage(HttpStatusCode.Unauthorized)
+            {
+                Content = new StringContent("bad token"),
+            },
+            new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent("{\"ok\":true,\"added\":0}"),
+            });
+        var fixture = await CreateFixtureAsync(handler);
+
+        var rejected = await fixture.Uploader.UploadOneAsync("worker-a", default);
+        var restartedUploader = new OutboxUploader(
+            fixture.Repository,
+            new EncryptedOutboxProtector(new XorTestProtector()),
+            fixture.Settings,
+            new HttpClient(handler),
+            fixture.Time,
+            new FixedBackoff(TimeSpan.FromSeconds(30)));
+
+        var unchanged = await restartedUploader.UploadOneAsync("worker-a", default);
+        fixture.Settings.Value = new ServerSettings(
+            new Uri("https://example.invalid/"),
+            "replacement-token");
+        var recovered = await restartedUploader.UploadOneAsync("worker-a", default);
+        var row = await fixture.Repository.GetOutboxAsync("outbox-1", default);
+
+        Assert.Equal(UploadDisposition.Quarantined, rejected.Disposition);
+        Assert.Equal(UploadDisposition.Idle, unchanged.Disposition);
+        Assert.Equal(UploadDisposition.Acknowledged, recovered.Disposition);
+        Assert.Equal(OutboxState.Acknowledged, row!.State);
+        Assert.Equal(2, handler.RequestBodies.Count);
+        using var retryBody = JsonDocument.Parse(handler.RequestBodies[1]);
+        Assert.Equal(
+            "replacement-token",
+            retryBody.RootElement.GetProperty("token").GetString());
     }
 
     [Fact]
@@ -128,16 +169,22 @@ public sealed class OutboxUploaderTests : IDisposable
     [Fact]
     public async Task CancellationPreservesCommittedLeaseForRestartRecovery()
     {
+        var requestStarted = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
         var handler = new QueueHandler(async (_, cancellationToken) =>
         {
+            requestStarted.SetResult();
             await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
             return new HttpResponseMessage(HttpStatusCode.OK);
         });
         var fixture = await CreateFixtureAsync(handler);
-        using var cancellation = new CancellationTokenSource(TimeSpan.FromMilliseconds(100));
+        using var cancellation = new CancellationTokenSource();
 
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
-            fixture.Uploader.UploadOneAsync("worker-a", cancellation.Token));
+        var upload = fixture.Uploader.UploadOneAsync("worker-a", cancellation.Token);
+        await requestStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        cancellation.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => upload);
         var row = await fixture.Repository.GetOutboxAsync("outbox-1", default);
 
         Assert.Equal(OutboxState.Leased, row!.State);

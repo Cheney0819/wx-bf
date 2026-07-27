@@ -4,6 +4,23 @@ namespace Wx411.Core.Tests;
 
 public sealed class DatabaseSourceDiscoveryTests
 {
+    [Theory]
+    [InlineData("db_storage/message/message_0.db", true)]
+    [InlineData("message/message_42.db", true)]
+    [InlineData("db_storage/session/session.db", true)]
+    [InlineData("session/session.db", true)]
+    [InlineData("db_storage/contact/contact.db", false)]
+    [InlineData("db_storage/biz_message/message_0.db", false)]
+    [InlineData("db_storage/message/message_backup.db", false)]
+    public void SourceClassifiesRequiredAndAuxiliaryDatabases(
+        string path,
+        bool expectedRequired)
+    {
+        var source = new DatabaseSource(path, 4096);
+
+        Assert.Equal(expectedRequired, source.IsRequired);
+    }
+
     [Fact]
     public void DiscoverFiltersPlaintextAndInvalidFilesAndOrdersKnownDatabases()
     {

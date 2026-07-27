@@ -27,6 +27,8 @@ public sealed class OutboxUploader
     private readonly HttpClient _httpClient;
     private readonly TimeProvider _timeProvider;
     private readonly IUploadBackoff _backoff;
+    private readonly SemaphoreSlim _credentialGate = new(1, 1);
+    private string? _credentialFingerprint;
 
     public OutboxUploader(
         DataSyncRepository repository,
@@ -55,7 +57,11 @@ public sealed class OutboxUploader
         CancellationToken cancellationToken)
     {
         var settings = await _settingsProvider.TryLoadAsync(cancellationToken);
-        if (settings is null) return new UploadResult(UploadDisposition.Offline, null, 0, null);
+        if (settings is null)
+        {
+            return new UploadResult(UploadDisposition.CredentialMissing, null, 0, null);
+        }
+        await RequeueAuthenticationFailuresIfCredentialChangedAsync(settings, cancellationToken);
         var row = await _repository.TryClaimOutboxAsync(
             workerId,
             TimeSpan.FromMinutes(3),
@@ -244,6 +250,42 @@ public sealed class OutboxUploader
             writer.WriteEndObject();
         }
         return buffer.WrittenSpan.ToArray();
+    }
+
+    private async Task RequeueAuthenticationFailuresIfCredentialChangedAsync(
+        ServerSettings settings,
+        CancellationToken cancellationToken)
+    {
+        var fingerprint = ComputeCredentialFingerprint(settings);
+        await _credentialGate.WaitAsync(cancellationToken);
+        try
+        {
+            if (string.Equals(_credentialFingerprint, fingerprint, StringComparison.Ordinal))
+                return;
+            await _repository.RequeueAuthenticationFailuresIfCredentialChangedAsync(
+                fingerprint,
+                cancellationToken);
+            _credentialFingerprint = fingerprint;
+        }
+        finally
+        {
+            _credentialGate.Release();
+        }
+    }
+
+    private static string ComputeCredentialFingerprint(ServerSettings settings)
+    {
+        var bytes = Encoding.UTF8.GetBytes($"{settings.BaseUri}\n{settings.Token}");
+        var digest = SHA256.HashData(bytes);
+        try
+        {
+            return Convert.ToHexString(digest);
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(bytes);
+            CryptographicOperations.ZeroMemory(digest);
+        }
     }
 
     private static async Task<byte[]> ReadResponseAsync(

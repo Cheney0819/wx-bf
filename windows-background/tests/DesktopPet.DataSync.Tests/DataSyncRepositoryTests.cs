@@ -80,6 +80,68 @@ public sealed class DataSyncRepositoryTests : IDisposable
         Assert.Equal(-1, databaseBytes.AsSpan().IndexOf("unique-secret-message"u8));
     }
 
+    [Fact]
+    public async Task RequeueAuthenticationQuarantinesPreservesOtherClientErrors()
+    {
+        await using var repository = await OpenAsync(Path.Combine(_root, "sync.db"));
+        await repository.EnqueueOutboxAsync(
+            new OutboxDraft(
+                "auth-row",
+                "messages:auth-row",
+                "messages",
+                "{\"request_id\":\"auth-row\",\"messages\":[]}"u8.ToArray()),
+            default);
+        await repository.EnqueueOutboxAsync(
+            new OutboxDraft(
+                "bad-row",
+                "messages:bad-row",
+                "messages",
+                "{\"request_id\":\"bad-row\",\"messages\":[]}"u8.ToArray()),
+            default);
+
+        var first = await repository.TryClaimOutboxAsync(
+            "worker-a", TimeSpan.FromMinutes(3), default);
+        Assert.NotNull(first);
+        await repository.QuarantineOutboxAsync(
+            first!.Id, "worker-a", 401, "unauthorized", default);
+        var second = await repository.TryClaimOutboxAsync(
+            "worker-a", TimeSpan.FromMinutes(3), default);
+        Assert.NotNull(second);
+        await repository.QuarantineOutboxAsync(
+            second!.Id, "worker-a", 400, "payload_invalid", default);
+
+        var requeued = await repository.RequeueQuarantinedOutboxAsync(
+            [401, 403],
+            default);
+
+        Assert.Equal(1, requeued);
+        Assert.Equal(OutboxState.Pending, (await repository.GetOutboxAsync(first.Id, default))!.State);
+        Assert.Equal(OutboxState.Quarantined, (await repository.GetOutboxAsync(second.Id, default))!.State);
+        Assert.Equal("messages:auth-row", (await repository.GetOutboxAsync("auth-row", default))!.IdempotencyKey);
+    }
+
+    [Fact]
+    public async Task IncompleteAuxiliaryHandoffCannotBypassImporterGate()
+    {
+        await using var repository = await OpenAsync(Path.Combine(_root, "sync.db"));
+        var database = new ValidatedHandoffDatabase(
+            new string('b', 64),
+            "contact/contact.db",
+            Path.Combine(_root, "contact.db"),
+            new string('c', 64));
+        var manifest = new ValidatedHandoffManifest(
+            new string('a', 64),
+            "epoch-1",
+            DateTimeOffset.UtcNow,
+            [database],
+            RequiredDatabasesComplete: false);
+
+        await Assert.ThrowsAsync<InvalidDataException>(() =>
+            repository.ImportHandoffAsync(manifest, default));
+
+        Assert.Empty(await repository.ListManifestsAsync(default));
+    }
+
     private async Task<DataSyncRepository> OpenAsync(
         string path,
         TimeProvider? timeProvider = null)

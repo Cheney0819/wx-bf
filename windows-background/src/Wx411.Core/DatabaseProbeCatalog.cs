@@ -5,7 +5,9 @@ namespace Wx411.Core;
 public sealed record DatabaseFileGeneration(
     long Length,
     DateTime LastWriteTimeUtc,
-    string FileIdentity);
+    string FileIdentity,
+    string WalFingerprint = "missing",
+    string SharedMemoryFingerprint = "missing");
 
 public sealed class DatabaseSamplePage : IDisposable
 {
@@ -31,6 +33,7 @@ public sealed class DatabaseSamplePage : IDisposable
 
 public sealed class DatabaseProbeDescriptor : IDisposable
 {
+    private const int StableWalPrefixLength = 64 * 1024;
     private const int MaxReadAttempts = 3;
     private static readonly TimeSpan RetryDelay = TimeSpan.FromMilliseconds(50);
     private byte[]? _salt;
@@ -106,11 +109,59 @@ public sealed class DatabaseProbeDescriptor : IDisposable
             using var stream = OpenShared(normalizedPath);
             ReadExactly(stream, salt, CancellationToken.None);
             var identity = $"{info.CreationTimeUtc.Ticks:X16}:{Convert.ToHexString(SHA256.HashData(salt))}";
-            return new DatabaseFileGeneration(stream.Length, info.LastWriteTimeUtc, identity);
+            var wal = ReadSidecarFingerprint(normalizedPath + "-wal", includePrefix: true);
+            var shm = ReadSidecarFingerprint(normalizedPath + "-shm", includePrefix: false);
+            return new DatabaseFileGeneration(
+                stream.Length,
+                info.LastWriteTimeUtc,
+                identity,
+                wal,
+                shm);
         }
         finally
         {
             CryptographicOperations.ZeroMemory(salt);
+        }
+    }
+
+    private static string ReadSidecarFingerprint(string path, bool includePrefix)
+    {
+        var info = new FileInfo(path);
+        info.Refresh();
+        if (!info.Exists) return "missing";
+
+        var length = info.Length;
+        var lastWrite = info.LastWriteTimeUtc;
+        var prefixLength = includePrefix
+            ? checked((int)Math.Min(length, StableWalPrefixLength))
+            : 0;
+        var prefix = new byte[prefixLength];
+        try
+        {
+            if (prefixLength > 0)
+            {
+                using var stream = OpenShared(path);
+                ReadExactly(stream, prefix, CancellationToken.None);
+            }
+
+            var after = new FileInfo(path);
+            after.Refresh();
+            if (!after.Exists || after.Length != length || after.LastWriteTimeUtc != lastWrite)
+                throw new DatabaseGenerationChangedException(path, "sidecar changed during fingerprinting");
+
+            var digest = SHA256.HashData(prefix);
+            try
+            {
+                return $"{length}:{lastWrite.Ticks}:{Convert.ToHexString(digest)}";
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(digest);
+            }
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(prefix);
         }
     }
 

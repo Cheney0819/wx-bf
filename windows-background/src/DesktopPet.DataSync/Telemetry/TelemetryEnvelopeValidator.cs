@@ -177,7 +177,8 @@ public sealed class TelemetryEnvelopeValidator
         {
             return;
         }
-        if (value.ValueKind == JsonValueKind.String && IsVersionMetric(name, value.GetString())) return;
+        if (value.ValueKind == JsonValueKind.String &&
+            (IsVersionMetric(name, value.GetString()) || IsCodeMetric(name, value.GetString()))) return;
         throw new InvalidDataException("Telemetry metric value is invalid.");
     }
 
@@ -187,6 +188,14 @@ public sealed class TelemetryEnvelopeValidator
         value.Length <= 32 &&
         char.IsAsciiDigit(value[0]) &&
         value.All(character => char.IsAsciiLetterOrDigit(character) || character is '-' or '.');
+
+    private static bool IsCodeMetric(string name, string? value) =>
+        name.EndsWith("Code", StringComparison.Ordinal) &&
+        !string.IsNullOrEmpty(value) &&
+        value.Length <= 80 &&
+        IsAsciiLower(value[0]) &&
+        value.All(character =>
+            IsAsciiLower(character) || char.IsAsciiDigit(character) || character is '_' or '-');
 
     private static bool IsAsciiMetricName(string name) =>
         name.Length is >= 1 and <= 64 &&

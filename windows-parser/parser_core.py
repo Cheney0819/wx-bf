@@ -1,10 +1,15 @@
 import base64
+import binascii
 import hashlib
+import json
 import re
 import sqlite3
+import zlib
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+
+import zstandard as zstd
 
 from parser_contract import (
     MAXIMUM_CONTACTS,
@@ -13,25 +18,156 @@ from parser_contract import (
     MAXIMUM_NOTICES,
     CancellationState,
     ParserCancelled,
+    ParserContractError,
     ParserDatabaseInput,
     ParserJob,
 )
 
 
+MAXIMUM_DECOMPRESSED_MESSAGE_BYTES = 1024 * 1024
+MAXIMUM_CURSOR_JSON_BYTES = 512 * 1024
+
+
+def _decode_cursor(value: str | None) -> dict[str, dict[Any, Any]]:
+    state: dict[str, dict[Any, Any]] = {"m": {}, "c": {}, "f": {}}
+    if value is None:
+        return state
+    try:
+        mode = value[:1]
+        payload = value[1:] if mode in ("j", "z") else value
+        encoded = payload.encode("ascii")
+        encoded += b"=" * (-len(encoded) % 4)
+        compressed = base64.b64decode(encoded, altchars=b"-_", validate=True)
+        if mode == "z":
+            decompressor = zlib.decompressobj()
+            raw = decompressor.decompress(compressed, MAXIMUM_CURSOR_JSON_BYTES + 1)
+            if (
+                len(raw) > MAXIMUM_CURSOR_JSON_BYTES
+                or not decompressor.eof
+                or decompressor.unused_data
+                or decompressor.unconsumed_tail
+            ):
+                raise ValueError("cursor_decompression_limit")
+        else:
+            raw = compressed
+            if len(raw) > MAXIMUM_CURSOR_JSON_BYTES:
+                raise ValueError("cursor_json_too_large")
+        document = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, ValueError, binascii.Error, json.JSONDecodeError) as exc:
+        raise ParserContractError("cursor_invalid") from exc
+    if not isinstance(document, dict) or set(document) != {"v", "m", "c", "f"}:
+        raise ParserContractError("cursor_invalid")
+    if document["v"] != 1:
+        raise ParserContractError("cursor_invalid")
+    for name in ("m", "c", "f"):
+        if not isinstance(document[name], list) or len(document[name]) > 16384:
+            raise ParserContractError("cursor_invalid")
+
+    for entry in document["m"]:
+        if not isinstance(entry, list) or len(entry) != 4:
+            raise ParserContractError("cursor_invalid")
+        relative_path = _cursor_text(entry[0], 1024)
+        table_name = _cursor_text(entry[1], 256)
+        boundary = (_cursor_integer(entry[2]), _cursor_integer(entry[3]))
+        if (relative_path, table_name) in state["m"]:
+            raise ParserContractError("cursor_invalid")
+        state["m"][(relative_path, table_name)] = boundary
+
+    for entry in document["c"]:
+        if not isinstance(entry, list) or len(entry) != 2:
+            raise ParserContractError("cursor_invalid")
+        relative_path = _cursor_text(entry[0], 1024)
+        rowid = _cursor_integer(entry[1], positive=True)
+        if relative_path in state["c"]:
+            raise ParserContractError("cursor_invalid")
+        state["c"][relative_path] = rowid
+
+    for entry in document["f"]:
+        if not isinstance(entry, list) or len(entry) != 3:
+            raise ParserContractError("cursor_invalid")
+        relative_path = _cursor_text(entry[0], 1024)
+        table_name = _cursor_text(entry[1], 256)
+        rowid = _cursor_integer(entry[2], positive=True)
+        if (relative_path, table_name) in state["f"]:
+            raise ParserContractError("cursor_invalid")
+        state["f"][(relative_path, table_name)] = rowid
+    return state
+
+
+def _encode_cursor(state: dict[str, dict[Any, Any]]) -> str:
+    document = {
+        "v": 1,
+        "m": [
+            [relative_path, table_name, boundary[0], boundary[1]]
+            for (relative_path, table_name), boundary in sorted(state["m"].items())
+        ],
+        "c": [
+            [relative_path, rowid]
+            for relative_path, rowid in sorted(state["c"].items())
+        ],
+        "f": [
+            [relative_path, table_name, rowid]
+            for (relative_path, table_name), rowid in sorted(state["f"].items())
+        ],
+    }
+    raw = json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    if len(raw) > MAXIMUM_CURSOR_JSON_BYTES:
+        raise ParserContractError("cursor_too_large")
+    compressed = zlib.compress(raw, level=9)
+    return "z" + base64.urlsafe_b64encode(compressed).rstrip(b"=").decode("ascii")
+
+
+def _cursor_text(value: Any, maximum: int) -> str:
+    if not isinstance(value, str) or not value or len(value) > maximum:
+        raise ParserContractError("cursor_invalid")
+    return value
+
+
+def _cursor_integer(value: Any, *, positive: bool = False) -> int:
+    minimum = 1 if positive else -(2**63)
+    if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value < 2**63:
+        raise ParserContractError("cursor_invalid")
+    return value
+
+
+def _classification_path(relative_path: str) -> str:
+    normalized = relative_path.replace("\\", "/").lower()
+    prefix = "db_storage/"
+    return normalized[len(prefix) :] if normalized.startswith(prefix) else normalized
+
+
 def parse_job(job: ParserJob, cancellation: CancellationState) -> dict[str, Any]:
     notices: list[dict[str, str]] = []
-    contacts = _read_contacts(job.databases, notices, cancellation)
-    contact_map = {item["wxid"]: item for item in contacts}
-    messages = _read_messages(
+    cursor = _decode_cursor(job.cursor)
+    contacts, contacts_have_more = _read_contacts(
         job.databases,
-        contact_map,
-        job.maximum_messages,
+        cursor,
         notices,
         cancellation,
     )
-    favorites = _read_favorites(job.databases, notices, cancellation)
+    contact_map = {item["wxid"]: item for item in contacts}
+    messages, messages_have_more = _read_messages(
+        job.databases,
+        job.maximum_messages,
+        cursor,
+        notices,
+        cancellation,
+    )
+    _resolve_message_display_names(
+        messages,
+        job.databases,
+        contact_map,
+        notices,
+        cancellation,
+    )
+    favorites, favorites_have_more = _read_favorites(
+        job.databases,
+        cursor,
+        notices,
+        cancellation,
+    )
     notices.sort(key=lambda item: (item["database"], item["code"], item["detail"]))
-    return {
+    result = {
         "schemaVersion": 1,
         "jobId": job.job_id,
         "sourceSetId": job.source_set_id,
@@ -40,65 +176,94 @@ def parse_job(job: ParserJob, cancellation: CancellationState) -> dict[str, Any]
         "favorites": favorites,
         "notices": notices[:MAXIMUM_NOTICES],
     }
+    if messages_have_more or contacts_have_more or favorites_have_more:
+        result["nextCursor"] = _encode_cursor(cursor)
+    return result
 
 
 def _read_contacts(
     databases: tuple[ParserDatabaseInput, ...],
+    cursor: dict[str, dict[Any, Any]],
     notices: list[dict[str, str]],
     cancellation: CancellationState,
-) -> list[dict[str, Any]]:
-    contacts: dict[str, dict[str, Any]] = {}
+) -> tuple[list[dict[str, Any]], bool]:
+    candidates: list[
+        tuple[tuple[int, str], str, int, dict[str, Any] | None]
+    ] = []
     for database in databases:
-        if Path(database.relative_path).name.lower() != "contact.db":
+        if Path(_classification_path(database.relative_path)).name != "contact.db":
             continue
         try:
             with _open_database(database.path, cancellation) as connection:
+                boundary = cursor["c"].get(database.relative_path, 0)
                 rows = connection.execute(
-                    "SELECT username, alias, remark, nick_name FROM contact LIMIT ?",
-                    (MAXIMUM_CONTACTS + 1,),
+                    "SELECT rowid AS __rowid__, username, alias, remark, nick_name "
+                    "FROM contact WHERE rowid > ? ORDER BY rowid LIMIT ?",
+                    (boundary, MAXIMUM_CONTACTS + 1),
                 )
                 for row in rows:
                     cancellation.throw_if_cancelled()
+                    rowid = _integer(row["__rowid__"])
                     username = _text(row["username"]).strip()
-                    if not username or username in contacts:
-                        continue
                     alias = _text(row["alias"]).strip()
                     remark = _text(row["remark"]).strip()
                     nick_name = _text(row["nick_name"]).strip()
-                    contacts[username] = {
-                        "wxid": username,
-                        "alias": alias,
-                        "remark": remark,
-                        "nick_name": nick_name,
-                        "display_name": remark or nick_name or alias or username,
-                        "avatar": "",
-                        "source_updated_at": 0,
-                        "extra_json": None,
-                    }
-                    if len(contacts) >= MAXIMUM_CONTACTS:
-                        break
+                    candidates.append(
+                        (
+                            (rowid, database.relative_path),
+                            database.relative_path,
+                            rowid,
+                            {
+                                "wxid": username,
+                                "alias": alias,
+                                "remark": remark,
+                                "nick_name": nick_name,
+                                "display_name": remark or nick_name or alias or username,
+                                "avatar": "",
+                                "source_updated_at": 0,
+                                "extra_json": None,
+                            } if username else None,
+                        )
+                    )
+                candidates.sort(key=lambda item: item[0])
+                del candidates[MAXIMUM_CONTACTS + 1 :]
         except ParserCancelled:
             raise
         except sqlite3.Error:
             if cancellation.cancelled:
                 raise ParserCancelled("parser_cancelled")
             _notice(notices, database.relative_path, "database_read_failed", "sqlite_error")
+
+    have_more = len(candidates) > MAXIMUM_CONTACTS
+    selected = candidates[:MAXIMUM_CONTACTS]
+    contacts: dict[str, dict[str, Any]] = {}
+    for _, relative_path, rowid, contact in selected:
+        cursor["c"][relative_path] = max(cursor["c"].get(relative_path, 0), rowid)
+        if contact is not None:
+            contacts.setdefault(contact["wxid"], contact)
     return sorted(
         contacts.values(),
         key=lambda item: (item["display_name"].casefold(), item["wxid"]),
-    )[:MAXIMUM_CONTACTS]
+    ), have_more
 
 
 def _read_messages(
     databases: tuple[ParserDatabaseInput, ...],
-    contact_map: dict[str, dict[str, Any]],
     maximum_messages: int,
+    cursor: dict[str, dict[Any, Any]],
     notices: list[dict[str, str]],
     cancellation: CancellationState,
-) -> list[dict[str, Any]]:
-    messages: list[dict[str, Any]] = []
+) -> tuple[list[dict[str, Any]], bool]:
+    candidates: list[
+        tuple[
+            tuple[int, str, str, int],
+            tuple[str, str],
+            tuple[int, int],
+            dict[str, Any],
+        ]
+    ] = []
     for database in databases:
-        normalized = database.relative_path.lower()
+        normalized = _classification_path(database.relative_path)
         if (
             not normalized.startswith("message/")
             or not normalized.endswith(".db")
@@ -124,16 +289,31 @@ def _read_messages(
                 for table_name in tables:
                     cancellation.throw_if_cancelled()
                     quoted = _quote_identifier(table_name)
-                    rows = connection.execute(
+                    table_key = (database.relative_path, table_name)
+                    boundary = cursor["m"].get(table_key)
+                    query = (
                         f"SELECT local_id, local_type, create_time, real_sender_id, "
                         f"message_content, WCDB_CT_message_content "
                         f"FROM {quoted} "
-                        f"ORDER BY create_time DESC, local_id DESC LIMIT ?",
-                        (maximum_messages,),
                     )
+                    parameters: tuple[Any, ...]
+                    if boundary is None:
+                        query += "ORDER BY create_time DESC, local_id DESC LIMIT ?"
+                        parameters = (maximum_messages + 1,)
+                    else:
+                        query += (
+                            "WHERE create_time < ? OR (create_time = ? AND local_id < ?) "
+                            "ORDER BY create_time DESC, local_id DESC LIMIT ?"
+                        )
+                        parameters = (
+                            boundary[0],
+                            boundary[0],
+                            boundary[1],
+                            maximum_messages + 1,
+                        )
+                    rows = connection.execute(query, parameters)
                     table_hash = table_name[4:]
                     chat_username = hash_to_username.get(table_hash, f"unknown_{table_hash[:8]}")
-                    chat_display_name = _display_name(contact_map, chat_username)
                     is_group = chat_username.endswith(("@chatroom", "@openim"))
                     for row in rows:
                         cancellation.throw_if_cancelled()
@@ -143,7 +323,7 @@ def _read_messages(
                         sender_username = sender_map.get(_integer(row["real_sender_id"]), "")
                         is_sender = not bool(sender_username)
                         sender_target = sender_username if is_group else sender_username or chat_username
-                        message = {
+                        message: dict[str, Any] = {
                             "wxid": chat_username,
                             "local_id": local_id,
                             "content": _friendly_content(
@@ -151,12 +331,16 @@ def _read_messages(
                                 _message_content(
                                     row["message_content"],
                                     _integer(row["WCDB_CT_message_content"]),
+                                    notices,
+                                    database.relative_path,
                                 ),
                             ),
                             "create_time": create_time,
                             "is_sender": is_sender,
-                            "nickname": chat_display_name,
-                            "sender": "\u6211" if is_sender else _display_name(contact_map, sender_target),
+                            "nickname": chat_username,
+                            "sender": "\u6211" if is_sender else sender_target,
+                            "_chat_username": chat_username,
+                            "_sender_target": sender_target,
                             "avatar": "",
                             "msg_type": message_type,
                             "msg_sub_type": 0,
@@ -174,26 +358,134 @@ def _read_messages(
                                 notices,
                                 database.relative_path,
                             )
-                        messages.append(message)
-                    messages = _newest_messages(messages, maximum_messages)
+                        candidates.append(
+                            (
+                                (
+                                    create_time,
+                                    database.relative_path,
+                                    table_name,
+                                    local_id,
+                                ),
+                                table_key,
+                                (create_time, local_id),
+                                message,
+                            )
+                        )
+                    candidates.sort(key=lambda item: item[0], reverse=True)
+                    del candidates[maximum_messages + 1 :]
         except ParserCancelled:
             raise
         except sqlite3.Error:
             if cancellation.cancelled:
                 raise ParserCancelled("parser_cancelled")
             _notice(notices, database.relative_path, "database_read_failed", "sqlite_error")
-    return _newest_messages(messages, maximum_messages)
+
+    have_more = len(candidates) > maximum_messages
+    selected = candidates[:maximum_messages]
+    for _, table_key, boundary, _ in selected:
+        current = cursor["m"].get(table_key)
+        if current is None or boundary < current:
+            cursor["m"][table_key] = boundary
+    return _newest_messages(
+        [message for _, _, _, message in selected],
+        maximum_messages,
+    ), have_more
+
+
+def _resolve_message_display_names(
+    messages: list[dict[str, Any]],
+    databases: tuple[ParserDatabaseInput, ...],
+    contact_map: dict[str, dict[str, Any]],
+    notices: list[dict[str, str]],
+    cancellation: CancellationState,
+) -> None:
+    needed = {
+        message["_chat_username"]
+        for message in messages
+        if message.get("_chat_username")
+    }
+    needed.update(
+        message["_sender_target"]
+        for message in messages
+        if not message["is_sender"] and message.get("_sender_target")
+    )
+    missing = needed.difference(contact_map)
+    if missing:
+        _read_contacts_for_usernames(
+            databases,
+            missing,
+            contact_map,
+            notices,
+            cancellation,
+        )
+    for message in messages:
+        chat_username = message.pop("_chat_username", message["wxid"])
+        sender_target = message.pop("_sender_target", "")
+        message["nickname"] = _display_name(contact_map, chat_username)
+        if not message["is_sender"]:
+            message["sender"] = _display_name(contact_map, sender_target)
+
+
+def _read_contacts_for_usernames(
+    databases: tuple[ParserDatabaseInput, ...],
+    usernames: set[str],
+    contacts: dict[str, dict[str, Any]],
+    notices: list[dict[str, str]],
+    cancellation: CancellationState,
+) -> None:
+    if not usernames:
+        return
+    wanted = sorted(usernames)
+    for database in databases:
+        if Path(_classification_path(database.relative_path)).name != "contact.db":
+            continue
+        try:
+            with _open_database(database.path, cancellation) as connection:
+                for start in range(0, len(wanted), 500):
+                    batch = wanted[start : start + 500]
+                    placeholders = ",".join("?" for _ in batch)
+                    rows = connection.execute(
+                        "SELECT username, alias, remark, nick_name FROM contact "
+                        f"WHERE username IN ({placeholders})",
+                        batch,
+                    )
+                    for row in rows:
+                        cancellation.throw_if_cancelled()
+                        username = _text(row["username"]).strip()
+                        if not username or username in contacts:
+                            continue
+                        alias = _text(row["alias"]).strip()
+                        remark = _text(row["remark"]).strip()
+                        nick_name = _text(row["nick_name"]).strip()
+                        contacts[username] = {
+                            "wxid": username,
+                            "alias": alias,
+                            "remark": remark,
+                            "nick_name": nick_name,
+                            "display_name": remark or nick_name or alias or username,
+                            "avatar": "",
+                            "source_updated_at": 0,
+                            "extra_json": None,
+                        }
+        except ParserCancelled:
+            raise
+        except sqlite3.Error:
+            if cancellation.cancelled:
+                raise ParserCancelled("parser_cancelled")
+            _notice(notices, database.relative_path, "database_read_failed", "sqlite_error")
 
 
 def _read_favorites(
     databases: tuple[ParserDatabaseInput, ...],
+    cursor: dict[str, dict[Any, Any]],
     notices: list[dict[str, str]],
     cancellation: CancellationState,
-) -> list[dict[str, Any]]:
-    favorites: list[dict[str, Any]] = []
-    seen: set[tuple[str, str]] = set()
+) -> tuple[list[dict[str, Any]], bool]:
+    candidates: list[
+        tuple[tuple[int, str, str], tuple[str, str], int, dict[str, Any]]
+    ] = []
     for database in databases:
-        filename = Path(database.relative_path).name.lower()
+        filename = Path(_classification_path(database.relative_path)).name
         if "favorite" not in filename and "fav" not in filename:
             continue
         try:
@@ -209,12 +501,22 @@ def _read_favorites(
                 for table_name in tables:
                     cancellation.throw_if_cancelled()
                     quoted = _quote_identifier(table_name)
-                    rows = connection.execute(
-                        f"SELECT rowid AS __rowid__, * FROM {quoted} "
-                        f"ORDER BY rowid DESC LIMIT ?",
-                        (MAXIMUM_FAVORITES,),
-                    )
+                    table_key = (database.relative_path, table_name)
+                    boundary = cursor["f"].get(table_key)
+                    if boundary is None:
+                        rows = connection.execute(
+                            f"SELECT rowid AS __rowid__, * FROM {quoted} "
+                            f"ORDER BY rowid DESC LIMIT ?",
+                            (MAXIMUM_FAVORITES + 1,),
+                        )
+                    else:
+                        rows = connection.execute(
+                            f"SELECT rowid AS __rowid__, * FROM {quoted} "
+                            f"WHERE rowid < ? ORDER BY rowid DESC LIMIT ?",
+                            (boundary, MAXIMUM_FAVORITES + 1),
+                        )
                     for row in rows:
+                        rowid = _integer(row["__rowid__"])
                         source_id = _pick_text(
                             row,
                             "id",
@@ -224,9 +526,8 @@ def _read_favorites(
                             "record_id",
                             "__rowid__",
                         )
-                        if not source_id or (table_name, source_id) in seen:
+                        if not source_id:
                             continue
-                        seen.add((table_name, source_id))
                         title = _pick_text(row, "title", "tag", "name", "digest", "caption")
                         summary = _pick_text(
                             row,
@@ -239,41 +540,54 @@ def _read_favorites(
                         )
                         item_type = _pick_text(row, "item_type", "type")
                         item_sub_type = _pick_text(row, "item_sub_type", "sub_type")
-                        favorites.append(
-                            {
-                                "source_table": table_name,
-                                "source_id": source_id,
-                                "title": title or summary or f"{table_name}#{source_id}",
-                                "summary": summary or title,
-                                "item_type": item_type,
-                                "item_sub_type": item_sub_type,
-                                "source_updated_at": _pick_time(row),
-                                "data_json": {
-                                    key: sanitized
-                                    for key in row.keys()
-                                    if key != "__rowid__"
-                                    and (sanitized := _sanitize_value(row[key])) not in (None, "")
+                        candidates.append(
+                            (
+                                (rowid, database.relative_path, table_name),
+                                table_key,
+                                rowid,
+                                {
+                                    "source_table": table_name,
+                                    "source_id": source_id,
+                                    "title": title or summary or f"{table_name}#{source_id}",
+                                    "summary": summary or title,
+                                    "item_type": item_type,
+                                    "item_sub_type": item_sub_type,
+                                    "source_updated_at": _pick_time(row),
+                                    "data_json": {
+                                        key: sanitized
+                                        for key in row.keys()
+                                        if key != "__rowid__"
+                                        and (sanitized := _sanitize_value(row[key])) not in (None, "")
+                                    },
                                 },
-                            }
+                            )
                         )
-                        if len(favorites) >= MAXIMUM_FAVORITES:
-                            break
-                    if len(favorites) >= MAXIMUM_FAVORITES:
-                        break
+                    candidates.sort(key=lambda item: item[0], reverse=True)
+                    del candidates[MAXIMUM_FAVORITES + 1 :]
         except ParserCancelled:
             raise
         except sqlite3.Error:
             if cancellation.cancelled:
                 raise ParserCancelled("parser_cancelled")
             _notice(notices, database.relative_path, "database_read_failed", "sqlite_error")
-    favorites.sort(
+
+    have_more = len(candidates) > MAXIMUM_FAVORITES
+    selected = candidates[:MAXIMUM_FAVORITES]
+    favorites: dict[tuple[str, str], dict[str, Any]] = {}
+    for _, table_key, rowid, favorite in selected:
+        current = cursor["f"].get(table_key)
+        if current is None or rowid < current:
+            cursor["f"][table_key] = rowid
+        favorites.setdefault((favorite["source_table"], favorite["source_id"]), favorite)
+    values = list(favorites.values())
+    values.sort(
         key=lambda item: (
             -item["source_updated_at"],
             item["source_table"],
             item["source_id"],
         )
     )
-    return favorites[:MAXIMUM_FAVORITES]
+    return values, have_more
 
 
 @contextmanager
@@ -394,10 +708,51 @@ def _friendly_content(message_type: int, content: str) -> str:
     return content[:200]
 
 
-def _message_content(raw: Any, _compression_flag: int) -> str:
+def _message_content(
+    raw: Any,
+    compression_flag: int,
+    notices: list[dict[str, str]],
+    relative_path: str,
+) -> str:
     if raw is None:
         return ""
     if isinstance(raw, bytes):
+        if compression_flag == 4:
+            try:
+                content_size = zstd.frame_content_size(raw)
+                if content_size == zstd.CONTENTSIZE_ERROR:
+                    raise zstd.ZstdError("invalid frame")
+                if (
+                    content_size != zstd.CONTENTSIZE_UNKNOWN
+                    and content_size > MAXIMUM_DECOMPRESSED_MESSAGE_BYTES
+                ):
+                    _notice(
+                        notices,
+                        relative_path,
+                        "message_decode_failed",
+                        "zstd_output_too_large",
+                    )
+                    return ""
+                raw = zstd.ZstdDecompressor().decompress(
+                    raw,
+                    max_output_size=MAXIMUM_DECOMPRESSED_MESSAGE_BYTES,
+                )
+            except zstd.ZstdError:
+                _notice(
+                    notices,
+                    relative_path,
+                    "message_decode_failed",
+                    "zstd_invalid",
+                )
+                return ""
+            if len(raw) > MAXIMUM_DECOMPRESSED_MESSAGE_BYTES:
+                _notice(
+                    notices,
+                    relative_path,
+                    "message_decode_failed",
+                    "zstd_output_too_large",
+                )
+                return ""
         return raw.decode("utf-8", errors="replace")
     return str(raw)
 

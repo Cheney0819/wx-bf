@@ -103,6 +103,18 @@ public sealed class TelemetryOutboxWriter
         var state = new Dictionary<string, string>(StringComparer.Ordinal);
         if (string.Equals(envelope.Component, "recovery", StringComparison.Ordinal))
         {
+            if (envelope.Severity is "warning" or "error")
+            {
+                state["error"] = envelope.Code;
+            }
+            else if (envelope.EventName is
+                "client_v4_data_dir_result" or
+                "recovery_capture_succeeded" or
+                "recovery_handoff_published")
+            {
+                state["error"] = "";
+            }
+
             if (string.Equals(envelope.EventName, "recovery_capture_failed", StringComparison.Ordinal))
                 state["decrypt_ok"] = "false";
             else if (string.Equals(envelope.EventName, "recovery_handoff_published", StringComparison.Ordinal) ||

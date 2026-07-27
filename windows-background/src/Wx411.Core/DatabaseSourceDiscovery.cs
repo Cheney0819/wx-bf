@@ -2,7 +2,10 @@ using System.Security.Cryptography;
 
 namespace Wx411.Core;
 
-public sealed record DatabaseSource(string Path, long Length);
+public sealed record DatabaseSource(string Path, long Length)
+{
+    public bool IsRequired => DatabaseSourceDiscovery.IsRequiredDatabasePath(Path);
+}
 
 public static class DatabaseSourceDiscovery
 {
@@ -82,6 +85,45 @@ public static class DatabaseSourceDiscovery
                 : StringComparer.OrdinalIgnoreCase.Compare(left.Path, right.Path);
         });
         return Array.AsReadOnly(databases.ToArray());
+    }
+
+    internal static bool IsRequiredDatabasePath(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path)) return false;
+        var normalized = path.Replace('\\', '/').TrimEnd('/');
+        var fileSeparator = normalized.LastIndexOf('/');
+        if (fileSeparator <= 0 || fileSeparator == normalized.Length - 1)
+            return false;
+
+        var parentSeparator = normalized.LastIndexOf('/', fileSeparator - 1);
+        var directory = normalized[(parentSeparator + 1)..fileSeparator];
+        var fileName = normalized[(fileSeparator + 1)..];
+        if (directory.Equals("session", StringComparison.OrdinalIgnoreCase))
+        {
+            return fileName.Equals("session.db", StringComparison.OrdinalIgnoreCase);
+        }
+
+        return directory.Equals("message", StringComparison.OrdinalIgnoreCase) &&
+            IsNumberedMessageDatabase(fileName);
+    }
+
+    private static bool IsNumberedMessageDatabase(string fileName)
+    {
+        const string prefix = "message_";
+        const string suffix = ".db";
+        if (!fileName.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) ||
+            !fileName.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var numberLength = fileName.Length - prefix.Length - suffix.Length;
+        if (numberLength <= 0) return false;
+        for (var index = prefix.Length; index < prefix.Length + numberLength; index++)
+        {
+            if (fileName[index] is < '0' or > '9') return false;
+        }
+        return true;
     }
 
     private static IEnumerable<string> DefaultRoots()

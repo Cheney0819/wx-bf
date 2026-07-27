@@ -58,6 +58,57 @@ public sealed class HandoffManifestImporterTests : IDisposable
         Assert.NotNull(await repository.GetParseJobAsync(repaired.JobId, default));
     }
 
+    [Theory]
+    [InlineData("message/message_0.db")]
+    [InlineData("db_storage/message/message_1.db")]
+    [InlineData(@"db_storage\message\biz_message_2.db")]
+    public async Task IncompleteRequiredDatabaseSetEnqueuesAvailableMessageDatabase(
+        string relativePath)
+    {
+        var fixture = await CreateManifestAsync(
+            requiredDatabasesComplete: false,
+            (relativePath, "message-db"));
+        await using var repository = await OpenRepositoryAsync();
+
+        var result = await CreateImporter(repository).ImportAsync(fixture.Path, default);
+
+        Assert.False(result.WasAlreadyImported);
+        Assert.Single(await repository.ListManifestsAsync(default));
+        Assert.Single(Directory.EnumerateFiles(AcceptedRoot(), "*.json"));
+        var inputs = await repository.ListParseJobInputsAsync(result.JobId, default);
+        Assert.Single(inputs);
+        Assert.Equal(relativePath.Replace('\\', '/'), inputs[0].RelativePath);
+    }
+
+    [Fact]
+    public async Task IncompleteAuxiliaryDatabaseSetRemainsDeferred()
+    {
+        var fixture = await CreateManifestAsync(
+            requiredDatabasesComplete: false,
+            ("contact/contact.db", "contact-db"));
+        await using var repository = await OpenRepositoryAsync();
+
+        await Assert.ThrowsAsync<IncompleteHandoffException>(() =>
+            CreateImporter(repository).ImportAsync(fixture.Path, default));
+
+        Assert.Empty(await repository.ListManifestsAsync(default));
+        Assert.False(Directory.Exists(AcceptedRoot()));
+    }
+
+    [Fact]
+    public async Task IncompleteNestedMessageLookingPathRemainsDeferred()
+    {
+        var fixture = await CreateManifestAsync(
+            requiredDatabasesComplete: false,
+            ("archive/message/message_0.db", "message-db"));
+        await using var repository = await OpenRepositoryAsync();
+
+        await Assert.ThrowsAsync<IncompleteHandoffException>(() =>
+            CreateImporter(repository).ImportAsync(fixture.Path, default));
+
+        Assert.Empty(await repository.ListManifestsAsync(default));
+    }
+
     [Fact]
     public async Task NewerGenerationReplacesOnlyMatchingRelativePathInSourceSet()
     {
@@ -132,7 +183,7 @@ public sealed class HandoffManifestImporterTests : IDisposable
     public async Task UnknownSchemaIsRejected()
     {
         var fixture = await CreateManifestAsync(("message/message_0.db", "message-db"));
-        await WriteManifestAsync(fixture.Path, fixture.Manifest with { SchemaVersion = 2 });
+        await WriteManifestAsync(fixture.Path, fixture.Manifest with { SchemaVersion = 3 });
 
         await AssertRejectedAsync<InvalidDataException>(fixture.Path);
     }
@@ -216,11 +267,17 @@ public sealed class HandoffManifestImporterTests : IDisposable
 
     private async Task<ManifestFixture> CreateManifestAsync(
         params (string RelativePath, string Content)[] databases) =>
-        await CreateManifestAsync(databases, DateTimeOffset.UtcNow);
+        await CreateManifestAsync(databases, DateTimeOffset.UtcNow, requiredDatabasesComplete: true);
+
+    private async Task<ManifestFixture> CreateManifestAsync(
+        bool requiredDatabasesComplete,
+        params (string RelativePath, string Content)[] databases) =>
+        await CreateManifestAsync(databases, DateTimeOffset.UtcNow, requiredDatabasesComplete);
 
     private async Task<ManifestFixture> CreateManifestAsync(
         (string RelativePath, string Content)[] databases,
-        DateTimeOffset createdAtUtc)
+        DateTimeOffset createdAtUtc,
+        bool requiredDatabasesComplete = true)
     {
         const string epochId = "epoch-1";
         var items = new List<DatabaseReadyItem>();
@@ -237,8 +294,14 @@ public sealed class HandoffManifestImporterTests : IDisposable
             items.Add(new DatabaseReadyItem(generationId, relativePath, path, sha256));
         }
 
-        var manifestId = ComputeManifestId(epochId, items);
-        var manifest = new DatabaseReadyManifest(1, manifestId, epochId, createdAtUtc, items);
+        var manifestId = ComputeManifestId(epochId, items, requiredDatabasesComplete);
+        var manifest = new DatabaseReadyManifest(
+            2,
+            manifestId,
+            epochId,
+            createdAtUtc,
+            items,
+            requiredDatabasesComplete);
         var manifestPath = Path.Combine(ReadyRoot(), manifestId + ".json");
         await WriteManifestAsync(manifestPath, manifest);
         return new ManifestFixture(manifestPath, manifest);
@@ -246,9 +309,10 @@ public sealed class HandoffManifestImporterTests : IDisposable
 
     private static string ComputeManifestId(
         string epochId,
-        IReadOnlyList<DatabaseReadyItem> items) =>
+        IReadOnlyList<DatabaseReadyItem> items,
+        bool requiredDatabasesComplete = true) =>
         Sha256(Encoding.UTF8.GetBytes(
-            epochId + "|" + string.Join(
+            $"{epochId}|requiredDatabasesComplete={requiredDatabasesComplete}|" + string.Join(
                 "|",
                 items.Select(item => $"{item.GenerationId}:{item.RelativePath}:{item.Sha256}"))));
 

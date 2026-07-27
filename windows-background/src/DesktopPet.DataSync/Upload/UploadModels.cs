@@ -15,6 +15,7 @@ public interface IUploadBackoff
 public enum UploadDisposition
 {
     Idle,
+    CredentialMissing,
     Offline,
     Acknowledged,
     RetryScheduled,

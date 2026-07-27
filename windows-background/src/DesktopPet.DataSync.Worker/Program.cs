@@ -45,9 +45,34 @@ public static class Program
                 paths.SyncDatabase,
                 TimeProvider.System,
                 outboxProtector);
-            var settings = new ServerSettingsVault(
-                Path.Combine(paths.DataSyncRoot, "server-settings.dpapi"),
-                protector);
+            var settingsPath = Path.Combine(
+                paths.DataSyncRoot,
+                "server-settings.dpapi");
+            var settings = new ServerSettingsVault(settingsPath, protector);
+            var legacyConfigPaths = new[]
+            {
+                Path.Combine(AppContext.BaseDirectory, "monitor_config.json"),
+                Path.GetFullPath(Path.Combine(
+                    AppContext.BaseDirectory,
+                    "..",
+                    "..",
+                    "monitor_config.json")),
+                Path.GetFullPath(Path.Combine(
+                    AppContext.BaseDirectory,
+                    "..",
+                    "..",
+                    "wechat_data",
+                    "monitor_config.json")),
+            };
+            var settingsBootstrapper = new ServerSettingsBootstrapper(
+                settings,
+                settingsPath,
+                legacyConfigPaths,
+                Environment.GetEnvironmentVariable,
+                new ServerSettings(
+                    new Uri("https://wx.junjiee.online/"),
+                    "wx_monitor_2026"));
+            await settingsBootstrapper.EnsureAsync(CancellationToken.None);
             var identity = await new ClientIdentityStore(
                     Path.Combine(paths.DataSyncRoot, "client-identity.json"),
                     Path.Combine(AppContext.BaseDirectory, "wechat_data", "client_identity.json"),
@@ -63,10 +88,7 @@ public static class Program
                 TimeProvider.System);
             var jobsRoot = Path.Combine(paths.DataSyncRoot, "Jobs");
             var builder = new ParserJobBuilder(jobsRoot);
-            var parserInstall = Path.Combine(
-                AppContext.BaseDirectory,
-                "Parser",
-                "parser-install.json");
+            var parserInstall = ResolveParserInstallPath(AppContext.BaseDirectory);
             var supervisor = new ParserProcessSupervisor(parserInstall);
             var validator = new ParserResultValidator();
             var writer = new IncrementalOutboxWriter(
@@ -135,5 +157,21 @@ public static class Program
             await host.RunAsync();
             return 0;
         }
+    }
+
+    internal static string ResolveParserInstallPath(string baseDirectory)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(baseDirectory);
+        var fullBaseDirectory = Path.GetFullPath(baseDirectory);
+        var siblingManifest = Path.GetFullPath(Path.Combine(
+            fullBaseDirectory,
+            "..",
+            "Parser",
+            "parser-install.json"));
+        if (File.Exists(siblingManifest)) return siblingManifest;
+        return Path.GetFullPath(Path.Combine(
+            fullBaseDirectory,
+            "Parser",
+            "parser-install.json"));
     }
 }

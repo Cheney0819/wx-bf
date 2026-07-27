@@ -20,6 +20,7 @@ public enum RecoveryActionKind
 {
     CaptureCurrent,
     RestartAndCapture,
+    RelaunchProcess,
     WaitPassively,
     PublishOutputs,
 }
@@ -28,7 +29,8 @@ public sealed record RecoveryAction(
     RecoveryActionKind Kind,
     IReadOnlyList<string> OutputPaths,
     IReadOnlyList<RecoveredDatabase> Databases,
-    string? Reason)
+    string? Reason,
+    bool RequiredDatabasesComplete = true)
 {
     public static RecoveryAction CaptureCurrent() =>
         new(RecoveryActionKind.CaptureCurrent, [], [], null);
@@ -36,11 +38,20 @@ public sealed record RecoveryAction(
     public static RecoveryAction RestartAndCapture() =>
         new(RecoveryActionKind.RestartAndCapture, [], [], null);
 
+    public static RecoveryAction Relaunch(string reason) =>
+        new(RecoveryActionKind.RelaunchProcess, [], [], reason);
+
     public static RecoveryAction Wait(string? reason = null) =>
         new(RecoveryActionKind.WaitPassively, [], [], reason);
 
     public static RecoveryAction Publish(
         IReadOnlyList<string> outputPaths,
-        IReadOnlyList<RecoveredDatabase> databases) =>
-        new(RecoveryActionKind.PublishOutputs, outputPaths, databases, null);
+        IReadOnlyList<RecoveredDatabase> databases,
+        bool requiredDatabasesComplete = true) =>
+        new(
+            RecoveryActionKind.PublishOutputs,
+            outputPaths,
+            databases,
+            Reason: null,
+            requiredDatabasesComplete);
 }

@@ -144,10 +144,34 @@ public sealed class ValidatedKeyVault : IValidatedDatabaseKeySink
         return Array.AsReadOnly(Directory
             .EnumerateFiles(_root, "*.vkey", SearchOption.TopDirectoryOnly)
             .Select(Path.GetFileNameWithoutExtension)
-            .Where(id => id is { Length: 64 })
+            .Where(id => id is { Length: 64 } && id.All(Uri.IsHexDigit))
             .Select(id => id!)
             .OrderBy(id => id, StringComparer.Ordinal)
             .ToArray());
+    }
+
+    public void Quarantine(string id)
+    {
+        ValidateId(id);
+        var source = PathFor(id);
+        if (!File.Exists(source)) return;
+        try
+        {
+            var quarantineRoot = Path.Combine(_root, "quarantine");
+            Directory.CreateDirectory(quarantineRoot);
+            var destination = Path.Combine(
+                quarantineRoot,
+                $"{id}.{DateTime.UtcNow.Ticks:X16}.{Guid.NewGuid():N}.quarantine");
+            File.Move(source, destination, overwrite: false);
+        }
+        catch (IOException)
+        {
+            // A concurrent reader may have already quarantined this record.
+        }
+        catch (UnauthorizedAccessException)
+        {
+            // The malformed record remains isolated by the caller for this pass.
+        }
     }
 
     private string PathFor(string id) => Path.Combine(_root, id + ".vkey");

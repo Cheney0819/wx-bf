@@ -15,18 +15,34 @@ public sealed class CallpointCaptureRecoveryService
     private readonly Func<ICallpointCaptureBackend> _captureBackendFactory;
     private readonly PendingCaptureVault _pendingCaptureVault;
     private readonly IValidatedDatabaseKeySink? _validatedKeySink;
+    private readonly Func<int, string, ModuleIdentityValidation?> _inspectLoadedModule;
     private readonly ConsistentDatabaseExporter _exporter;
 
     public CallpointCaptureRecoveryService(
         Func<ICallpointCaptureBackend> captureBackendFactory,
         PendingCaptureVault pendingCaptureVault,
         IValidatedDatabaseKeySink? validatedKeySink = null)
+        : this(
+            captureBackendFactory,
+            pendingCaptureVault,
+            validatedKeySink,
+            InspectLoadedModule)
+    {
+    }
+
+    internal CallpointCaptureRecoveryService(
+        Func<ICallpointCaptureBackend> captureBackendFactory,
+        PendingCaptureVault pendingCaptureVault,
+        IValidatedDatabaseKeySink? validatedKeySink,
+        Func<int, string, ModuleIdentityValidation?> inspectLoadedModule)
     {
         ArgumentNullException.ThrowIfNull(captureBackendFactory);
         ArgumentNullException.ThrowIfNull(pendingCaptureVault);
+        ArgumentNullException.ThrowIfNull(inspectLoadedModule);
         _captureBackendFactory = captureBackendFactory;
         _pendingCaptureVault = pendingCaptureVault;
         _validatedKeySink = validatedKeySink;
+        _inspectLoadedModule = inspectLoadedModule;
         _exporter = new ConsistentDatabaseExporter();
     }
 
@@ -66,6 +82,7 @@ public sealed class CallpointCaptureRecoveryService
             token);
 
         var ready = new CaptureReadySignal(collector.IsReadyForValidation);
+        string? lastCaptureFailure = null;
         if (!ready.Value)
         {
             var resolution = await WaitForCaptureProcessSelectionsAsync(
@@ -90,6 +107,9 @@ public sealed class CallpointCaptureRecoveryService
             {
                 token.ThrowIfCancellationRequested();
                 if (targetProcess.Pid is not int targetPid) continue;
+                var moduleIdentity = _inspectLoadedModule(targetPid, "Weixin.dll");
+                if (moduleIdentity?.IsUnsupported == true)
+                    throw new UnsupportedModuleException(moduleIdentity.Error);
                 progress.Report(new RecoveryProgress(
                     8,
                     $"[2/7] 正在附加 PID {targetPid}…",
@@ -132,6 +152,8 @@ public sealed class CallpointCaptureRecoveryService
                             new Progress<CallpointCaptureStatus>(status =>
                                 progress.Report(new RecoveryProgress(22, status.Message, status.Detail))),
                             token);
+                        if (!string.IsNullOrWhiteSpace(captureResult?.Error))
+                            lastCaptureFailure = captureResult.Error;
                         captureResult?.Dispose();
                     }
                     finally
@@ -167,7 +189,11 @@ public sealed class CallpointCaptureRecoveryService
         }
 
         if (!ready.Value && collector.PendingMatches.Count == 0)
-            throw new InvalidOperationException("所有候选 PID 的调用点均未命中数据库 key。请确认先点捕获，再启动并登录目标程序。");
+        {
+            throw new InvalidOperationException(
+                lastCaptureFailure ??
+                "所有候选 PID 的调用点均未命中数据库 key。请确认先点捕获，再启动并登录目标程序。");
+        }
 
         var outputPaths = new List<string>();
         var failedDatabasePaths = new List<string>();
@@ -342,28 +368,74 @@ public sealed class CallpointCaptureRecoveryService
 
     private static IReadOnlyList<TargetProcessSource> ResolveTargets(RecoveryProcessSelection process)
     {
-        if (process.ScanAll) return TargetProcessDiscovery.Discover();
+        if (process.ScanAll)
+        {
+            var processName = Path.GetFileNameWithoutExtension(process.Name);
+            if (string.IsNullOrWhiteSpace(processName) ||
+                string.Equals(processName, "Automatic", StringComparison.OrdinalIgnoreCase))
+            {
+                processName = "Weixin";
+            }
+            return TargetProcessDiscovery.Discover(
+                processName,
+                process.SessionId,
+                process.ExecutablePath);
+        }
         if (process.Pid is not int pid) return Array.Empty<TargetProcessSource>();
+        if (!TargetProcessDiscovery.Matches(
+                pid,
+                process.SessionId,
+                process.ExecutablePath))
+        {
+            return Array.Empty<TargetProcessSource>();
+        }
         return [new TargetProcessSource(pid, process.Name)];
+    }
+
+    private static ModuleIdentityValidation? InspectLoadedModule(int pid, string moduleName)
+    {
+        if (!OperatingSystem.IsWindows()) return null;
+        var path = TargetModuleReader.ResolveDllPath((uint)pid, moduleName);
+        return path is null ? null : PeCallpointLocator.ValidateModuleIdentity(path);
     }
 
     private static CaptureProcessResolution ResolveCaptureProcessSelections(
         RecoveryProcessSelection process,
         string databasePath)
     {
-        if (!process.ScanAll) return new CaptureProcessResolution([process], []);
+        if (!process.ScanAll)
+        {
+            var target = ResolveTargets(process);
+            return new CaptureProcessResolution(
+                target.Select(item => process with
+                {
+                    Pid = item.Pid,
+                    Name = item.Name,
+                }).ToArray(),
+                []);
+        }
         var targets = ResolveTargets(process).Where(item => item.Pid > 0).OrderBy(item => item.Pid).ToArray();
         var ownerPids = ProcessFileHandleFinder.FindProcessIdsHoldingFile(
             databasePath,
             targets.Select(item => item.Pid).ToArray()).ToArray();
         if (ownerPids.Length == 0)
             return new CaptureProcessResolution(
-                targets.Select(item => new RecoveryProcessSelection(item.Pid, item.Name)).ToArray(), ownerPids);
+                targets.Select(item => process with
+                {
+                    Pid = item.Pid,
+                    Name = item.Name,
+                    ScanAll = false,
+                }).ToArray(), ownerPids);
         var byPid = targets.ToDictionary(item => item.Pid);
         var ordered = ownerPids.Where(byPid.ContainsKey).Select(pid => byPid[pid]).ToList();
         ordered.AddRange(targets.Where(item => !ownerPids.Contains(item.Pid)));
         return new CaptureProcessResolution(
-            ordered.Select(item => new RecoveryProcessSelection(item.Pid, item.Name)).ToArray(), ownerPids);
+            ordered.Select(item => process with
+            {
+                Pid = item.Pid,
+                Name = item.Name,
+                ScanAll = false,
+            }).ToArray(), ownerPids);
     }
 
     private static async Task<CaptureProcessResolution> WaitForCaptureProcessSelectionsAsync(

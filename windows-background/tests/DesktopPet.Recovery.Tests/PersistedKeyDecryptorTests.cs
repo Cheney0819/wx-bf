@@ -1,3 +1,5 @@
+using System.Buffers.Binary;
+using System.Security.Cryptography;
 using DesktopPet.Background.Contracts;
 using DesktopPet.Recovery.Persistence;
 using DesktopPet.Recovery.Security;
@@ -33,7 +35,10 @@ public sealed class PersistedKeyDecryptorTests : IDisposable
         var output = Assert.Single(observation.OutputPaths);
         SqliteIntegrityChecker.VerifyFile(output);
         Assert.Equal(RecoveryActionKind.PublishOutputs,
-            (await fixture.Machine.ObserveAsync(fixture.Epoch.Id, observation, default)).Kind);
+            (await fixture.Machine.ObserveAsync(
+                fixture.Epoch.Id,
+                observation.Observation,
+                default)).Kind);
         Assert.Equal(0,
             (await fixture.Repository.GetEpochAsync(fixture.Epoch.Id, default))!.RestartCount);
     }
@@ -64,7 +69,12 @@ public sealed class PersistedKeyDecryptorTests : IDisposable
     {
         var fixture = await CreateFixtureAsync();
         var goodPath = CopyEncryptedFixture("message_0.db");
-        var badPath = Path.Combine(_root, "bad.db");
+        var badPath = Path.Combine(
+            _root,
+            "db_storage",
+            "message",
+            "message_1.db");
+        Directory.CreateDirectory(Path.GetDirectoryName(badPath)!);
         await File.WriteAllBytesAsync(badPath, new byte[32]);
         fixture.Vault.Store(Metadata(goodPath), CorrectKey());
 
@@ -82,6 +92,105 @@ public sealed class PersistedKeyDecryptorTests : IDisposable
         Assert.True(observation.HasValidatedKey);
         Assert.Single(observation.OutputPaths);
         Assert.Equal("persisted_key_partial_failure", observation.FailureCode);
+        Assert.Single(observation.UnresolvedRequiredDatabases);
+        Assert.Equal(badPath, observation.UnresolvedRequiredDatabases[0].Path);
+    }
+
+    [Fact]
+    public async Task AuxiliaryFailureDoesNotRemainRestartEligible()
+    {
+        var fixture = await CreateFixtureAsync();
+        var requiredPath = CopyEncryptedFixture(
+            Path.Combine("db_storage", "message", "message_0.db"));
+        var auxiliaryPath = Path.Combine(
+            _root,
+            "db_storage",
+            "contact",
+            "contact.db");
+        Directory.CreateDirectory(Path.GetDirectoryName(auxiliaryPath)!);
+        await File.WriteAllBytesAsync(auxiliaryPath, new byte[32]);
+        fixture.Vault.Store(Metadata(requiredPath), CorrectKey());
+
+        var result = await fixture.Decryptor.TryDecryptAsync(
+            fixture.Epoch,
+            _root,
+            [
+                new DatabaseSource(
+                    auxiliaryPath,
+                    new FileInfo(auxiliaryPath).Length),
+                new DatabaseSource(
+                    requiredPath,
+                    new FileInfo(requiredPath).Length),
+            ],
+            Path.Combine(_root, "output"),
+            new Progress<RecoveryProgress>(),
+            default);
+
+        Assert.True(result.HasValidatedKey);
+        Assert.Single(result.OutputPaths);
+        Assert.Empty(result.UnresolvedRequiredDatabases);
+    }
+
+    [Fact]
+    public async Task CorruptVaultRecordIsQuarantinedBeforeLaterValidKeyIsTried()
+    {
+        var fixture = await CreateFixtureAsync();
+        var databasePath = CopyEncryptedFixture("message_0.db");
+        var source = new DatabaseSource(databasePath, new FileInfo(databasePath).Length);
+        fixture.Vault.Store(Metadata(databasePath), CorrectKey());
+        var corruptId = new string('0', 64);
+        await WriteMalformedJsonEnvelopeAsync(corruptId);
+
+        var observation = await fixture.Decryptor.TryDecryptAsync(
+            fixture.Epoch,
+            _root,
+            [source],
+            Path.Combine(_root, "output"),
+            new Progress<RecoveryProgress>(),
+            default);
+
+        Assert.True(observation.HasValidatedKey);
+        Assert.Single(observation.OutputPaths);
+        Assert.False(File.Exists(Path.Combine(_root, "vault", corruptId + ".vkey")));
+        Assert.NotEmpty(Directory.EnumerateFiles(
+            Path.Combine(_root, "vault"),
+            "*.quarantine",
+            SearchOption.AllDirectories));
+    }
+
+    private async Task WriteMalformedJsonEnvelopeAsync(string id)
+    {
+        var metadata = "{"u8.ToArray();
+        var plaintext = new byte[8 + metadata.Length + 32];
+        BinaryPrimitives.WriteInt32LittleEndian(plaintext, metadata.Length);
+        metadata.CopyTo(plaintext.AsSpan(4));
+        BinaryPrimitives.WriteInt32LittleEndian(
+            plaintext.AsSpan(4 + metadata.Length),
+            32);
+        CorrectKey().CopyTo(plaintext.AsSpan(8 + metadata.Length));
+        var ciphertext = plaintext.ToArray();
+        for (var index = 0; index < ciphertext.Length; index++)
+            ciphertext[index] ^= 0x7D;
+
+        var envelope = new byte[12 + ciphertext.Length];
+        "DPKV"u8.CopyTo(envelope);
+        BinaryPrimitives.WriteInt32LittleEndian(envelope.AsSpan(4), 1);
+        BinaryPrimitives.WriteInt32LittleEndian(
+            envelope.AsSpan(8),
+            ciphertext.Length);
+        ciphertext.CopyTo(envelope.AsSpan(12));
+        try
+        {
+            await File.WriteAllBytesAsync(
+                Path.Combine(_root, "vault", id + ".vkey"),
+                envelope);
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(plaintext);
+            CryptographicOperations.ZeroMemory(ciphertext);
+            CryptographicOperations.ZeroMemory(envelope);
+        }
     }
 
     [Fact]
@@ -146,8 +255,8 @@ public sealed class PersistedKeyDecryptorTests : IDisposable
 
     private string CopyEncryptedFixture(string name)
     {
-        Directory.CreateDirectory(_root);
         var path = Path.Combine(_root, name);
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         File.Copy(Path.Combine(AppContext.BaseDirectory, "sqlcipher4_raw_key.db"), path);
         return path;
     }

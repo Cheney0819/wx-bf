@@ -174,13 +174,16 @@ public sealed class RecoveryWorkerTests : IDisposable
     }
 
     [Fact]
-    public async Task KnownRootWatcherEmitsDatabaseChangeWithoutDriveScan()
+    public async Task SelectedRootWatcherEmitsDatabaseChangeWithoutDriveScan()
     {
         var knownRoot = Path.Combine(_root, "known");
         var outsideRoot = Path.Combine(_root, "outside");
         Directory.CreateDirectory(knownRoot);
         Directory.CreateDirectory(outsideRoot);
-        var watcher = new KnownRootDatabaseWatcher([knownRoot]);
+        var watcher = new SelectedRootDatabaseWatcher(
+            new FixedDataRootLocator(knownRoot),
+            TimeSpan.FromMilliseconds(10),
+            TimeProvider.System);
         var channel = Channel.CreateUnbounded<RecoveryHint>();
         using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(3));
         var running = watcher.RunAsync(channel.Writer, cancellation.Token);
@@ -343,6 +346,23 @@ public sealed class RecoveryWorkerTests : IDisposable
         {
             await _started.Task;
             await _writer!.WriteAsync(hint);
+        }
+    }
+
+    private sealed class FixedDataRootLocator(string root)
+        : IWeChatDataRootLocator
+    {
+        public string? CurrentDataRoot => root;
+
+        public Task<WeChatDataRootResolution> LocateAsync(
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return Task.FromResult(new WeChatDataRootResolution(
+                root,
+                1,
+                0,
+                "data_root_discovered"));
         }
     }
 

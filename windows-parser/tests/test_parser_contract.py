@@ -1,13 +1,16 @@
 import json
 import os
 import signal
+import sqlite3
 from pathlib import Path
 
 import pytest
+import zstandard as zstd
 
 from conftest import (
     PARSER_ROOT,
     create_message_database,
+    create_contact_database,
     run_parser,
     sha256,
     write_job,
@@ -17,6 +20,11 @@ from parser_contract import (
     CancellationState,
     ParserContractError,
     write_result_atomic,
+)
+from parser_core import (
+    MAXIMUM_DECOMPRESSED_MESSAGE_BYTES,
+    _decode_cursor,
+    _encode_cursor,
 )
 
 
@@ -78,7 +86,101 @@ def test_parser_rejects_duplicate_relative_path(tmp_path: Path) -> None:
     assert result.stdout == ""
 
 
-def test_parser_truncates_to_newest_5000_messages_deterministically(tmp_path: Path) -> None:
+def test_db_storage_message_path_matches_normalized_message_path(tmp_path: Path) -> None:
+    regular_root = tmp_path / "regular"
+    legacy_root = tmp_path / "legacy"
+    regular_database = regular_root / "input" / "message" / "message_0.db"
+    legacy_database = legacy_root / "input" / "db_storage" / "message" / "message_0.db"
+    create_message_database(regular_database)
+    create_message_database(legacy_database)
+    regular_job = write_job(regular_root, [("message/message_0.db", regular_database)])
+    legacy_job = write_job(
+        legacy_root,
+        [("db_storage/message/message_0.db", legacy_database)],
+    )
+
+    regular_result = run_parser(regular_job)
+    legacy_result = run_parser(legacy_job)
+
+    assert regular_result.returncode == legacy_result.returncode == 0
+    regular_document = json.loads(
+        (regular_root / "output" / "result.json").read_text(encoding="utf-8")
+    )
+    legacy_document = json.loads(
+        (legacy_root / "output" / "result.json").read_text(encoding="utf-8")
+    )
+    assert legacy_document["messages"] == regular_document["messages"]
+
+
+def test_zstd_message_content_flag_is_decoded_to_utf8(tmp_path: Path) -> None:
+    job_root = tmp_path / "job"
+    database = job_root / "input" / "message" / "message_0.db"
+    create_message_database(database, count=1)
+    compressed = zstd.ZstdCompressor().compress("zstd-original".encode("utf-8"))
+    with sqlite3.connect(database) as connection:
+        table_name = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'"
+        ).fetchone()[0]
+        connection.execute(
+            f'UPDATE "{table_name}" SET message_content = ?, '
+            "WCDB_CT_message_content = 4 WHERE local_id = 0",
+            (compressed,),
+        )
+    job = write_job(job_root, [("message/message_0.db", database)])
+
+    result = run_parser(job)
+    document = json.loads((job_root / "output" / "result.json").read_text(encoding="utf-8"))
+
+    assert result.returncode == 0
+    assert document["messages"][0]["content"] == "zstd-original"
+
+
+@pytest.mark.parametrize(
+    ("compressed", "detail"),
+    [
+        (b"not-a-zstd-frame", "zstd_invalid"),
+        (
+            zstd.ZstdCompressor().compress(
+                b"x" * (MAXIMUM_DECOMPRESSED_MESSAGE_BYTES + 1)
+            ),
+            "zstd_output_too_large",
+        ),
+    ],
+)
+def test_zstd_decode_failure_is_isolated_and_noticed(
+    tmp_path: Path,
+    compressed: bytes,
+    detail: str,
+) -> None:
+    job_root = tmp_path / "job"
+    database = job_root / "input" / "message" / "message_0.db"
+    create_message_database(database, count=1)
+    with sqlite3.connect(database) as connection:
+        table_name = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'"
+        ).fetchone()[0]
+        connection.execute(
+            f'UPDATE "{table_name}" SET message_content = ?, '
+            "WCDB_CT_message_content = 4 WHERE local_id = 0",
+            (compressed,),
+        )
+    job = write_job(job_root, [("message/message_0.db", database)])
+
+    result = run_parser(job)
+    document = json.loads((job_root / "output" / "result.json").read_text(encoding="utf-8"))
+
+    assert result.returncode == 0
+    assert document["messages"][0]["content"] == ""
+    assert document["notices"] == [
+        {
+            "code": "message_decode_failed",
+            "database": "message/message_0.db",
+            "detail": detail,
+        }
+    ]
+
+
+def test_parser_paginates_messages_with_a_deterministic_next_cursor(tmp_path: Path) -> None:
     job_root = tmp_path / "job"
     database = job_root / "input" / "message" / "message_0.db"
     create_message_database(database, count=5005)
@@ -86,15 +188,171 @@ def test_parser_truncates_to_newest_5000_messages_deterministically(tmp_path: Pa
 
     first = run_parser(job)
     first_document = json.loads((job_root / "output" / "result.json").read_text(encoding="utf-8"))
+    first_ids = [message["local_id"] for message in first_document["messages"]]
+    assert first.returncode == 0
+    assert first_ids == list(range(5, 5005))
+    assert isinstance(first_document.get("nextCursor"), str)
+
+    payload = json.loads(job.read_text(encoding="utf-8"))
+    payload["cursor"] = first_document["nextCursor"]
+    job.write_text(json.dumps(payload), encoding="utf-8")
+    os.remove(job_root / "output" / "result.json")
+    second = run_parser(job)
+    second_document = json.loads((job_root / "output" / "result.json").read_text(encoding="utf-8"))
+    second_ids = [message["local_id"] for message in second_document["messages"]]
+
+    assert second.returncode == 0
+    assert second_ids == list(range(5))
+    assert set(first_ids).isdisjoint(second_ids)
+    assert sorted(first_ids + second_ids) == list(range(5005))
+    assert "nextCursor" not in second_document
+
+
+def test_message_table_ties_do_not_duplicate_or_skip_across_pages(tmp_path: Path) -> None:
+    job_root = tmp_path / "job"
+    database = job_root / "input" / "message" / "message_0.db"
+    create_message_database(database, count=3000)
+    second_table = "Msg_" + "f" * 32
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            f'''CREATE TABLE "{second_table}"(
+                local_id INTEGER,
+                local_type INTEGER,
+                create_time INTEGER,
+                real_sender_id INTEGER,
+                message_content BLOB,
+                WCDB_CT_message_content INTEGER
+            )'''
+        )
+        connection.executemany(
+            f'INSERT INTO "{second_table}" VALUES(?, 1, ?, 1, ?, 0)',
+            ((index, index, f"other-{index}") for index in range(3000)),
+        )
+    job = write_job(job_root, [("message/message_0.db", database)])
+
+    first = run_parser(job)
+    first_document = json.loads((job_root / "output" / "result.json").read_text(encoding="utf-8"))
+    payload = json.loads(job.read_text(encoding="utf-8"))
+    payload["cursor"] = first_document["nextCursor"]
+    job.write_text(json.dumps(payload), encoding="utf-8")
+    os.remove(job_root / "output" / "result.json")
+    second = run_parser(job)
+    second_document = json.loads((job_root / "output" / "result.json").read_text(encoding="utf-8"))
+
+    first_keys = {
+        (item["wxid"], item["create_time"], item["local_id"])
+        for item in first_document["messages"]
+    }
+    second_keys = {
+        (item["wxid"], item["create_time"], item["local_id"])
+        for item in second_document["messages"]
+    }
+    assert first.returncode == second.returncode == 0
+    assert len(first_keys) == 5000
+    assert len(second_keys) == 1000
+    assert first_keys.isdisjoint(second_keys)
+    assert len(first_keys | second_keys) == 6000
+    assert "nextCursor" not in second_document
+
+
+def test_contact_and_favorite_boundaries_advance_independently(tmp_path: Path) -> None:
+    job_root = tmp_path / "job"
+    contact = job_root / "input" / "contact" / "contact.db"
+    favorite = job_root / "input" / "favorite" / "favorite.db"
+    contact.parent.mkdir(parents=True)
+    favorite.parent.mkdir(parents=True)
+    with sqlite3.connect(contact) as connection:
+        connection.execute(
+            "CREATE TABLE contact(username TEXT, alias TEXT, remark TEXT, nick_name TEXT)"
+        )
+        connection.executemany(
+            "INSERT INTO contact VALUES(?, '', '', ?)",
+            ((f"user-{index:04d}", f"User {index:04d}") for index in range(5001)),
+        )
+    with sqlite3.connect(favorite) as connection:
+        connection.execute(
+            "CREATE TABLE Favorites(id INTEGER, title TEXT, update_time INTEGER)"
+        )
+        connection.executemany(
+            "INSERT INTO Favorites VALUES(?, ?, ?)",
+            ((index, f"Favorite {index}", index) for index in range(1001)),
+        )
+    job = write_job(
+        job_root,
+        [
+            ("contact/contact.db", contact),
+            ("favorite/favorite.db", favorite),
+        ],
+    )
+
+    first = run_parser(job)
+    first_document = json.loads((job_root / "output" / "result.json").read_text(encoding="utf-8"))
+    payload = json.loads(job.read_text(encoding="utf-8"))
+    payload["cursor"] = first_document["nextCursor"]
+    job.write_text(json.dumps(payload), encoding="utf-8")
     os.remove(job_root / "output" / "result.json")
     second = run_parser(job)
     second_document = json.loads((job_root / "output" / "result.json").read_text(encoding="utf-8"))
 
     assert first.returncode == second.returncode == 0
-    assert first_document == second_document
-    assert len(first_document["messages"]) == 5000
-    assert first_document["messages"][0]["local_id"] == 5
-    assert first_document["messages"][-1]["local_id"] == 5004
+    assert len(first_document["contacts"]) == 5000
+    assert len(first_document["favorites"]) == 1000
+    assert len(second_document["contacts"]) == 1
+    assert len(second_document["favorites"]) == 1
+    assert len({item["wxid"] for item in first_document["contacts"] + second_document["contacts"]}) == 5001
+    assert len(
+        {
+            (item["source_table"], item["source_id"])
+            for item in first_document["favorites"] + second_document["favorites"]
+        }
+    ) == 1001
+    assert "nextCursor" not in second_document
+
+
+def test_message_display_names_remain_stable_across_pages(tmp_path: Path) -> None:
+    job_root = tmp_path / "job"
+    message = job_root / "input" / "message" / "message_0.db"
+    contact = job_root / "input" / "contact" / "contact.db"
+    create_message_database(message, count=5001)
+    create_contact_database(contact)
+    job = write_job(
+        job_root,
+        [
+            ("contact/contact.db", contact),
+            ("message/message_0.db", message),
+        ],
+    )
+
+    first = run_parser(job)
+    first_document = json.loads((job_root / "output" / "result.json").read_text(encoding="utf-8"))
+    payload = json.loads(job.read_text(encoding="utf-8"))
+    payload["cursor"] = first_document["nextCursor"]
+    job.write_text(json.dumps(payload), encoding="utf-8")
+    os.remove(job_root / "output" / "result.json")
+    second = run_parser(job)
+    second_document = json.loads((job_root / "output" / "result.json").read_text(encoding="utf-8"))
+
+    assert first.returncode == second.returncode == 0
+    assert first_document["messages"][0]["nickname"] == "Alice Remark"
+    assert first_document["messages"][0]["sender"] == "Alice Remark"
+    assert second_document["messages"][0]["nickname"] == "Alice Remark"
+    assert second_document["messages"][0]["sender"] == "Alice Remark"
+
+
+def test_large_table_cursor_is_compact_and_round_trips() -> None:
+    state = {
+        "m": {
+            ("message/message_0.db", f"Msg_{index:032x}"): (index, index)
+            for index in range(2000)
+        },
+        "c": {"contact/contact.db": 5000},
+        "f": {("favorite/favorite.db", "Favorites"): 1000},
+    }
+
+    encoded = _encode_cursor(state)
+
+    assert len(encoded) < 64 * 1024
+    assert _decode_cursor(encoded) == state
 
 
 def test_malformed_sqlite_is_isolated_as_notice(tmp_path: Path) -> None:

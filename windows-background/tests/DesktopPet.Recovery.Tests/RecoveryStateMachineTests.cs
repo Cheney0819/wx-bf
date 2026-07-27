@@ -73,6 +73,60 @@ public sealed class RecoveryStateMachineTests : IDisposable
     }
 
     [Fact]
+    public async Task UnsupportedModuleDoesNotConsumeRestartBudget()
+    {
+        await using var fixture = await CreateFixtureAsync(restarts: 0);
+
+        var action = await fixture.Machine.ObserveAsync(
+            fixture.Epoch.Id,
+            new CaptureObservation(false, false, [], "unsupported_module"),
+            default);
+
+        Assert.Equal(RecoveryActionKind.WaitPassively, action.Kind);
+        Assert.Equal("unsupported_module", action.Reason);
+        Assert.Equal(0, (await fixture.Repository.GetEpochAsync(
+            fixture.Epoch.Id, default))!.RestartCount);
+    }
+
+    [Fact]
+    public async Task BreakpointRestoreFailureForcesRelaunchAfterBudgetIsExhausted()
+    {
+        await using var fixture = await CreateFixtureAsync(restarts: 2);
+
+        var action = await fixture.Machine.ObserveAsync(
+            fixture.Epoch.Id,
+            new CaptureObservation(false, false, [], "breakpoint_restore_failed"),
+            default);
+
+        Assert.Equal(RecoveryActionKind.RelaunchProcess, action.Kind);
+        Assert.Equal("breakpoint_restore_failed", action.Reason);
+    }
+
+    [Fact]
+    public async Task IncompleteReadableOutputDoesNotSuppressLaterRestart()
+    {
+        await using var fixture = await CreateFixtureAsync(restarts: 0);
+
+        var action = await fixture.Machine.ObserveAsync(
+            fixture.Epoch.Id,
+            new CaptureObservation(
+                HasValidatedKey: true,
+                HasPendingCapture: false,
+                OutputPaths: ["/generation/message_0.db"],
+                FailureCode: "partial_success",
+                RequiredDatabasesComplete: false),
+            default);
+
+        Assert.Equal(RecoveryActionKind.PublishOutputs, action.Kind);
+        Assert.False((await fixture.Repository.GetEpochAsync(
+            fixture.Epoch.Id,
+            default))!.ActiveRestartSuppressed);
+        Assert.True(await fixture.Repository.TryConsumeRestartAsync(
+            fixture.Epoch.Id,
+            default));
+    }
+
+    [Fact]
     public async Task BeginAllowsPassiveCaptureWithoutRestoringRestartBudget()
     {
         await using var fixture = await CreateFixtureAsync(restarts: 0);

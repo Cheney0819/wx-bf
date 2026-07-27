@@ -1,5 +1,5 @@
 {
   "ServerUrl": "https://wx.junjiee.online/api/messages",
-  "ServerToken": "wx_monitor_2026",
+  "ServerToken": "",
   "PushIntervalSeconds": 60
 }

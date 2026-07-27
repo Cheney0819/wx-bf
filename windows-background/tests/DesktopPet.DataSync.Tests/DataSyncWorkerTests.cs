@@ -154,6 +154,7 @@ public sealed class DataSyncWorkerTests : IDisposable
     [Theory]
     [InlineData("datasync_heartbeat_failed")]
     [InlineData("upload_failed")]
+    [InlineData("datasync_credential_missing")]
     public async Task TelemetryFailureDiagnosticsStayLocalAndNeverCreateOutbox(string eventType)
     {
         var databasePath = Path.Combine(_root, $"{eventType}.db");

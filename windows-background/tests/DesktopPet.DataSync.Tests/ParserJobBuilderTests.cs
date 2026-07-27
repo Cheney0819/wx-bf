@@ -1,4 +1,5 @@
 using System.Security.Cryptography;
+using System.Text.Json;
 using DesktopPet.DataSync.Persistence;
 
 namespace DesktopPet.DataSync.Tests;
@@ -62,6 +63,29 @@ public sealed class ParserJobBuilderTests : IDisposable
         await Assert.ThrowsAsync<CryptographicException>(() =>
             builder.BuildAsync(Job(), [input], 5000, default));
         Assert.False(Directory.Exists(Path.Combine(_root, "jobs", "job-1")));
+    }
+
+    [Fact]
+    public async Task CursorAdvanceReplacesManifestAndRemovesPreviousResult()
+    {
+        var source = await WriteSourceAsync("generation.sqlite", "readable-database"u8.ToArray());
+        var builder = new ParserJobBuilder(Path.Combine(_root, "jobs"));
+        var built = await builder.BuildAsync(
+            Job(),
+            [Input("message/message_0.db", source)],
+            5000,
+            default);
+        Directory.CreateDirectory(built.OutputRoot);
+        var resultPath = Path.Combine(built.OutputRoot, "result.json");
+        await File.WriteAllTextAsync(resultPath, "stale-result");
+
+        var continued = await builder.AdvanceCursorAsync(built, "opaque-cursor", default);
+
+        Assert.Equal(built.JobRoot, continued.JobRoot);
+        Assert.False(File.Exists(resultPath));
+        using var manifest = JsonDocument.Parse(await File.ReadAllTextAsync(built.JobManifestPath));
+        Assert.Equal("opaque-cursor", manifest.RootElement.GetProperty("cursor").GetString());
+        Assert.Equal("opaque-cursor", continued.Manifest.Cursor);
     }
 
     private ParseJob Job() => new(

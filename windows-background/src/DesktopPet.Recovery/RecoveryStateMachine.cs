@@ -33,24 +33,47 @@ public sealed class RecoveryStateMachine
             throw new InvalidOperationException("Recovery epoch does not exist.");
         if (!epoch.IsActive) return RecoveryAction.Wait("epoch_inactive");
 
+        if (string.Equals(
+                observation.FailureCode,
+                "breakpoint_restore_failed",
+                StringComparison.Ordinal))
+        {
+            return RecoveryAction.Relaunch("breakpoint_restore_failed");
+        }
+
+        if (string.Equals(
+                observation.FailureCode,
+                "unsupported_module",
+                StringComparison.Ordinal))
+        {
+            return RecoveryAction.Wait("unsupported_module");
+        }
+
+        // A readable output is already a validated handoff unit. Publish it now,
+        // while the remaining databases continue through later reconciliation.
+        if (observation.OutputPaths.Count > 0)
+        {
+            if (observation.RequiredDatabasesComplete && observation.HasValidatedKey)
+                await _repository.MarkKeyAvailableAsync(epochId, cancellationToken);
+            else if (observation.RequiredDatabasesComplete && observation.HasPendingCapture)
+                await _repository.MarkPendingAvailableAsync(epochId, cancellationToken);
+            return RecoveryAction.Publish(
+                observation.OutputPaths,
+                observation.Databases,
+                observation.RequiredDatabasesComplete);
+        }
+
         if (observation.HasValidatedKey)
         {
             await _repository.MarkKeyAvailableAsync(epochId, cancellationToken);
-            return observation.OutputPaths.Count > 0
-                ? RecoveryAction.Publish(observation.OutputPaths, observation.Databases)
-                : RecoveryAction.Wait("key_available_without_output");
+            return RecoveryAction.Wait("key_available_without_output");
         }
 
         if (observation.HasPendingCapture)
         {
             await _repository.MarkPendingAvailableAsync(epochId, cancellationToken);
-            return observation.OutputPaths.Count > 0
-                ? RecoveryAction.Publish(observation.OutputPaths, observation.Databases)
-                : RecoveryAction.Wait("pending_capture_available");
+            return RecoveryAction.Wait("pending_capture_available");
         }
-
-        if (observation.OutputPaths.Count > 0)
-            return RecoveryAction.Wait("outputs_without_validated_key");
 
         if (RecoveryPolicy.IsRestartSuppressed(epoch))
             return RecoveryAction.Wait("active_restart_suppressed");

@@ -132,7 +132,7 @@ public sealed class StatusOutboxWriterTests : IDisposable
         var result = await uploader.UploadOneAsync("worker-a", default);
         var pending = await repository.GetPendingOutboxAsync(10, default);
 
-        Assert.Equal(UploadDisposition.Offline, result.Disposition);
+        Assert.Equal(UploadDisposition.CredentialMissing, result.Disposition);
         Assert.Single(pending);
         Assert.Equal("status", pending[0].Endpoint);
         Assert.NotEmpty(pending[0].Ciphertext);

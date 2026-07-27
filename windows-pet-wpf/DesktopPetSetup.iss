@@ -1,5 +1,5 @@
 #define MyAppName "桌宠"
-#define MyAppVersion "1.0.14"
+#define MyAppVersion "1.0.20"
 #define MyAppPublisher "Junjiee"
 
 [Setup]
@@ -23,7 +23,7 @@ WizardImageFile=Assets\installer-wizard.png
 WizardSmallImageFile=Assets\installer-wizard-small.png
 UninstallDisplayIcon={app}\DesktopPet.Wpf.exe
 ArchitecturesInstallIn64BitMode=x64compatible
-VersionInfoVersion=1.0.14.0
+VersionInfoVersion=1.0.20.0
 VersionInfoTextVersion={#MyAppVersion}
 
 [Languages]
@@ -35,6 +35,12 @@ Name: "autorun"; Description: "开机自动启动"; GroupDescription: "附加任
 
 [Files]
 Source: "bin\Release\net8.0-windows\win-x64\publish\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+[InstallDelete]
+Type: files; Name: "{app}\monitor_config.json"
+Type: files; Name: "{app}\wechat_data\monitor_config.json"
+Type: files; Name: "{app}\Background\DataSync\monitor_config.json"
+Type: files; Name: "{app}\wx_decrypt.exe"
 
 [Icons]
 Name: "{autoprograms}\桌宠"; Filename: "{app}\DesktopPet.Wpf.exe"

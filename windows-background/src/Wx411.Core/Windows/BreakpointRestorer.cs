@@ -36,6 +36,7 @@ internal interface IBreakpointRestoreOperations
 
 internal sealed class BreakpointRestorer
 {
+    private static readonly TimeSpan DefaultRestoreTimeout = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan RetryDelay = TimeSpan.FromMilliseconds(50);
     private readonly IBreakpointRestoreOperations _operations;
 
@@ -48,12 +49,21 @@ internal sealed class BreakpointRestorer
     internal BreakpointRestoreResult Restore(
         BreakpointRestoreRequest request,
         Action<BreakpointRestoreResult>? report,
+        CancellationToken cleanupToken) =>
+        Restore(request, report, DefaultRestoreTimeout, cleanupToken);
+
+    internal BreakpointRestoreResult Restore(
+        BreakpointRestoreRequest request,
+        Action<BreakpointRestoreResult>? report,
+        TimeSpan timeout,
         CancellationToken cleanupToken)
     {
+        if (timeout <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(timeout));
+        var clock = Stopwatch.StartNew();
         var processHandle = request.ProcessHandle;
         for (var attempt = 1; ; attempt++)
         {
-            cleanupToken.ThrowIfCancellationRequested();
             if (_operations.WriteByte(processHandle, request.Address, request.OriginalByte) &&
                 _operations.FlushInstructionCache(processHandle, request.Address) &&
                 _operations.ReadByte(processHandle, request.Address, out var actual) &&
@@ -79,6 +89,28 @@ internal sealed class BreakpointRestorer
                     null);
             }
 
+            if (clock.Elapsed >= timeout)
+            {
+                var terminal = TerminalFailure(
+                    request,
+                    processHandle,
+                    attempt,
+                    "Breakpoint restoration deadline expired while the process remained alive.");
+                report?.Invoke(terminal);
+                return terminal;
+            }
+
+            if (cleanupToken.IsCancellationRequested)
+            {
+                var terminal = TerminalFailure(
+                    request,
+                    processHandle,
+                    attempt,
+                    "Breakpoint restoration was cancelled after the immediate restore attempt failed.");
+                report?.Invoke(terminal);
+                return terminal;
+            }
+
             var failure = new BreakpointRestoreResult(
                 BreakpointRestoreStatus.Fatal,
                 request.Pid,
@@ -94,9 +126,48 @@ internal sealed class BreakpointRestorer
                 _operations.CloseHandle(processHandle);
                 processHandle = reopened;
             }
-            _operations.Delay(RetryDelay, cleanupToken);
+            var remaining = timeout - clock.Elapsed;
+            if (remaining <= TimeSpan.Zero)
+            {
+                var terminal = TerminalFailure(
+                    request,
+                    processHandle,
+                    attempt,
+                    "Breakpoint restoration deadline expired while the process remained alive.");
+                report?.Invoke(terminal);
+                return terminal;
+            }
+            try
+            {
+                _operations.Delay(
+                    remaining < RetryDelay ? remaining : RetryDelay,
+                    cleanupToken);
+            }
+            catch (OperationCanceledException) when (cleanupToken.IsCancellationRequested)
+            {
+                var terminal = TerminalFailure(
+                    request,
+                    processHandle,
+                    attempt,
+                    "Breakpoint restoration was cancelled while waiting to retry.");
+                report?.Invoke(terminal);
+                return terminal;
+            }
         }
     }
+
+    private static BreakpointRestoreResult TerminalFailure(
+        BreakpointRestoreRequest request,
+        nint processHandle,
+        int attempts,
+        string error) =>
+        new(
+            BreakpointRestoreStatus.Fatal,
+            request.Pid,
+            request.Address,
+            attempts,
+            processHandle,
+            error);
 }
 
 internal sealed class NativeBreakpointRestoreOperations : IBreakpointRestoreOperations
