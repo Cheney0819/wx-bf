@@ -1041,4 +1041,3 @@ public sealed class DebugCaptureBackend : ICallpointCaptureBackend, IDisposable
         Fatal,
     }
 }
-
