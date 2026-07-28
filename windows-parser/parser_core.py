@@ -320,7 +320,9 @@ def _read_messages(
                     for row in rows:
                         cancellation.throw_if_cancelled()
                         local_id = _integer(row["local_id"])
-                        message_type = _integer(row["local_type"])
+                        message_type, message_sub_type = _split_message_type(
+                            row["local_type"]
+                        )
                         create_time = _integer(row["create_time"])
                         sender_username = sender_map.get(_integer(row["real_sender_id"]), "")
                         is_sender = not bool(sender_username)
@@ -345,7 +347,7 @@ def _read_messages(
                             "_sender_target": sender_target,
                             "avatar": "",
                             "msg_type": message_type,
-                            "msg_sub_type": 0,
+                            "msg_sub_type": message_sub_type,
                             "media_type": "image" if message_type == 3 else "",
                             "media_mime": "",
                             "media_name": "",
@@ -841,6 +843,16 @@ def _integer(value: Any) -> int:
         return int(value or 0)
     except (TypeError, ValueError, OverflowError):
         return 0
+
+
+def _split_message_type(value: Any) -> tuple[int, int]:
+    packed = _integer(value) & 0xFFFFFFFFFFFFFFFF
+    return _signed_int32(packed), _signed_int32(packed >> 32)
+
+
+def _signed_int32(value: int) -> int:
+    value &= 0xFFFFFFFF
+    return value - 0x100000000 if value >= 0x80000000 else value
 
 
 def _notice(

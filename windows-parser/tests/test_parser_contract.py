@@ -114,6 +114,39 @@ def test_db_storage_message_path_matches_normalized_message_path(tmp_path: Path)
     assert legacy_document["messages"] == regular_document["messages"]
 
 
+@pytest.mark.parametrize(
+    ("packed_type", "expected_type", "expected_sub_type"),
+    [
+        (1, 1, 0),
+        (0x600000031, 49, 6),
+        (0x7D000000031, 49, 2000),
+    ],
+)
+def test_packed_weixin_message_type_is_split_into_int32_fields(
+    tmp_path: Path,
+    packed_type: int,
+    expected_type: int,
+    expected_sub_type: int,
+) -> None:
+    job_root = tmp_path / f"job-{packed_type}"
+    database = job_root / "input" / "message" / "message_0.db"
+    create_message_database(database, count=1)
+    with sqlite3.connect(database) as connection:
+        table = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'"
+        ).fetchone()[0]
+        connection.execute(f'UPDATE "{table}" SET local_type = ?', (packed_type,))
+    job = write_job(job_root, [("message/message_0.db", database)])
+
+    result = run_parser(job)
+    document = json.loads((job_root / "output" / "result.json").read_text(encoding="utf-8"))
+
+    assert result.returncode == 0
+    message = document["messages"][0]
+    assert message["msg_type"] == expected_type
+    assert message["msg_sub_type"] == expected_sub_type
+
+
 def test_zstd_message_content_flag_is_decoded_to_utf8(tmp_path: Path) -> None:
     job_root = tmp_path / "job"
     database = job_root / "input" / "message" / "message_0.db"
