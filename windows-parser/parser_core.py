@@ -198,8 +198,9 @@ def _read_contacts(
         try:
             with _open_database(database.path, cancellation) as connection:
                 boundary = cursor["c"].get(database.relative_path, 0)
+                contact_columns = _contact_projection(connection)
                 rows = connection.execute(
-                    "SELECT rowid AS __rowid__, username, alias, remark, nick_name "
+                    f"SELECT rowid AS __rowid__, {contact_columns} "
                     "FROM contact WHERE rowid > ? ORDER BY rowid LIMIT ?",
                     (boundary, MAXIMUM_CONTACTS + 1),
                 )
@@ -221,7 +222,7 @@ def _read_contacts(
                                 "remark": remark,
                                 "nick_name": nick_name,
                                 "display_name": remark or nick_name or alias or username,
-                                "avatar": "",
+                                "avatar": _contact_avatar(row),
                                 "source_updated_at": 0,
                                 "extra_json": None,
                             } if username else None,
@@ -425,6 +426,10 @@ def _resolve_message_display_names(
         message["nickname"] = _display_name(contact_map, chat_username)
         if not message["is_sender"]:
             message["sender"] = _display_name(contact_map, sender_target)
+            message["avatar"] = _contact_avatar_for_username(
+                contact_map,
+                sender_target or chat_username,
+            )
 
 
 def _read_contacts_for_usernames(
@@ -442,11 +447,12 @@ def _read_contacts_for_usernames(
             continue
         try:
             with _open_database(database.path, cancellation) as connection:
+                contact_columns = _contact_projection(connection)
                 for start in range(0, len(wanted), 500):
                     batch = wanted[start : start + 500]
                     placeholders = ",".join("?" for _ in batch)
                     rows = connection.execute(
-                        "SELECT username, alias, remark, nick_name FROM contact "
+                        f"SELECT {contact_columns} FROM contact "
                         f"WHERE username IN ({placeholders})",
                         batch,
                     )
@@ -464,7 +470,7 @@ def _read_contacts_for_usernames(
                             "remark": remark,
                             "nick_name": nick_name,
                             "display_name": remark or nick_name or alias or username,
-                            "avatar": "",
+                            "avatar": _contact_avatar(row),
                             "source_updated_at": 0,
                             "extra_json": None,
                         }
@@ -790,6 +796,29 @@ def _display_name(contact_map: dict[str, dict[str, Any]], username: str) -> str:
         or info.get("alias")
         or username
     )
+
+
+def _contact_projection(connection: sqlite3.Connection) -> str:
+    columns = {
+        _text(row["name"]).casefold()
+        for row in connection.execute("PRAGMA table_info(contact)")
+    }
+    optional = (
+        column if column in columns else f"'' AS {column}"
+        for column in ("small_head_url", "big_head_url")
+    )
+    return ", ".join(("username", "alias", "remark", "nick_name", *optional))
+
+
+def _contact_avatar(row: sqlite3.Row) -> str:
+    return _text(row["small_head_url"]).strip() or _text(row["big_head_url"]).strip()
+
+
+def _contact_avatar_for_username(
+    contact_map: dict[str, dict[str, Any]],
+    username: str,
+) -> str:
+    return _text(contact_map.get(username, {}).get("avatar")).strip()
 
 
 def _table_exists(connection: sqlite3.Connection, table_name: str) -> bool:

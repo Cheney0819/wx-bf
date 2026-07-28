@@ -482,6 +482,102 @@ def test_message_display_names_remain_stable_across_pages(tmp_path: Path) -> Non
     assert second_document["messages"][0]["sender"] == "Alice Remark"
 
 
+def test_contact_small_avatar_url_is_exported_to_direct_messages(tmp_path: Path) -> None:
+    job_root = tmp_path / "job"
+    message = job_root / "input" / "message" / "message_0.db"
+    contact = job_root / "input" / "contact" / "contact.db"
+    create_message_database(message, count=1)
+    contact.parent.mkdir(parents=True)
+    with sqlite3.connect(contact) as connection:
+        connection.execute(
+            "CREATE TABLE contact("
+            "username TEXT, alias TEXT, remark TEXT, nick_name TEXT, "
+            "small_head_url TEXT, big_head_url TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO contact VALUES(?, '', '', ?, ?, ?)",
+            ("alice", "Alice", "https://wx.qlogo.cn/small-alice", "https://wx.qlogo.cn/big-alice"),
+        )
+    job = write_job(
+        job_root,
+        [("contact/contact.db", contact), ("message/message_0.db", message)],
+    )
+
+    result = run_parser(job)
+    document = json.loads((job_root / "output" / "result.json").read_text(encoding="utf-8"))
+
+    assert result.returncode == 0
+    assert document["contacts"][0]["avatar"] == "https://wx.qlogo.cn/small-alice"
+    assert document["messages"][0]["avatar"] == "https://wx.qlogo.cn/small-alice"
+
+
+def test_group_message_uses_sender_big_avatar_when_small_is_empty(tmp_path: Path) -> None:
+    job_root = tmp_path / "job"
+    message = job_root / "input" / "message" / "message_0.db"
+    contact = job_root / "input" / "contact" / "contact.db"
+    room_username = "friends@chatroom"
+    room_hash = hashlib.md5(room_username.encode("utf-8")).hexdigest()
+    message.parent.mkdir(parents=True)
+    with sqlite3.connect(message) as connection:
+        connection.execute("CREATE TABLE Name2Id(user_name TEXT)")
+        connection.execute(
+            "INSERT INTO Name2Id(rowid, user_name) VALUES(1, ?), (2, 'bob')",
+            (room_username,),
+        )
+        connection.execute(
+            f'''CREATE TABLE "Msg_{room_hash}"(
+                local_id INTEGER,
+                local_type INTEGER,
+                create_time INTEGER,
+                real_sender_id INTEGER,
+                message_content BLOB,
+                WCDB_CT_message_content INTEGER
+            )'''
+        )
+        connection.execute(
+            f'INSERT INTO "Msg_{room_hash}" VALUES(1, 1, 100, 2, "hello", 0)'
+        )
+    contact.parent.mkdir(parents=True)
+    with sqlite3.connect(contact) as connection:
+        connection.execute(
+            "CREATE TABLE contact("
+            "username TEXT, alias TEXT, remark TEXT, nick_name TEXT, "
+            "small_head_url TEXT, big_head_url TEXT)"
+        )
+        connection.executemany(
+            "INSERT INTO contact VALUES(?, '', '', ?, ?, ?)",
+            (
+                (room_username, "Friends", "https://wx.qlogo.cn/room", ""),
+                ("bob", "Bob", "   ", "https://wework.qpic.cn/big-bob"),
+            ),
+        )
+    job = write_job(
+        job_root,
+        [("contact/contact.db", contact), ("message/message_0.db", message)],
+    )
+
+    result = run_parser(job)
+    document = json.loads((job_root / "output" / "result.json").read_text(encoding="utf-8"))
+
+    assert result.returncode == 0
+    assert document["messages"][0]["sender"] == "Bob"
+    assert document["messages"][0]["avatar"] == "https://wework.qpic.cn/big-bob"
+
+
+def test_legacy_contact_schema_keeps_empty_avatar_without_notice(tmp_path: Path) -> None:
+    job_root = tmp_path / "job"
+    contact = job_root / "input" / "contact" / "contact.db"
+    create_contact_database(contact)
+    job = write_job(job_root, [("contact/contact.db", contact)])
+
+    result = run_parser(job)
+    document = json.loads((job_root / "output" / "result.json").read_text(encoding="utf-8"))
+
+    assert result.returncode == 0
+    assert document["contacts"][0]["avatar"] == ""
+    assert document["notices"] == []
+
+
 def test_large_table_cursor_is_compact_and_round_trips() -> None:
     state = {
         "m": {
