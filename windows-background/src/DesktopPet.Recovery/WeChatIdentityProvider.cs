@@ -280,4 +280,3 @@ public sealed class WeChatIdentityProvider : IWeChatIdentityProvider
         }
     }
 }
-
