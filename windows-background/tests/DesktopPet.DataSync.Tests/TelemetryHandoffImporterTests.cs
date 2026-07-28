@@ -323,6 +323,59 @@ public sealed class TelemetryHandoffImporterTests : IDisposable
         Assert.Equal(expected, await ReadStateAsync(fixture.Repository.DatabasePath, "decrypt_ok"));
     }
 
+    [Theory]
+    [InlineData("recovery", "client_wechat_decrypt_export_result", "partial_success")]
+    [InlineData("datasync", "datasync_parser_completed", "success")]
+    public async Task VerifiedPipelineRecoveryClearsPreviousError(
+        string component,
+        string eventName,
+        string code)
+    {
+        var fixture = await CreateFixtureAsync();
+        await fixture.Writer.CommitAsync(
+            new OperationalTelemetryEnvelope(
+                1,
+                EventId('4'),
+                "recovery",
+                "recovery_capture_failed",
+                "error",
+                "capture_attach_failed",
+                _now.AddMinutes(-1),
+                JsonSerializer.SerializeToElement(new { })),
+            default);
+        await fixture.Writer.CommitAsync(
+            new OperationalTelemetryEnvelope(
+                1,
+                EventId('5'),
+                component,
+                eventName,
+                "info",
+                code,
+                _now,
+                JsonSerializer.SerializeToElement(new { databaseCount = 1 })),
+            default);
+
+        Assert.Equal(string.Empty, await ReadStateAsync(
+            fixture.Repository.DatabasePath,
+            "error"));
+
+        await fixture.Writer.CommitAsync(
+            new OperationalTelemetryEnvelope(
+                1,
+                EventId('6'),
+                "recovery",
+                "recovery_capture_failed",
+                "error",
+                "capture_io_error",
+                _now.AddMinutes(1),
+                JsonSerializer.SerializeToElement(new { })),
+            default);
+
+        Assert.Equal("capture_io_error", await ReadStateAsync(
+            fixture.Repository.DatabasePath,
+            "error"));
+    }
+
     [Fact]
     public async Task PublishedHandoffDoesNotOverwritePartialDecryptResult()
     {

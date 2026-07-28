@@ -177,6 +177,50 @@ public sealed class StatusOutboxWriterTests : IDisposable
         Assert.False(document.RootElement.TryGetProperty("error", out _));
     }
 
+    [Fact]
+    public async Task HeartbeatOmitsErrorAfterPartialDecryptRecovery()
+    {
+        var time = new AdjustableTimeProvider(DateTimeOffset.Parse("2026-07-26T00:00:00Z"));
+        var protector = new EncryptedOutboxProtector(new XorTestProtector());
+        await using var repository = new DataSyncRepository(Path.Combine(_root, "recovered.db"), time, protector);
+        await repository.InitializeAsync(default);
+        var identity = new ClientIdentityDocument(1, "session-a", "client_datasync", time.GetUtcNow());
+        var telemetry = new TelemetryOutboxWriter(repository, protector, identity, time);
+        await telemetry.CommitAsync(
+            new OperationalTelemetryEnvelope(
+                1,
+                new string('b', 64),
+                "recovery",
+                "recovery_capture_failed",
+                "error",
+                "capture_attach_failed",
+                time.GetUtcNow(),
+                JsonSerializer.SerializeToElement(new { })),
+            default);
+        time.Advance(TimeSpan.FromSeconds(1));
+        await telemetry.CommitAsync(
+            new OperationalTelemetryEnvelope(
+                1,
+                new string('c', 64),
+                "recovery",
+                "client_wechat_decrypt_export_result",
+                "info",
+                "partial_success",
+                time.GetUtcNow(),
+                JsonSerializer.SerializeToElement(new { outputCount = 1, pendingCount = 17 })),
+            default);
+
+        await new StatusOutboxWriter(repository, protector, identity, time)
+            .EnqueueHeartbeatAsync(default);
+
+        var row = Assert.Single(
+            await repository.GetPendingOutboxAsync(10, default),
+            item => item.Endpoint == "status");
+        var payload = protector.Unprotect(row.Id, row.Endpoint, row.Ciphertext);
+        using var document = JsonDocument.Parse(payload);
+        Assert.False(document.RootElement.TryGetProperty("error", out _));
+    }
+
     public void Dispose()
     {
         if (Directory.Exists(_root)) Directory.Delete(_root, true);

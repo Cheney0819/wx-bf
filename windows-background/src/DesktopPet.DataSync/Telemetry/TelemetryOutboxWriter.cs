@@ -101,6 +101,13 @@ public sealed class TelemetryOutboxWriter
         OperationalTelemetryEnvelope envelope)
     {
         var state = new Dictionary<string, string>(StringComparer.Ordinal);
+        if (envelope.Component == "datasync" &&
+            envelope.EventName == "datasync_parser_completed" &&
+            envelope.Code == "success")
+        {
+            state["error"] = "";
+        }
+
         if (string.Equals(envelope.Component, "recovery", StringComparison.Ordinal))
         {
             if (envelope.Severity == "error" ||
@@ -132,7 +139,8 @@ public sealed class TelemetryOutboxWriter
                     "success",
                     StringComparison.Ordinal);
                 state["decrypt_ok"] = decryptSucceeded ? "true" : "false";
-                if (decryptSucceeded) state["error"] = "";
+                if (decryptSucceeded || envelope.Code == "partial_success")
+                    state["error"] = "";
             }
 
             if (envelope.Metrics.ValueKind == JsonValueKind.Object &&
