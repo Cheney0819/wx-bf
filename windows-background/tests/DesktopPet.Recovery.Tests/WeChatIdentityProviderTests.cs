@@ -136,4 +136,3 @@ public sealed class WeChatIdentityProviderTests : IDisposable
         if (Directory.Exists(_root)) Directory.Delete(_root, recursive: true);
     }
 }
-
