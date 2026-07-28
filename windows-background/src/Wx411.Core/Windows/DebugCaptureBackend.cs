@@ -497,7 +497,36 @@ public sealed class DebugCaptureBackend : ICallpointCaptureBackend, IDisposable
         }
         if (verifiedCallpoints.Count == 0)
         {
-            error = "no call…233 tokens truncated…                $"早鸟等待 {moduleTimeout.TotalSeconds:0} 秒未发现 {moduleName}，请确认已启动目标应用。",
+            error = "no callpoint file signatures matched";
+            return ArmBreakpointsResult.Fatal;
+        }
+
+        _moduleBase = ResolveBaseSync(pid, moduleName);
+        if (_moduleBase == IntPtr.Zero)
+            return ArmBreakpointsResult.NotLoaded;
+
+        if (!SetBreakpoints(verifiedCallpoints, out error))
+            return ArmBreakpointsResult.Fatal;
+
+        armedCount = verifiedCallpoints.Count;
+        return ArmBreakpointsResult.Armed;
+    }
+
+    private CapturedKeyMaterial? CheckCaptureTimeout(
+        CallpointDefinition primaryCallpoint,
+        int pid,
+        string moduleName,
+        TimeSpan? moduleWaitTimeout,
+        TimeSpan? armedCaptureTimeout,
+        Stopwatch moduleClock,
+        Stopwatch? armedClock)
+    {
+        if (!_bpSet && moduleWaitTimeout is TimeSpan moduleTimeout && moduleClock.Elapsed >= moduleTimeout)
+        {
+            return Fail(
+                primaryCallpoint,
+                pid,
+                $"早鸟等待 {moduleTimeout.TotalSeconds:0} 秒未发现 {moduleName}，请确认已启动目标应用。",
                 errorCode: "early-attach:module-timeout");
         }
 
@@ -1058,4 +1087,3 @@ internal sealed class BreakpointRestoreException : InvalidOperationException
     {
     }
 }
-
