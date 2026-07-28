@@ -97,6 +97,30 @@ public sealed class WeChatIdentityProviderTests : IDisposable
     }
 
     [Fact]
+    public void UniqueProcessTreeRootIsSelectedWhenNoProcessHasAMainWindow()
+    {
+        var executable = typeof(WeChatIdentityProviderTests).Assembly.Location;
+        const int mainPid = 7301;
+        var expected = new WeChatProcessCandidate(
+            mainPid,
+            7,
+            executable,
+            ParentProcessId: 611);
+        var processes = new[]
+        {
+            new WeChatProcessCandidate(7302, 7, executable, ParentProcessId: mainPid),
+            expected,
+            new WeChatProcessCandidate(7303, 7, executable, ParentProcessId: mainPid),
+            new WeChatProcessCandidate(7304, 7, executable, ParentProcessId: mainPid),
+            new WeChatProcessCandidate(7305, 7, executable, ParentProcessId: mainPid),
+        };
+
+        var selected = WeChatIdentityProvider.SelectInteractiveProcess(processes);
+
+        Assert.Equal(expected, selected);
+    }
+
+    [Fact]
     public void OneInteractiveProcessRemainsSelectable()
     {
         var executable = typeof(WeChatIdentityProviderTests).Assembly.Location;
@@ -112,3 +136,4 @@ public sealed class WeChatIdentityProviderTests : IDisposable
         if (Directory.Exists(_root)) Directory.Delete(_root, recursive: true);
     }
 }
+
