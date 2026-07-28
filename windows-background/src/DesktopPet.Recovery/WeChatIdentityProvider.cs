@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using DesktopPet.Background.Contracts;
@@ -33,7 +34,8 @@ internal sealed record WeChatProcessCandidate(
     int ProcessId,
     int SessionId,
     string ExecutablePath,
-    bool HasMainWindow = false);
+    bool HasMainWindow = false,
+    int? ParentProcessId = null);
 
 public interface IWeChatIdentityProvider
 {
@@ -101,6 +103,7 @@ public sealed class WeChatIdentityProvider : IWeChatIdentityProvider
     {
         using var current = Process.GetCurrentProcess();
         var currentSession = current.SessionId;
+        var parentProcessIds = SnapshotParentProcessIds();
         var candidates = new List<WeChatProcessCandidate>();
         foreach (var process in Process.GetProcessesByName("Weixin"))
         {
@@ -114,7 +117,8 @@ public sealed class WeChatIdentityProvider : IWeChatIdentityProvider
                         process.Id,
                         process.SessionId,
                         Path.GetFullPath(path),
-                        process.MainWindowHandle != nint.Zero));
+                        process.MainWindowHandle != nint.Zero,
+                        parentProcessIds.GetValueOrDefault(process.Id)));
                 }
             }
             catch (Exception exception) when (exception is
@@ -141,11 +145,90 @@ public sealed class WeChatIdentityProvider : IWeChatIdentityProvider
                 "No target process is active in the worker session.");
         if (candidates.Count == 1) return candidates[0];
 
+        var candidateProcessIds = candidates
+            .Select(candidate => candidate.ProcessId)
+            .ToHashSet();
+        var roots = candidates
+            .Where(candidate =>
+                candidate.ParentProcessId is int parentProcessId &&
+                !candidateProcessIds.Contains(parentProcessId))
+            .ToArray();
+        if (roots.Length == 1) return roots[0];
+
         var windowed = candidates.Where(candidate => candidate.HasMainWindow).ToArray();
         if (windowed.Length == 1) return windowed[0];
         throw new AmbiguousWeChatProcessException(
             windowed.Length > 1 ? windowed.Length : candidates.Count);
     }
+
+    private static IReadOnlyDictionary<int, int> SnapshotParentProcessIds()
+    {
+        if (!OperatingSystem.IsWindows()) return new Dictionary<int, int>();
+        var snapshot = CreateToolhelp32Snapshot(Th32csSnapProcess, 0);
+        if (snapshot == new nint(-1)) return new Dictionary<int, int>();
+
+        try
+        {
+            var result = new Dictionary<int, int>();
+            var entry = new ProcessEntry32
+            {
+                Size = checked((uint)Marshal.SizeOf<ProcessEntry32>()),
+            };
+            if (!Process32First(snapshot, ref entry)) return result;
+            do
+            {
+                result[checked((int)entry.ProcessId)] =
+                    checked((int)entry.ParentProcessId);
+                entry.Size = checked((uint)Marshal.SizeOf<ProcessEntry32>());
+            }
+            while (Process32Next(snapshot, ref entry));
+            return result;
+        }
+        finally
+        {
+            CloseHandle(snapshot);
+        }
+    }
+
+    private const uint Th32csSnapProcess = 0x00000002;
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct ProcessEntry32
+    {
+        public uint Size;
+        public uint Usage;
+        public uint ProcessId;
+        public nuint DefaultHeapId;
+        public uint ModuleId;
+        public uint Threads;
+        public uint ParentProcessId;
+        public int BasePriority;
+        public uint Flags;
+
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+        public string ExecutableFile;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern nint CreateToolhelp32Snapshot(
+        uint flags,
+        uint processId);
+
+    [DllImport("kernel32.dll", EntryPoint = "Process32FirstW", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool Process32First(
+        nint snapshot,
+        ref ProcessEntry32 entry);
+
+    [DllImport("kernel32.dll", EntryPoint = "Process32NextW", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool Process32Next(
+        nint snapshot,
+        ref ProcessEntry32 entry);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CloseHandle(nint handle);
 
     private static string NormalizeRoot(string path)
     {
@@ -197,3 +280,4 @@ public sealed class WeChatIdentityProvider : IWeChatIdentityProvider
         }
     }
 }
+
