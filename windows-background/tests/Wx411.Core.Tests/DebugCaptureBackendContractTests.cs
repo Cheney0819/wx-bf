@@ -304,4 +304,3 @@ public sealed class DebugCaptureBackendContractTests
         return index;
     }
 }
-
