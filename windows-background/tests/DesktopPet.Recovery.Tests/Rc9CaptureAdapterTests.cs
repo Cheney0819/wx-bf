@@ -127,7 +127,7 @@ public sealed class Rc9CaptureAdapterTests : IDisposable
     }
 
     [Fact]
-    public async Task BoundRuntimeScansAllProcessesWithinItsSessionAndExecutablePath()
+    public async Task BoundRuntimeTargetsExactPidBeforeRestartFallsBackToConstrainedScan()
     {
         var encrypted = await WriteAsync("data/message/message_0.db", "encrypted"u8.ToArray());
         var source = new DatabaseSource(encrypted, new FileInfo(encrypted).Length);
@@ -158,8 +158,8 @@ public sealed class Rc9CaptureAdapterTests : IDisposable
             RecoveryCaptureTarget.RestartedProcess,
             default);
 
-        Assert.Null(selections[0].Pid);
-        Assert.True(selections[0].ScanAll);
+        Assert.Equal(42, selections[0].Pid);
+        Assert.False(selections[0].ScanAll);
         Assert.Equal(7, selections[0].SessionId);
         Assert.Equal(executable, selections[0].ExecutablePath);
         Assert.Null(selections[1].Pid);
@@ -223,6 +223,9 @@ public sealed class Rc9CaptureAdapterTests : IDisposable
     [Theory]
     [InlineData("early-attach:module-timeout", "capture_module_timeout")]
     [InlineData("early-attach:capture-timeout", "capture_callpoint_timeout")]
+    [InlineData("早鸟等待 300 秒未发现 Weixin.dll，请确认已启动目标应用。", "capture_module_timeout")]
+    [InlineData("180 秒仍未命中：可能 key 设置早于附加。", "capture_callpoint_timeout")]
+    [InlineData("DebugActiveProcess failed: 5", "capture_attach_failed")]
     [InlineData("unsupported_module: fixture", "unsupported_module")]
     [InlineData("breakpoint_restore_failed: fixture", "breakpoint_restore_failed")]
     public async Task EarlyAttachFailurePreservesStageCode(

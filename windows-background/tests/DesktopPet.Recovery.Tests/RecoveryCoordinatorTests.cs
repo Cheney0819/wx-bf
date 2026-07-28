@@ -631,6 +631,27 @@ public sealed class RecoveryCoordinatorTests : IDisposable
     }
 
     [Fact]
+    public async Task StartTelemetryUsesBoundedVersionInsteadOfExecutableIdentity()
+    {
+        var telemetry = new RecordingTelemetryPublisher();
+        await using var fixture = await CreateFixtureAsync(
+            telemetry,
+            reuse: new SlowIgnoringCancellationReuseAdapter(TimeSpan.Zero),
+            epochExecutableVersion:
+                "4.1.12.26|sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef|signer:fixture",
+            observations: [new CaptureObservation(false, true, [], null)]);
+
+        _ = await fixture.Coordinator.RunEpochAsync(fixture.Epoch, default);
+
+        var starts = telemetry.Events.Where(draft => draft.EventName is
+            "recovery_key_reuse_started" or "recovery_capture_started").ToArray();
+        Assert.Equal(2, starts.Length);
+        Assert.All(starts, draft => Assert.Equal(
+            "4.1.12.26",
+            draft.Metrics.GetProperty("executableVersion").GetString()));
+    }
+
+    [Fact]
     public async Task UncooperativePersistedKeyReuseStopsBeforeLiveCaptureCanRaceIt()
     {
         var reuse = new SlowIgnoringCancellationReuseAdapter(TimeSpan.FromMilliseconds(250));
@@ -764,6 +785,7 @@ public sealed class RecoveryCoordinatorTests : IDisposable
         TimeSpan? telemetryTimeout = null,
         TimeSpan? keyReuseTimeout = null,
         TimeSpan? keyReuseCancellationTimeout = null,
+        string epochExecutableVersion = "4.1.0",
         params CaptureObservation[] observations)
     {
         var repository = new RecoveryRepository(
@@ -771,7 +793,7 @@ public sealed class RecoveryCoordinatorTests : IDisposable
             TimeProvider.System);
         await repository.InitializeAsync(default);
         var epoch = await repository.BeginOrLoadEpochAsync(
-            new RecoveryEpochIdentity("4.1.0", "root-a"),
+            new RecoveryEpochIdentity(epochExecutableVersion, "root-a"),
             explicitRetry: false,
             default);
         var events = new List<string>();

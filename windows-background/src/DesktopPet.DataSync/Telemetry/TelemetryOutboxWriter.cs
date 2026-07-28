@@ -103,14 +103,16 @@ public sealed class TelemetryOutboxWriter
         var state = new Dictionary<string, string>(StringComparer.Ordinal);
         if (string.Equals(envelope.Component, "recovery", StringComparison.Ordinal))
         {
-            if (envelope.Severity is "warning" or "error")
+            if (envelope.Severity == "error" ||
+                (envelope.Severity == "warning" && !IsTransientPreflightWarning(envelope)))
             {
                 state["error"] = envelope.Code;
             }
-            else if (envelope.EventName is
-                "client_v4_data_dir_result" or
-                "recovery_capture_succeeded" or
-                "recovery_handoff_published")
+            else if ((envelope.EventName == "client_v4_data_dir_result" &&
+                      envelope.Severity == "info") ||
+                     envelope.EventName is
+                         "recovery_capture_succeeded" or
+                         "recovery_handoff_published")
             {
                 state["error"] = "";
             }
@@ -142,6 +144,14 @@ public sealed class TelemetryOutboxWriter
         }
         return state;
     }
+
+    private static bool IsTransientPreflightWarning(
+        OperationalTelemetryEnvelope envelope) =>
+        string.Equals(
+            envelope.EventName,
+            "client_v4_data_dir_result",
+            StringComparison.Ordinal) &&
+        envelope.Code is "ambiguous_data_root" or "ambiguous_wechat_process";
 
     private static string Sha256(string material)
     {

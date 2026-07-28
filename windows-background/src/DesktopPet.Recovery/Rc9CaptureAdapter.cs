@@ -272,12 +272,12 @@ public sealed class Rc9CaptureAdapter : IRecoveryCaptureAdapter
         _progress = progress;
         _discoverDatabases = discoverDatabases;
         _createCaptureContext = createCaptureContext;
-        _boundProcess = boundProcess with
+        _boundProcess = boundProcess;
+        _restartedProcess = boundProcess with
         {
             Pid = null,
             ScanAll = true,
         };
-        _restartedProcess = _boundProcess;
     }
 
     private static RecoveryProcessSelection BoundProcessSelection(
@@ -406,12 +406,25 @@ public sealed class Rc9CaptureAdapter : IRecoveryCaptureAdapter
             {
                 return "capture_module_timeout";
             }
+            if (invalid.Message.Contains("早鸟等待", StringComparison.Ordinal) &&
+                invalid.Message.Contains("未发现", StringComparison.Ordinal))
+            {
+                return "capture_module_timeout";
+            }
 
             if (invalid.Message.Contains(
                     "early-attach:capture-timeout",
                     StringComparison.OrdinalIgnoreCase))
             {
                 return "capture_callpoint_timeout";
+            }
+            if (invalid.Message.Contains("秒仍未命中", StringComparison.Ordinal))
+                return "capture_callpoint_timeout";
+            if (invalid.Message.Contains(
+                    "DebugActiveProcess failed",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return "capture_attach_failed";
             }
         }
 

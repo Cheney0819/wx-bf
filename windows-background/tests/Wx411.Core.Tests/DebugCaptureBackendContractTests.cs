@@ -1,9 +1,26 @@
 using System.Text.RegularExpressions;
+using System.Reflection;
+using Wx411.Core.Windows;
 
 namespace Wx411.Core.Tests;
 
 public sealed class DebugCaptureBackendContractTests
 {
+    [Fact]
+    public void FailureCarriesStableCodeInErrorChannel()
+    {
+        var method = typeof(DebugCaptureBackend).GetMethod(
+            "Fail",
+            BindingFlags.NonPublic | BindingFlags.Static) ??
+            throw new InvalidOperationException("Debug capture failure factory was not found.");
+        using var failure = (CapturedKeyMaterial)method.Invoke(
+            null,
+            [CallpointProfiles.Preferred.Callpoints[0], 1, "本地化提示", null, "capture_timeout"]
+        )!;
+
+        Assert.Equal("capture_timeout: 本地化提示", failure.Error);
+    }
+
     [Fact]
     public void AttachRetryAcceptsCancellationAndHasNoThreadSleep()
     {

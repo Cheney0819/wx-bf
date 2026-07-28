@@ -105,7 +105,7 @@ public sealed class RecoveryCoordinator
                         "recovery_key_reuse_started",
                         "info",
                         "key_reuse_started",
-                        new { executableVersion = current.Identity.ExecutableVersion },
+                        new { executableVersion = BoundedExecutableVersion(current.Identity.ExecutableVersion) },
                         cancellationToken);
                     reuseCancellation =
                         CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -260,7 +260,7 @@ public sealed class RecoveryCoordinator
                             new
                             {
                                 restartCount = current.RestartCount,
-                                executableVersion = current.Identity.ExecutableVersion,
+                                executableVersion = BoundedExecutableVersion(current.Identity.ExecutableVersion),
                             },
                             cancellationToken);
                         CaptureObservation observation;
@@ -630,6 +630,20 @@ public sealed class RecoveryCoordinator
             character is >= 'a' and <= 'z' || char.IsAsciiDigit(character) || character == '_')
             ? value
             : fallback;
+
+    private static string BoundedExecutableVersion(string executableIdentity)
+    {
+        var separator = executableIdentity.IndexOf('|');
+        var version = separator < 0
+            ? executableIdentity
+            : executableIdentity[..separator];
+        return version.Length is >= 1 and <= 32 &&
+               char.IsAsciiDigit(version[0]) &&
+               version.All(character =>
+                   char.IsAsciiLetterOrDigit(character) || character is '-' or '.')
+            ? version
+            : "0";
+    }
 
     private static void AddCompletedRelativePaths(
         ISet<string> completedRelativePaths,

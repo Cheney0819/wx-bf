@@ -113,6 +113,33 @@ public sealed class TelemetryHandoffImporterTests : IDisposable
     }
 
     [Fact]
+    public async Task AmbiguousDataRootWarningDoesNotBecomeASecondServerError()
+    {
+        var fixture = await CreateFixtureAsync();
+        await fixture.Writer.CommitAsync(
+            new OperationalTelemetryEnvelope(
+                1,
+                EventId('8'),
+                "recovery",
+                "client_v4_data_dir_result",
+                "warning",
+                "ambiguous_data_root",
+                _now,
+                JsonSerializer.SerializeToElement(new
+                {
+                    candidateCount = 3,
+                    databaseCount = 0,
+                    wechatLoggedIn = true,
+                })),
+            default);
+
+        Assert.Null(await ReadStateAsync(fixture.Repository.DatabasePath, "error"));
+        Assert.Equal("true", await ReadStateAsync(
+            fixture.Repository.DatabasePath,
+            "wechat_logged_in"));
+    }
+
+    [Fact]
     public async Task ReplayAfterCommitCreatesNoDuplicateRows()
     {
         var fixture = await CreateFixtureAsync();

@@ -28,7 +28,6 @@ public sealed class WindowsAppProcessController : IAppProcessController
     private readonly TimeSpan _exitTimeout;
     private readonly int? _sessionId;
     private readonly string? _executablePath;
-    private int? _boundProcessId;
 
     public WindowsAppProcessController()
         : this(new WindowsAppProcessOperations(), DefaultExitTimeout, runtime: null)
@@ -60,7 +59,6 @@ public sealed class WindowsAppProcessController : IAppProcessController
             if (runtime.ProcessId <= 0 || runtime.SessionId < 0)
                 throw new ArgumentOutOfRangeException(nameof(runtime));
             ArgumentException.ThrowIfNullOrWhiteSpace(runtime.ExecutablePath);
-            _boundProcessId = runtime.ProcessId;
             _sessionId = runtime.SessionId;
             _executablePath = Path.GetFullPath(runtime.ExecutablePath);
         }
@@ -85,13 +83,6 @@ public sealed class WindowsAppProcessController : IAppProcessController
         if (snapshots.Length == 0)
             throw new InvalidOperationException(
                 "No restartable target process is active in the interactive session.");
-        if (_boundProcessId is int boundPid &&
-            !snapshots.Any(item => item.ProcessId == boundPid))
-        {
-            throw new InvalidOperationException(
-                "The bound target process identity changed before restart.");
-        }
-
         var selectedGroup = snapshots
             .GroupBy(
                 item => Path.GetFullPath(item.ExecutablePath),
@@ -114,7 +105,6 @@ public sealed class WindowsAppProcessController : IAppProcessController
         await beforeStart(cancellationToken);
         cancellationToken.ThrowIfCancellationRequested();
         var started = _operations.Start(executablePath);
-        _boundProcessId = null;
         return started;
     }
 

@@ -89,6 +89,35 @@ public sealed class WindowsAppProcessControllerTests
     }
 
     [Fact]
+    public async Task BoundRuntimeContinuesWhenPidWasReplacedWithinSameIdentity()
+    {
+        var executable = Path.GetFullPath(
+            Path.Combine("opt", "bound", "Weixin.exe"));
+        var operations = new FakeProcessOperations
+        {
+            Snapshots =
+            [
+                new AppProcessSnapshot(13, 7, executable, DateTimeOffset.UnixEpoch),
+                new AppProcessSnapshot(14, 8, executable, DateTimeOffset.UnixEpoch),
+            ],
+        };
+        var runtime = new WeChatRuntimeIdentity(
+            12,
+            7,
+            executable,
+            "fixture-executable");
+        var controller = new WindowsAppProcessController(
+            operations,
+            TimeSpan.FromSeconds(5),
+            runtime);
+
+        await controller.RestartAsync(default);
+
+        Assert.Equal([13], operations.TerminatedProcessIds);
+        Assert.Equal(executable, operations.StartedExecutable);
+    }
+
+    [Fact]
     public async Task RestartWithoutInteractiveTargetFailsBeforeStarting()
     {
         var operations = new FakeProcessOperations { Snapshots = [] };

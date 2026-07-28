@@ -517,7 +517,7 @@ public sealed class DebugCaptureBackend : ICallpointCaptureBackend, IDisposable
                 primaryCallpoint,
                 pid,
                 $"早鸟等待 {moduleTimeout.TotalSeconds:0} 秒未发现 {moduleName}，请确认已启动目标应用。",
-                "early-attach:module-timeout");
+                errorCode: "early-attach:module-timeout");
         }
 
         if (_bpSet &&
@@ -529,7 +529,7 @@ public sealed class DebugCaptureBackend : ICallpointCaptureBackend, IDisposable
                 primaryCallpoint,
                 pid,
                 $"{captureTimeout.TotalSeconds:0} 秒仍未命中：可能 key 设置早于附加，建议完全退出微信后先点工具再启动。",
-                "early-attach:capture-timeout");
+                errorCode: "early-attach:capture-timeout");
         }
 
         return null;
@@ -988,14 +988,15 @@ public sealed class DebugCaptureBackend : ICallpointCaptureBackend, IDisposable
         CallpointDefinition definition,
         int pid,
         string why,
-        string? regs = null) =>
+        string? regs = null,
+        string? errorCode = null) =>
         new(
             definition.Name,
             definition.BreakpointRva,
             regs ?? $"fail:{why}",
             pid,
             DateTime.UtcNow)
-        { Error = why };
+        { Error = errorCode is null ? why : $"{errorCode}: {why}" };
 
     private static CapturedKeyMaterial Make(
         CallpointDefinition definition,
