@@ -232,6 +232,31 @@ public sealed class DebugCaptureBackendContractTests
     }
 
     [Fact]
+    public void PendingSingleStepIsDrainedBeforeStopCancellationOrTimeout()
+    {
+        var source = TestSourceTree.ReadWindowsEasy(
+            Path.Combine("src", "Wx411.Core", "Windows", "DebugCaptureBackend.cs"));
+        var eventLoop = Slice(
+            source,
+            "private CapturedKeyMaterial? RunCaptureSync(",
+            "private bool ShouldStopEventLoop(");
+        var stopGuard = Slice(
+            source,
+            "private bool ShouldStopEventLoop(",
+            "private ArmBreakpointsResult TryArmBreakpoints(");
+
+        Assert.Equal(
+            2,
+            Regex.Matches(eventLoop, @"\bif\s*\(ShouldStopEventLoop\s*\(").Count);
+        Assert.DoesNotContain("ct.ThrowIfCancellationRequested();", eventLoop, StringComparison.Ordinal);
+        Assert.DoesNotContain("shouldStop?.Invoke()", eventLoop, StringComparison.Ordinal);
+        Assert.Contains("_pendingRearms.Count != 0", stopGuard, StringComparison.Ordinal);
+        Assert.Contains("cancellationToken.ThrowIfCancellationRequested();", stopGuard, StringComparison.Ordinal);
+        Assert.Contains("shouldStop?.Invoke() == true", stopGuard, StringComparison.Ordinal);
+        Assert.Contains("if (_pendingRearms.Count != 0)", eventLoop, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void BackendArmsFourDefaultBreakpointsPerAttach()
     {
         var source = TestSourceTree.ReadWindowsEasy(
@@ -279,3 +304,4 @@ public sealed class DebugCaptureBackendContractTests
         return index;
     }
 }
+
