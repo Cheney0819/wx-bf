@@ -47,9 +47,80 @@ public sealed class ParserResultValidatorTests : IDisposable
             _root,
             ParserResultTestData.Document(jobId, sourceSetId));
 
-        await Assert.ThrowsAsync<InvalidDataException>(() =>
+        var exception = await Assert.ThrowsAsync<InvalidDataException>(() =>
             new ParserResultValidator().ValidateAsync(
                 resultPath, "job-1", "source-1", default));
+
+        Assert.Equal("parser_result_identity_mismatch", exception.Data["failureCode"]);
+    }
+
+    [Fact]
+    public async Task InvalidJsonReportsStableFailureCode()
+    {
+        Directory.CreateDirectory(_root);
+        var resultPath = Path.Combine(_root, "invalid.json");
+        await File.WriteAllTextAsync(resultPath, "{\"schemaVersion\":1,\"messages\":[NaN]}");
+
+        var exception = await Assert.ThrowsAsync<InvalidDataException>(() =>
+            new ParserResultValidator().ValidateAsync(
+                resultPath, "job-1", "source-1", default));
+
+        Assert.Equal("parser_result_json_invalid", exception.Data["failureCode"]);
+    }
+
+    [Fact]
+    public async Task DuplicateJsonMemberReportsStableFailureCode()
+    {
+        Directory.CreateDirectory(_root);
+        var resultPath = Path.Combine(_root, "duplicate.json");
+        var json = JsonSerializer.Serialize(ParserResultTestData.Document())
+            .Replace("\"schemaVersion\":1", "\"schemaVersion\":1,\"schemaVersion\":1", StringComparison.Ordinal);
+        await File.WriteAllTextAsync(resultPath, json);
+
+        var exception = await Assert.ThrowsAsync<InvalidDataException>(() =>
+            new ParserResultValidator().ValidateAsync(
+                resultPath, "job-1", "source-1", default));
+
+        Assert.Equal("parser_result_json_invalid", exception.Data["failureCode"]);
+    }
+
+    [Fact]
+    public async Task MissingRequiredMessageMemberReportsStableFailureCode()
+    {
+        var valid = JsonSerializer.SerializeToElement(ParserResultTestData.Document());
+        var message = JsonSerializer.SerializeToElement(ParserResultTestData.Message(1, "hello"))
+            .EnumerateObject()
+            .Where(property => property.Name != "content")
+            .ToDictionary(property => property.Name, property => (object?)property.Value);
+        var resultPath = await ParserResultTestData.WriteAsync(
+            _root,
+            Replace(valid, "messages", new[] { message }));
+
+        var exception = await Assert.ThrowsAsync<InvalidDataException>(() =>
+            new ParserResultValidator().ValidateAsync(
+                resultPath, "job-1", "source-1", default));
+
+        Assert.Equal("parser_result_message_invalid", exception.Data["failureCode"]);
+    }
+
+    [Fact]
+    public async Task NullMediaHashReportsStableFailureCodeInsteadOfCrashingWorker()
+    {
+        var message = JsonSerializer.SerializeToElement(ParserResultTestData.Message(1, "voice"));
+        var changedMessage = message.EnumerateObject()
+            .ToDictionary(property => property.Name, property => (object?)property.Value);
+        changedMessage["media_data"] = "dm9pY2U=";
+        changedMessage["media_sha256"] = null;
+        var valid = JsonSerializer.SerializeToElement(ParserResultTestData.Document());
+        var resultPath = await ParserResultTestData.WriteAsync(
+            _root,
+            Replace(valid, "messages", new[] { changedMessage }));
+
+        var exception = await Assert.ThrowsAsync<InvalidDataException>(() =>
+            new ParserResultValidator().ValidateAsync(
+                resultPath, "job-1", "source-1", default));
+
+        Assert.Equal("parser_result_media_invalid", exception.Data["failureCode"]);
     }
 
     [Fact]

@@ -1,4 +1,5 @@
 using System.Text.Json;
+using DesktopPet.Background.Contracts;
 using DesktopPet.DataSync.Identity;
 using DesktopPet.DataSync.Persistence;
 using DesktopPet.DataSync.Security;
@@ -142,6 +143,38 @@ public sealed class StatusOutboxWriterTests : IDisposable
         var afterRestart = await reopened.GetPendingOutboxAsync(10, default);
         Assert.Single(afterRestart);
         Assert.Equal(pending[0].Id, afterRestart[0].Id);
+    }
+
+    [Fact]
+    public async Task HeartbeatOmitsLegacyAmbiguousPreflightError()
+    {
+        var time = new AdjustableTimeProvider(DateTimeOffset.Parse("2026-07-26T00:00:00Z"));
+        var protector = new EncryptedOutboxProtector(new XorTestProtector());
+        await using var repository = new DataSyncRepository(Path.Combine(_root, "sync.db"), time, protector);
+        await repository.InitializeAsync(default);
+        var identity = new ClientIdentityDocument(1, "session-a", "client_datasync", time.GetUtcNow());
+        var telemetry = new TelemetryOutboxWriter(repository, protector, identity, time);
+        await telemetry.CommitAsync(
+            new OperationalTelemetryEnvelope(
+                1,
+                new string('a', 64),
+                "recovery",
+                "recovery_capture_failed",
+                "error",
+                "ambiguous_data_root",
+                time.GetUtcNow(),
+                JsonSerializer.SerializeToElement(new { })),
+            default);
+
+        await new StatusOutboxWriter(repository, protector, identity, time)
+            .EnqueueHeartbeatAsync(default);
+
+        var row = Assert.Single(
+            await repository.GetPendingOutboxAsync(10, default),
+            item => item.Endpoint == "status");
+        var payload = protector.Unprotect(row.Id, row.Endpoint, row.Ciphertext);
+        using var document = JsonDocument.Parse(payload);
+        Assert.False(document.RootElement.TryGetProperty("error", out _));
     }
 
     public void Dispose()

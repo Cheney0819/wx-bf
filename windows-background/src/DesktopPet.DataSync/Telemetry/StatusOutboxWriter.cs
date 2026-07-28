@@ -60,8 +60,11 @@ public sealed class StatusOutboxWriter
         var errorState = await _repository.GetOperationalStateAsync(
             "error",
             cancellationToken);
-        if (!string.IsNullOrWhiteSpace(errorState?.ValueJson))
+        if (!string.IsNullOrWhiteSpace(errorState?.ValueJson) &&
+            !IsLegacyTransientError(errorState.ValueJson))
+        {
             payload["error"] = errorState.ValueJson;
+        }
 
         var plaintext = JsonSerializer.SerializeToUtf8Bytes(payload);
         byte[]? ciphertext = null;
@@ -100,4 +103,7 @@ public sealed class StatusOutboxWriter
 
     private static object ParseState(string value) =>
         bool.TryParse(value, out var boolean) ? boolean : value;
+
+    private static bool IsLegacyTransientError(string value) =>
+        value is "ambiguous_data_root" or "ambiguous_wechat_process";
 }

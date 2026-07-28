@@ -9,6 +9,31 @@ public sealed class ParserResultValidator
     private const long MaximumResultBytes = 32L * 1024 * 1024;
     private const int MaximumStringCharacters = 64 * 1024;
     private const int MaximumMediaBytes = 5 * 1024 * 1024;
+    private static readonly IReadOnlySet<string> ResultMembers = new HashSet<string>(
+        ["schemaVersion", "jobId", "sourceSetId", "messages", "contacts", "favorites", "notices"],
+        StringComparer.Ordinal);
+    private static readonly IReadOnlySet<string> MessageMembers = new HashSet<string>(
+        [
+            "wxid", "local_id", "content", "create_time", "is_sender", "nickname", "sender",
+            "avatar", "msg_type", "msg_sub_type", "media_type", "media_mime", "media_name",
+            "media_data", "media_sha256",
+        ],
+        StringComparer.Ordinal);
+    private static readonly IReadOnlySet<string> ContactMembers = new HashSet<string>(
+        [
+            "wxid", "alias", "remark", "nick_name", "display_name", "avatar",
+            "source_updated_at", "extra_json",
+        ],
+        StringComparer.Ordinal);
+    private static readonly IReadOnlySet<string> FavoriteMembers = new HashSet<string>(
+        [
+            "source_table", "source_id", "title", "summary", "item_type", "item_sub_type",
+            "source_updated_at", "data_json",
+        ],
+        StringComparer.Ordinal);
+    private static readonly IReadOnlySet<string> NoticeMembers = new HashSet<string>(
+        ["code", "database", "detail"],
+        StringComparer.Ordinal);
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
@@ -29,7 +54,7 @@ public sealed class ParserResultValidator
         var info = new FileInfo(fullPath);
         if (!info.Exists) throw new FileNotFoundException("Parser result is missing.", fullPath);
         if (info.Length > MaximumResultBytes)
-            throw new InvalidDataException("Parser result exceeds 32 MiB.");
+            throw Failure("parser_result_too_large", "Parser result exceeds 32 MiB.");
 
         var bytes = await File.ReadAllBytesAsync(fullPath, cancellationToken);
         try
@@ -38,13 +63,18 @@ public sealed class ParserResultValidator
             try
             {
                 using var json = JsonDocument.Parse(bytes);
+                ValidateNoDuplicateMembers(json.RootElement);
+                ValidateJsonContract(json.RootElement);
                 ValidateStringLengths(json.RootElement, propertyName: null);
                 result = JsonSerializer.Deserialize<ParserResultDocument>(bytes, JsonOptions) ??
-                    throw new InvalidDataException("Parser result is empty.");
+                    throw Failure("parser_result_json_invalid", "Parser result is empty.");
             }
             catch (JsonException exception)
             {
-                throw new InvalidDataException("Parser result JSON violates schema 1.", exception);
+                throw Failure(
+                    "parser_result_json_invalid",
+                    "Parser result JSON violates schema 1.",
+                    exception);
             }
 
             return ValidateDocument(result, expectedJobId, expectedSourceSetId);
@@ -61,18 +91,20 @@ public sealed class ParserResultValidator
         string expectedSourceSetId)
     {
         if (result.SchemaVersion != 1)
-            throw new InvalidDataException("Parser result schema is unsupported.");
+            throw Failure("parser_result_schema_invalid", "Parser result schema is unsupported.");
         if (!string.Equals(result.JobId, expectedJobId, StringComparison.Ordinal) ||
             !string.Equals(result.SourceSetId, expectedSourceSetId, StringComparison.Ordinal))
         {
-            throw new InvalidDataException("Parser result identity does not match its claimed job.");
+            throw Failure(
+                "parser_result_identity_mismatch",
+                "Parser result identity does not match its claimed job.");
         }
         if (result.Messages is null || result.Messages.Count > 5000 ||
             result.Contacts is null || result.Contacts.Count > 5000 ||
             result.Favorites is null || result.Favorites.Count > 1000 ||
             result.Notices is null || result.Notices.Count > 1000)
         {
-            throw new InvalidDataException("Parser result count limit was exceeded.");
+            throw Failure("parser_result_count_invalid", "Parser result count limit was exceeded.");
         }
         if (result.NextCursor is not null &&
             (string.IsNullOrWhiteSpace(result.NextCursor) ||
@@ -80,15 +112,25 @@ public sealed class ParserResultValidator
              result.NextCursor.Any(character =>
                  !(char.IsAsciiLetterOrDigit(character) || character is '-' or '_'))))
         {
-            throw new InvalidDataException("Parser continuation cursor is invalid.");
+            throw Failure("parser_result_cursor_invalid", "Parser continuation cursor is invalid.");
         }
 
         var messageIdentities = new HashSet<string>(StringComparer.Ordinal);
         var uniqueMessages = new List<ParsedMessage>(result.Messages.Count);
         foreach (var message in result.Messages)
         {
-            if (message is null || string.IsNullOrWhiteSpace(message.Wxid))
-                throw new InvalidDataException("Parser message identity is empty.");
+            if (message is null ||
+                string.IsNullOrWhiteSpace(message.Wxid) ||
+                message.Content is null ||
+                message.Nickname is null ||
+                message.Sender is null ||
+                message.Avatar is null ||
+                message.MediaType is null ||
+                message.MediaMime is null ||
+                message.MediaName is null)
+            {
+                throw Failure("parser_result_message_invalid", "Parser message identity is empty.");
+            }
             ValidateMedia(message);
             if (messageIdentities.Add(ParserItemIdentity.Message(message)))
                 uniqueMessages.Add(message);
@@ -98,9 +140,14 @@ public sealed class ParserResultValidator
         foreach (var contact in result.Contacts)
         {
             if (contact is null || string.IsNullOrWhiteSpace(contact.Wxid) ||
+                contact.Alias is null || contact.Remark is null ||
+                contact.NickName is null || contact.DisplayName is null ||
+                contact.Avatar is null ||
                 !contacts.Add(contact.Wxid))
             {
-                throw new InvalidDataException("Parser result contains an invalid or duplicate contact.");
+                throw Failure(
+                    "parser_result_contact_invalid",
+                    "Parser result contains an invalid or duplicate contact.");
             }
         }
 
@@ -110,10 +157,14 @@ public sealed class ParserResultValidator
             if (favorite is null ||
                 string.IsNullOrWhiteSpace(favorite.SourceTable) ||
                 string.IsNullOrWhiteSpace(favorite.SourceId) ||
+                favorite.Title is null || favorite.Summary is null ||
+                favorite.ItemType is null || favorite.ItemSubType is null ||
                 favorite.DataJson is null ||
                 !favorites.Add((favorite.SourceTable, favorite.SourceId)))
             {
-                throw new InvalidDataException("Parser result contains an invalid or duplicate favorite.");
+                throw Failure(
+                    "parser_result_favorite_invalid",
+                    "Parser result contains an invalid or duplicate favorite.");
             }
         }
 
@@ -125,7 +176,7 @@ public sealed class ParserResultValidator
                 string.IsNullOrWhiteSpace(notice.Detail) ||
                 IsUnsafeRelativePath(notice.Database))
             {
-                throw new InvalidDataException("Parser notice is invalid.");
+                throw Failure("parser_result_notice_invalid", "Parser notice is invalid.");
             }
         }
 
@@ -136,10 +187,12 @@ public sealed class ParserResultValidator
 
     private static void ValidateMedia(ParsedMessage message)
     {
+        if (message.MediaData is null || message.MediaSha256 is null)
+            throw Failure("parser_result_media_invalid", "Embedded media fields are null.");
         if (string.IsNullOrEmpty(message.MediaData))
         {
             if (!string.IsNullOrEmpty(message.MediaSha256))
-                throw new InvalidDataException("Media hash exists without media data.");
+                throw Failure("parser_result_media_invalid", "Media hash exists without media data.");
             return;
         }
 
@@ -150,14 +203,17 @@ public sealed class ParserResultValidator
         }
         catch (FormatException exception)
         {
-            throw new InvalidDataException("Embedded media is not valid base64.", exception);
+            throw Failure(
+                "parser_result_media_invalid",
+                "Embedded media is not valid base64.",
+                exception);
         }
         try
         {
             if (decoded.Length > MaximumMediaBytes)
-                throw new InvalidDataException("Embedded media exceeds 5 MiB.");
+                throw Failure("parser_result_media_invalid", "Embedded media exceeds 5 MiB.");
             if (!IsSha256(message.MediaSha256))
-                throw new InvalidDataException("Embedded media SHA-256 is invalid.");
+                throw Failure("parser_result_media_invalid", "Embedded media SHA-256 is invalid.");
             var digest = SHA256.HashData(decoded);
             try
             {
@@ -166,7 +222,9 @@ public sealed class ParserResultValidator
                         message.MediaSha256,
                         StringComparison.OrdinalIgnoreCase))
                 {
-                    throw new InvalidDataException("Embedded media SHA-256 does not match its bytes.");
+                    throw Failure(
+                        "parser_result_media_invalid",
+                        "Embedded media SHA-256 does not match its bytes.");
                 }
             }
             finally
@@ -196,14 +254,101 @@ public sealed class ParserResultValidator
                 if (!string.Equals(propertyName, "media_data", StringComparison.Ordinal) &&
                     (element.GetString()?.Length ?? 0) > MaximumStringCharacters)
                 {
-                    throw new InvalidDataException("Parser result string exceeds 64 KiB.");
+                    throw Failure(
+                        "parser_result_string_too_large",
+                        "Parser result string exceeds 64 KiB.");
                 }
                 break;
         }
     }
 
-    private static bool IsSha256(string value) =>
-        value.Length == 64 && value.All(Uri.IsHexDigit);
+    private static void ValidateNoDuplicateMembers(JsonElement element)
+    {
+        if (element.ValueKind == JsonValueKind.Object)
+        {
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var property in element.EnumerateObject())
+            {
+                if (!seen.Add(property.Name))
+                    throw Failure("parser_result_json_invalid", "Parser result contains a duplicate member.");
+                ValidateNoDuplicateMembers(property.Value);
+            }
+        }
+        else if (element.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in element.EnumerateArray())
+                ValidateNoDuplicateMembers(item);
+        }
+    }
+
+    private static void ValidateJsonContract(JsonElement root)
+    {
+        ValidateObjectMembers(
+            root,
+            ResultMembers,
+            "parser_result_json_invalid",
+            optionalMember: "nextCursor");
+        ValidateArrayMembers(
+            root.GetProperty("messages"),
+            MessageMembers,
+            "parser_result_message_invalid");
+        ValidateArrayMembers(
+            root.GetProperty("contacts"),
+            ContactMembers,
+            "parser_result_contact_invalid");
+        ValidateArrayMembers(
+            root.GetProperty("favorites"),
+            FavoriteMembers,
+            "parser_result_favorite_invalid");
+        ValidateArrayMembers(
+            root.GetProperty("notices"),
+            NoticeMembers,
+            "parser_result_notice_invalid");
+    }
+
+    private static void ValidateArrayMembers(
+        JsonElement array,
+        IReadOnlySet<string> requiredMembers,
+        string failureCode)
+    {
+        if (array.ValueKind != JsonValueKind.Array)
+            throw Failure(failureCode, "Parser result collection is invalid.");
+        foreach (var item in array.EnumerateArray())
+            ValidateObjectMembers(item, requiredMembers, failureCode);
+    }
+
+    private static void ValidateObjectMembers(
+        JsonElement value,
+        IReadOnlySet<string> requiredMembers,
+        string failureCode,
+        string? optionalMember = null)
+    {
+        if (value.ValueKind != JsonValueKind.Object)
+            throw Failure(failureCode, "Parser result object is invalid.");
+        var actual = value.EnumerateObject()
+            .Select(property => property.Name)
+            .ToHashSet(StringComparer.Ordinal);
+        if (!requiredMembers.IsSubsetOf(actual) ||
+            actual.Any(member => !requiredMembers.Contains(member) && member != optionalMember))
+        {
+            throw Failure(failureCode, "Parser result object members are invalid.");
+        }
+    }
+
+    private static InvalidDataException Failure(
+        string code,
+        string message,
+        Exception? innerException = null)
+    {
+        var exception = innerException is null
+            ? new InvalidDataException(message)
+            : new InvalidDataException(message, innerException);
+        exception.Data["failureCode"] = code;
+        return exception;
+    }
+
+    private static bool IsSha256(string? value) =>
+        value is { Length: 64 } && value.All(Uri.IsHexDigit);
 
     private static bool IsUnsafeRelativePath(string path)
     {

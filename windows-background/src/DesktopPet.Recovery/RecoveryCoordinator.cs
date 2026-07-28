@@ -76,7 +76,6 @@ public sealed class RecoveryCoordinator
         Task<CaptureObservation>? preparedCaptureTask = null;
         CancellationTokenSource? preparedCaptureCancellation = null;
         var completedRelativePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var continueCaptureAfterPublish = false;
         try
         {
             var current = await RequireActiveEpochAsync(epoch.Id, cancellationToken);
@@ -236,6 +235,12 @@ public sealed class RecoveryCoordinator
                                     },
                                     cancellationToken);
                             }
+                            if (publication.WasPublished ||
+                                reuseAction.RequiredDatabasesComplete ||
+                                !allowLiveCapture)
+                            {
+                                return reuseAction;
+                            }
                         }
                         if (requiredDatabasesComplete || !allowLiveCapture)
                             return reuseAction;
@@ -252,7 +257,6 @@ public sealed class RecoveryCoordinator
                 {
                     case RecoveryActionKind.CaptureCurrent:
                         current = await RequireActiveEpochAsync(epoch.Id, cancellationToken);
-                        continueCaptureAfterPublish = false;
                         await PublishTelemetryBestEffortAsync(
                             "recovery_capture_started",
                             "info",
@@ -291,14 +295,18 @@ public sealed class RecoveryCoordinator
                         {
                             captureCancellation?.Dispose();
                         }
-                        action = await _stateMachine.ObserveAsync(
-                            epoch.Id,
-                            observation,
-                            cancellationToken);
+                        var previousOutputsAlreadyPublished =
+                            completedRelativePaths.Count > 0 &&
+                            !observation.HasValidatedKey &&
+                            !observation.HasPendingCapture &&
+                            observation.OutputPaths.Count == 0;
+                        action = previousOutputsAlreadyPublished
+                            ? RecoveryAction.Wait("partial_outputs_already_published")
+                            : await _stateMachine.ObserveAsync(
+                                epoch.Id,
+                                observation,
+                                cancellationToken);
                         AddCompletedRelativePaths(completedRelativePaths, observation.Databases);
-                        continueCaptureAfterPublish = observation.OutputPaths.Count > 0 &&
-                            (observation.UnmatchedDatabases.Count > 0 ||
-                             observation.FailedDatabases.Count > 0);
                         var observationCode = StableCodeOrDefault(
                             observation.FailureCode,
                             "capture_failed");
@@ -454,12 +462,6 @@ public sealed class RecoveryCoordinator
                                     action.RequiredDatabasesComplete,
                                 },
                                 cancellationToken);
-                        }
-                        if (continueCaptureAfterPublish)
-                        {
-                            action = RecoveryAction.CaptureCurrent();
-                            continueCaptureAfterPublish = false;
-                            break;
                         }
                         return action;
 

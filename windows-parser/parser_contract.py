@@ -185,11 +185,15 @@ def load_job(job_path: Path) -> ParserJob:
 
 def write_result_atomic(document: dict[str, Any], output_root: Path) -> Path:
     _validate_result_counts(document)
-    encoded = json.dumps(
-        document,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode("utf-8")
+    try:
+        encoded = json.dumps(
+            document,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except ValueError as exc:
+        raise ParserContractError("result_non_finite_number") from exc
     if len(encoded) > MAXIMUM_RESULT_BYTES:
         raise ParserContractError("result_too_large")
     output_root.mkdir(parents=True, exist_ok=True)

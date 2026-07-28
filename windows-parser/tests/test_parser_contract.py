@@ -26,6 +26,7 @@ from parser_core import (
     MAXIMUM_DECOMPRESSED_MESSAGE_BYTES,
     _decode_cursor,
     _encode_cursor,
+    _sanitize_value,
 )
 
 
@@ -507,6 +508,31 @@ def test_result_above_32_mib_is_rejected_without_publish(tmp_path: Path) -> None
     }
 
     with pytest.raises(ParserContractError):
+        write_result_atomic(document, output_root)
+
+    assert not (output_root / "result.json").exists()
+
+
+def test_non_finite_database_numbers_are_normalized_for_strict_json() -> None:
+    assert _sanitize_value(float("nan")) is None
+    assert _sanitize_value(float("inf")) is None
+    assert _sanitize_value(float("-inf")) is None
+    assert _sanitize_value(1.5) == 1.5
+
+
+def test_result_writer_rejects_non_finite_json_without_publish(tmp_path: Path) -> None:
+    output_root = tmp_path / "output"
+    document = {
+        "schemaVersion": 1,
+        "jobId": "job",
+        "sourceSetId": "source",
+        "messages": [],
+        "contacts": [],
+        "favorites": [{"data_json": {"score": float("inf")}}],
+        "notices": [],
+    }
+
+    with pytest.raises(ParserContractError, match="result_non_finite_number"):
         write_result_atomic(document, output_root)
 
     assert not (output_root / "result.json").exists()

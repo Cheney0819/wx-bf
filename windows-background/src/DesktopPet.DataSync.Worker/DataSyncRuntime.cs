@@ -461,10 +461,21 @@ public sealed class DataSyncRuntime : IDataSyncRuntime
         return metrics;
     }
 
-    private static string ParserFailureCode(string stageKey, Exception exception)
+    internal static string ParserFailureCode(string stageKey, Exception exception)
     {
         if (exception is ParserSupervisorException supervisorException)
             return supervisorException.Code;
+        if (stageKey == "result_validate" &&
+            exception.Data["failureCode"] is string validationCode &&
+            validationCode.StartsWith("parser_result_", StringComparison.Ordinal) &&
+            validationCode.Length <= 80 &&
+            validationCode.All(character =>
+                char.IsAsciiLetterLower(character) ||
+                char.IsAsciiDigit(character) ||
+                character == '_'))
+        {
+            return validationCode;
+        }
         return (stageKey, exception) switch
         {
             ("job_build", FileNotFoundException) => "parser_input_missing",

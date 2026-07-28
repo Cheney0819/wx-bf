@@ -415,6 +415,17 @@ public sealed class EndToEndDataSyncTests : IDisposable
     }
 
     [Fact]
+    public void ParserResultValidationFailurePreservesSpecificCode()
+    {
+        var exception = new InvalidDataException("Parser result JSON is invalid.");
+        exception.Data["failureCode"] = "parser_result_json_invalid";
+
+        Assert.Equal(
+            "parser_result_json_invalid",
+            DataSyncRuntime.ParserFailureCode("result_validate", exception));
+    }
+
+    [Fact]
     public async Task ParserStartFailureDiagnosticsReportMissingArtifact()
     {
         if (OperatingSystem.IsWindows()) return;

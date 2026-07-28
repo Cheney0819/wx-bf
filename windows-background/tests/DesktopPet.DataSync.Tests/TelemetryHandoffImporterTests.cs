@@ -133,10 +133,49 @@ public sealed class TelemetryHandoffImporterTests : IDisposable
                 })),
             default);
 
-        Assert.Null(await ReadStateAsync(fixture.Repository.DatabasePath, "error"));
+        Assert.True(string.IsNullOrEmpty(await ReadStateAsync(
+            fixture.Repository.DatabasePath,
+            "error")));
         Assert.Equal("true", await ReadStateAsync(
             fixture.Repository.DatabasePath,
             "wechat_logged_in"));
+    }
+
+    [Fact]
+    public async Task AmbiguousDataRootWarningDoesNotClearARealError()
+    {
+        var fixture = await CreateFixtureAsync();
+        await fixture.Writer.CommitAsync(
+            new OperationalTelemetryEnvelope(
+                1,
+                EventId('7'),
+                "recovery",
+                "recovery_capture_failed",
+                "error",
+                "capture_attach_failed",
+                _now.AddMinutes(-1),
+                JsonSerializer.SerializeToElement(new { })),
+            default);
+        await fixture.Writer.CommitAsync(
+            new OperationalTelemetryEnvelope(
+                1,
+                EventId('8'),
+                "recovery",
+                "client_v4_data_dir_result",
+                "warning",
+                "ambiguous_data_root",
+                _now,
+                JsonSerializer.SerializeToElement(new
+                {
+                    candidateCount = 3,
+                    databaseCount = 0,
+                    wechatLoggedIn = true,
+                })),
+            default);
+
+        Assert.Equal("capture_attach_failed", await ReadStateAsync(
+            fixture.Repository.DatabasePath,
+            "error"));
     }
 
     [Fact]

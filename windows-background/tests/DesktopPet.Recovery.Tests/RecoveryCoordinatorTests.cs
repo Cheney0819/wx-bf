@@ -244,7 +244,7 @@ public sealed class RecoveryCoordinatorTests : IDisposable
     }
 
     [Fact]
-    public async Task PartialBatchPublishesAndContinuesWithCompletedDatabaseExcluded()
+    public async Task PartialBatchPublishesWithoutFurtherLiveCapture()
     {
         var auxiliarySource = await WriteStagingAsync("hardlink.sqlite", "auxiliary"u8.ToArray());
         var messageSource = await WriteStagingAsync("message.sqlite", "message"u8.ToArray());
@@ -280,28 +280,23 @@ public sealed class RecoveryCoordinatorTests : IDisposable
         var action = await fixture.Coordinator.RunEpochAsync(fixture.Epoch, default);
 
         Assert.Equal(RecoveryActionKind.PublishOutputs, action.Kind);
-        Assert.Equal(2, fixture.Capture.CallCount);
-        Assert.Equal(2, Directory.EnumerateFiles(
+        Assert.Equal(1, fixture.Capture.CallCount);
+        Assert.Single(Directory.EnumerateFiles(
             Path.Combine(_root, "handoff", "ready"),
-            "*.json").Count());
+            "*.json"));
         Assert.Empty(fixture.Capture.CompletedPathSnapshots[0]);
-        Assert.Contains(
-            "db_storage/hardlink/hardlink.db",
-            fixture.Capture.CompletedPathSnapshots[1]);
-        Assert.Equal("db_storage/message/message_0.db", Assert.Single(action.Databases).RelativePath);
+        Assert.Equal("db_storage/hardlink/hardlink.db", Assert.Single(action.Databases).RelativePath);
+        Assert.Equal(0, fixture.Process.RestartCount);
         var decryptEvents = fixture.Telemetry.Events
             .Where(draft => draft.EventName == "client_wechat_decrypt_export_result")
             .ToArray();
-        Assert.Equal(2, decryptEvents.Length);
+        Assert.Single(decryptEvents);
         Assert.Equal(1, decryptEvents[0].Metrics.GetProperty("outputCount").GetInt32());
         Assert.Equal(1, decryptEvents[0].Metrics.GetProperty("pendingCount").GetInt32());
-        Assert.Equal("success", decryptEvents[1].Code);
-        Assert.Equal(2, decryptEvents[1].Metrics.GetProperty("outputCount").GetInt32());
-        Assert.Equal(0, decryptEvents[1].Metrics.GetProperty("pendingCount").GetInt32());
     }
 
     [Fact]
-    public async Task RestartedCaptureKeepsCompletedDatabaseExclusions()
+    public async Task PartialBatchDoesNotRestartWhenRemainingCaptureWouldFail()
     {
         var auxiliarySource = await WriteStagingAsync("restart-hardlink.sqlite", "auxiliary"u8.ToArray());
         var messageSource = await WriteStagingAsync("restart-message.sqlite", "message"u8.ToArray());
@@ -338,12 +333,9 @@ public sealed class RecoveryCoordinatorTests : IDisposable
         var action = await fixture.Coordinator.RunEpochAsync(fixture.Epoch, default);
 
         Assert.Equal(RecoveryActionKind.PublishOutputs, action.Kind);
-        Assert.Equal(3, fixture.Capture.CallCount);
-        Assert.Equal(1, fixture.Process.RestartCount);
-        Assert.Equal(RecoveryCaptureTarget.RestartedProcess, fixture.Capture.Targets[2]);
-        Assert.Contains(
-            "db_storage/hardlink/hardlink.db",
-            fixture.Capture.CompletedPathSnapshots[2]);
+        Assert.Equal(1, fixture.Capture.CallCount);
+        Assert.Equal(0, fixture.Process.RestartCount);
+        Assert.Equal(RecoveryCaptureTarget.BoundProcess, fixture.Capture.Targets[0]);
     }
 
     [Fact]
@@ -398,7 +390,7 @@ public sealed class RecoveryCoordinatorTests : IDisposable
     }
 
     [Fact]
-    public async Task PartialPersistedOutputPublishesThenCapturesUnresolvedDatabases()
+    public async Task PartialPersistedOutputPublishesWithoutLiveCapture()
     {
         var source = await WriteStagingAsync("reused-partial.sqlite", "reused-partial"u8.ToArray());
         var sha256 = await Sha256Async(source);
@@ -422,16 +414,24 @@ public sealed class RecoveryCoordinatorTests : IDisposable
 
         var action = await fixture.Coordinator.RunEpochAsync(fixture.Epoch, default);
 
-        Assert.Equal(RecoveryActionKind.WaitPassively, action.Kind);
-        Assert.Equal("pending_capture_available", action.Reason);
-        Assert.Equal(2, fixture.Capture.CallCount);
-        Assert.Equal(1, fixture.Process.RestartCount);
-        Assert.Equal(
-            [RecoveryCaptureTarget.BoundProcess, RecoveryCaptureTarget.RestartedProcess],
-            fixture.Capture.Targets);
+        Assert.Equal(RecoveryActionKind.PublishOutputs, action.Kind);
+        Assert.Equal(0, fixture.Capture.CallCount);
+        Assert.Equal(0, fixture.Process.RestartCount);
+        Assert.Empty(fixture.Capture.Targets);
         Assert.Single(Directory.EnumerateFiles(
             Path.Combine(_root, "handoff", "ready"),
             "*.json"));
+
+        var naturalRestartAction = await fixture.Coordinator.RunEpochAsync(fixture.Epoch, default);
+
+        Assert.Equal(RecoveryActionKind.WaitPassively, naturalRestartAction.Kind);
+        Assert.Equal("partial_outputs_already_published", naturalRestartAction.Reason);
+        Assert.Equal(1, fixture.Capture.CallCount);
+        Assert.Equal(0, fixture.Process.RestartCount);
+        Assert.Equal(RecoveryCaptureTarget.BoundProcess, Assert.Single(fixture.Capture.Targets));
+        Assert.Contains(
+            "message/message_partial.db",
+            Assert.Single(fixture.Capture.CompletedPathSnapshots));
     }
 
     [Fact]
@@ -726,7 +726,7 @@ public sealed class RecoveryCoordinatorTests : IDisposable
     }
 
     [Fact]
-    public async Task TimedOutPersistedKeyReusePreservesCompletedDatabaseForLiveCapture()
+    public async Task TimedOutPersistedKeyReuseWithPartialOutputPublishesWithoutLiveCapture()
     {
         var source = await WriteStagingAsync("timed-out-partial.sqlite", "partial"u8.ToArray());
         var recovered = new RecoveredDatabase(
@@ -755,11 +755,12 @@ public sealed class RecoveryCoordinatorTests : IDisposable
         var action = await fixture.Coordinator.RunEpochAsync(fixture.Epoch, default)
             .WaitAsync(TimeSpan.FromSeconds(5));
 
-        Assert.Equal("pending_capture_available", action.Reason);
-        Assert.Equal(1, fixture.Capture.CallCount);
-        Assert.Contains(
-            "db_storage/hardlink/hardlink.db",
-            fixture.Capture.CompletedPathSnapshots.Single());
+        Assert.Equal(RecoveryActionKind.PublishOutputs, action.Kind);
+        Assert.Null(action.Reason);
+        Assert.Equal("db_storage/hardlink/hardlink.db", Assert.Single(action.Databases).RelativePath);
+        Assert.Equal(0, fixture.Capture.CallCount);
+        Assert.Equal(0, fixture.Process.RestartCount);
+        Assert.Empty(fixture.Capture.CompletedPathSnapshots);
         Assert.Single(Directory.EnumerateFiles(
             Path.Combine(_root, "handoff", "ready"),
             "*.json"));
