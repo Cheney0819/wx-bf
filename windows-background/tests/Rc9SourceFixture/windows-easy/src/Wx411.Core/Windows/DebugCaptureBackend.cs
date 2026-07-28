@@ -265,8 +265,7 @@ public sealed class DebugCaptureBackend : ICallpointCaptureBackend, IDisposable
             var initialBreakpointPending = true;
             while (true)
             {
-                ct.ThrowIfCancellationRequested();
-                if (shouldStop?.Invoke() == true)
+                if (ShouldStopEventLoop(shouldStop, ct))
                     return null;
                 DebugEvent debugEvent = default;
                 if (!NativeMethods.WaitForDebugEvent(ref debugEvent, 100))
@@ -274,8 +273,10 @@ public sealed class DebugCaptureBackend : ICallpointCaptureBackend, IDisposable
                     var error = Marshal.GetLastPInvokeError();
                     if (error == NativeMethods.ERROR_SEM_TIMEOUT)
                     {
-                        if (shouldStop?.Invoke() == true)
+                        if (ShouldStopEventLoop(shouldStop, ct))
                             return null;
+                        if (_pendingRearms.Count != 0)
+                            continue;
                         var timeout = CheckCaptureTimeout(
                             primaryCallpoint,
                             pid,
@@ -431,6 +432,15 @@ public sealed class DebugCaptureBackend : ICallpointCaptureBackend, IDisposable
             _attachedPid = 0;
             _cleanupProgress = null;
         }
+    }
+
+    private bool ShouldStopEventLoop(
+        Func<bool>? shouldStop,
+        CancellationToken cancellationToken)
+    {
+        if (_pendingRearms.Count != 0) return false;
+        cancellationToken.ThrowIfCancellationRequested();
+        return shouldStop?.Invoke() == true;
     }
 
     private ArmBreakpointsResult TryArmBreakpoints(
@@ -1031,3 +1041,4 @@ public sealed class DebugCaptureBackend : ICallpointCaptureBackend, IDisposable
         Fatal,
     }
 }
+
