@@ -1,0 +1,43 @@
+{
+  "schema": "Footprint_CaptureRuntime_Manifest_v1",
+  "runtime_identifier": "win-x64",
+  "bundle_sha256": "3e20025703cabd2c1c3a94e49e4ae2ac2f22725788a2408793b801e785bb2381",
+  "resources": [
+    {
+      "resource_name": "Footprint.CaptureRuntime.Resources.python-3.13.0-embed-amd64.zip",
+      "file_name": "python-3.13.0-embed-amd64.zip",
+      "length": 12499601,
+      "sha256": "01c32d0737432240adcf0bbc1d32327f0976d3a1e1427774bc8febc8f1c03111"
+    },
+    {
+      "resource_name": "Footprint.CaptureRuntime.Resources.frida-17.9.9-cp37-abi3-win_amd64.whl",
+      "file_name": "frida-17.9.9-cp37-abi3-win_amd64.whl",
+      "length": 41968374,
+      "sha256": "a84dddae7a2c570077f42b64d14931cf75fc3be69a3e0ed0cac25e15f2215531"
+    },
+    {
+      "resource_name": "Footprint.CaptureRuntime.Resources.sqlcipher.exe",
+      "file_name": "sqlcipher.exe",
+      "length": 8233105,
+      "sha256": "69e1fc5df120026626b02dd3adae6a44a090eaf4b571daadc3b7e23e9fa21e68"
+    },
+    {
+      "resource_name": "Footprint.CaptureRuntime.Resources.frida_host.py",
+      "file_name": "frida_host.py",
+      "length": 41179,
+      "sha256": "d608732016c567c2aeb3ee65ce872c38b799c989226cc2d4d18430c5a54180c7"
+    },
+    {
+      "resource_name": "Footprint.CaptureRuntime.Resources.weixin-agent.js",
+      "file_name": "weixin-agent.js",
+      "length": 57765,
+      "sha256": "dd8ce6285df9a40f040c29e5288d248d91e609cd5a9e96ac720d6b8c6c0656f0"
+    },
+    {
+      "resource_name": "Footprint.CaptureRuntime.Resources.weixin-4914.json",
+      "file_name": "weixin-4914.json",
+      "length": 10379,
+      "sha256": "895a7949a3c6e6ed36a41e0c41a6c5c245d9cc4d8fb6c09069c79c1b6296b42f"
+    }
+  ]
+}

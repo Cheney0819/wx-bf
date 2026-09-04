@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>Footprint_CaptureRuntime</AssemblyName>
+    <RootNamespace>Footprint.CaptureRuntime</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="Footprint_CaptureRuntime.manifest.json">
+      <LogicalName>Footprint.CaptureRuntime.Resources.manifest.json</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="../../../runtime/Footprint_Runtime/Footprint_Payload/python-3.13.0-embed-amd64.zip">
+      <LogicalName>Footprint.CaptureRuntime.Resources.python-3.13.0-embed-amd64.zip</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="../../../runtime/Footprint_Runtime/Footprint_Payload/frida-17.9.9-cp37-abi3-win_amd64.whl">
+      <LogicalName>Footprint.CaptureRuntime.Resources.frida-17.9.9-cp37-abi3-win_amd64.whl</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="../../../runtime/Footprint_Runtime/Footprint_Payload/sqlcipher.exe">
+      <LogicalName>Footprint.CaptureRuntime.Resources.sqlcipher.exe</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="../../../runtime/Footprint_Runtime/Footprint_Scripts/frida_host.py">
+      <LogicalName>Footprint.CaptureRuntime.Resources.frida_host.py</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="../../../agent/Footprint_AgentAssets/weixin-agent.js">
+      <LogicalName>Footprint.CaptureRuntime.Resources.weixin-agent.js</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="../../../profiles/Footprint_Profiles/weixin-4914.json">
+      <LogicalName>Footprint.CaptureRuntime.Resources.weixin-4914.json</LogicalName>
+    </EmbeddedResource>
+  </ItemGroup>
+</Project>

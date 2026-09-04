@@ -1,0 +1,3 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFramework>net8.0</TargetFramework><AssemblyName>Footprint_Media</AssemblyName><RootNamespace>Footprint.Media</RootNamespace><PlatformTarget>AnyCPU</PlatformTarget></PropertyGroup>
+</Project>

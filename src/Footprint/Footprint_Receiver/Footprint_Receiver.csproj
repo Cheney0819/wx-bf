@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>Footprint_Receiver</AssemblyName>
+    <RootNamespace>Footprint.Receiver</RootNamespace>
+    <PlatformTarget>AnyCPU</PlatformTarget>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RuntimeIdentifiers>osx-arm64</RuntimeIdentifiers>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.Sqlite" />
+    <ProjectReference Include="../Footprint_ReceiverRuntime/Footprint_ReceiverRuntime.csproj" />
+    <ProjectReference Include="../Footprint_Archive/Footprint_Archive.csproj" />
+    <ProjectReference Include="../Footprint_Renderer/Footprint_Renderer.csproj" />
+  </ItemGroup>
+</Project>

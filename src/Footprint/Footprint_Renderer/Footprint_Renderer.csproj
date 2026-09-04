@@ -1,0 +1,5 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFramework>net8.0</TargetFramework><AssemblyName>Footprint_Renderer</AssemblyName><RootNamespace>Footprint.Renderer</RootNamespace><PlatformTarget>AnyCPU</PlatformTarget></PropertyGroup>
+  <ItemGroup><PackageReference Include="Microsoft.Data.Sqlite" /></ItemGroup>
+  <ItemGroup><ProjectReference Include="../Footprint_Archive/Footprint_Archive.csproj" /></ItemGroup>
+</Project>

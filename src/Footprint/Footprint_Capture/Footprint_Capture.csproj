@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <AssemblyName>Footprint_Capture</AssemblyName>
+    <RootNamespace>Footprint.Worker</RootNamespace>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <IncludeAllContentForSelfExtract>true</IncludeAllContentForSelfExtract>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Footprint_Core/Footprint_Core.csproj"
+                      Condition="'$(IsolatedCaptureBuild)' != 'true'" />
+    <ProjectReference Include="../Footprint_Core/Footprint_Core.csproj"
+                      Condition="'$(IsolatedCaptureBuild)' == 'true'">
+      <SetConfiguration>Configuration=$(Configuration)</SetConfiguration>
+      <AdditionalProperties>PlatformTarget=AnyCPU;BaseOutputPath=$(IsolatedCoreOutput);BaseIntermediateOutputPath=$(IsolatedCoreIntermediate);MSBuildProjectExtensionsPath=$(IsolatedCoreIntermediate);DefaultItemExcludes=obj/**;IsolatedCaptureBuild=true</AdditionalProperties>
+      <SetPlatform>Platform=AnyCPU</SetPlatform>
+    </ProjectReference>
+  </ItemGroup>
+</Project>

@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFramework>net8.0</TargetFramework><AssemblyName>Footprint_Archive</AssemblyName><RootNamespace>Footprint.Archive</RootNamespace><PlatformTarget>AnyCPU</PlatformTarget><AllowUnsafeBlocks>true</AllowUnsafeBlocks></PropertyGroup>
+  <ItemGroup><PackageReference Include="Microsoft.Data.Sqlite" /></ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Footprint_Parser/Footprint_Parser.csproj" />
+    <ProjectReference Include="../Footprint_Media/Footprint_Media.csproj" />
+  </ItemGroup>
+</Project>
